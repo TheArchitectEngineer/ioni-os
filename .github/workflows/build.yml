@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel:
+    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: RELEASE
+            arch: ARM64
+          - kernel: DEVELOPMENT
+            arch: ARM64
+          - kernel: RELEASE
+            arch: X86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: ./scripts/build.sh
+        env:
+          KERNEL_CONFIGS: ${{ matrix.kernel }}
+          ARCH_CONFIGS: ${{ matrix.arch }}
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.kernel }}-${{ matrix.arch }}
+          path: BUILD/sym/kernel*
+          if-no-files-found: error
