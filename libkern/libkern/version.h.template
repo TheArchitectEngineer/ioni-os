@@ -64,7 +64,7 @@
 #define OSBUILD_CONFIG  "###KERNEL_BUILD_CONFIG###"
 
 /* OSTYPE, ostype, is a string as returned by uname -s */
-#define	OSTYPE		"Darwin"
+#define	OSTYPE		"Ioni"
 
 /* OSRELEASE, osrelease, is a string as returned by uname -r */
 #define OSRELEASE	"###KERNEL_VERSION_LONG###"
