@@ -10,6 +10,7 @@
 ![Kernel](https://img.shields.io/badge/kernel-XNU-101a35)
 ![Arch](https://img.shields.io/badge/arch-arm64_·_x86__64-3a4d85)
 ![Stage](https://img.shields.io/badge/stage-foundation-e0a437)
+[![build](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml/badge.svg)](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml)
 
 </div>
 
@@ -27,7 +28,7 @@ Ioni — экспериментальная операционная систе�
 
 | # | Этап | Статус |
 |---|------|--------|
-| 1 | Ядро собирается и загружается в ВМ | запланировано |
+| 1 | Ядро собирается и загружается в ВМ | в работе |
 | 2 | Минимальный userland: libc, init, shell | запланировано |
 | 3 | **Порт Homebrew** — пакетный менеджер на Ioni | цель |
 | 4 | **XQuartz + FluxBox** — графический десктоп на X11 | цель |
@@ -51,7 +52,16 @@ Ioni — экспериментальная операционная систе�
 
 ## Сборка
 
-Сборка апстримного XNU требует тулчейна Apple (Xcode на macOS) и окружения Darwin. По мере движения к этапу 1 дорожной карты в этом разделе появятся собственные скрипты сборки Ioni и документированный путь кросс-сборки. Пока действуют апстрим-инструкции: см. каталог `doc/` и заметки к релизам на [apple-oss-distributions](https://github.com/apple-oss-distributions/distribution/tags).
+XNU собирается только на macOS с установленным Xcode. Скрипт-обёртка прячет детали make:
+
+```sh
+./scripts/build.sh                                                  # RELEASE, архитектура машины
+KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # свой вариант
+```
+
+Переменные: `KERNEL_CONFIGS` — RELEASE / DEVELOPMENT / DEBUG / PROFILE (по умолчанию RELEASE); `ARCH_CONFIGS` — ARM64 / X86_64 (по умолчанию ARM64); `SDKROOT` — путь к SDK (по умолчанию macosx). Артефакты падают в `BUILD/sym/`: `kernel.<config>` — загружаемый образ, `kernel.<config>.unstripped` — с символами для отладки; `./scripts/clean.sh` чистит дерево сборки.
+
+CI запускается на каждый пуш в `main` и на pull request'ы: ядра RELEASE и DEVELOPMENT для ARM64 плюс RELEASE для X86_64 собираются на раннерах `macos-26` в GitHub Actions и выгружаются в артефакты.
 
 ## Лицензия
 

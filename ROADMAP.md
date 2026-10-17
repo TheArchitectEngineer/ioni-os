@@ -10,8 +10,8 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 ## Stage 1 — Buildable kernel
 
-- [ ] Reproducible build environment: toolchain, SDK, dependencies
-- [ ] Kernel image builds for arm64 / x86_64
+- [x] Build scripts and CI: GitHub Actions builds kernels on macos-26 runners (Xcode 26.6)
+- [ ] First green build: RELEASE / DEVELOPMENT ARM64 and RELEASE X86_64
 - [ ] Kernel boots in a VM with serial console output
 
 ## Stage 2 — Minimal userland
@@ -44,7 +44,7 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 **Этап 0 — фундамент** (готово): база XNU импортирована, поверхностный ребрендинг применён — система отвечает `Ioni` в `uname` и в баннере загрузки.
 
-**Этап 1 — собираемое ядро**: воспроизводимое окружение сборки, образ ядра, загрузка в виртуальной машине.
+**Этап 1 — собираемое ядро**: скрипты сборки и CI готовы (GitHub Actions, раннеры macos-26), ждём первый зелёный билд, дальше — загрузка ядра в виртуальной машине.
 
 **Этап 2 — минимальный userland**: libc, dyld, init, shell и загружаемый ramdisk-образ.
 

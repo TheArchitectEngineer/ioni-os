@@ -10,6 +10,7 @@
 ![Kernel](https://img.shields.io/badge/kernel-XNU-101a35)
 ![Arch](https://img.shields.io/badge/arch-arm64_·_x86__64-3a4d85)
 ![Stage](https://img.shields.io/badge/stage-foundation-e0a437)
+[![build](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml/badge.svg)](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml)
 
 </div>
 
@@ -27,7 +28,7 @@ Big milestones on the way, smaller steps between them:
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Kernel builds and boots in a VM | planned |
+| 1 | Kernel builds and boots in a VM | in progress |
 | 2 | Minimal userland: libc, init, shell | planned |
 | 3 | **Homebrew port** — package management on Ioni | goal |
 | 4 | **XQuartz + FluxBox** — a graphical X11 desktop | goal |
@@ -51,7 +52,16 @@ The repository currently holds the XNU source base:
 
 ## Building
 
-Building XNU upstream requires Apple's toolchain (Xcode on macOS) and the Darwin build ecosystem. As Ioni moves toward Stage 1 of the roadmap, its own build scripts and a documented cross-build path will land in this section. Until then, the upstream instructions apply: see the `doc/` directory and the release notes at [apple-oss-distributions](https://github.com/apple-oss-distributions/distribution/tags).
+XNU builds only on macOS with Xcode installed. The build wrapper hides the make details:
+
+```sh
+./scripts/build.sh                                                  # RELEASE, this machine's arch
+KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # custom variant
+```
+
+Variables: `KERNEL_CONFIGS` — RELEASE / DEVELOPMENT / DEBUG / PROFILE (default RELEASE); `ARCH_CONFIGS` — ARM64 / X86_64 (default ARM64); `SDKROOT` — SDK path (default macosx). Artifacts land in `BUILD/sym/`: `kernel.<config>` is the bootable image, `kernel.<config>.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
+
+CI runs on every push to `main` and on pull requests: RELEASE and DEVELOPMENT kernels for ARM64 plus RELEASE for X86_64 are built on GitHub Actions `macos-26` runners and uploaded as artifacts.
 
 ## Licensing
 
