@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-label="Ioni OS — built on the XNU kernel">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#101a35"/>
+      <stop offset="1" stop-color="#1b2a55"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6ea8ff"/>
+      <stop offset="1" stop-color="#9b7bff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6ea8ff" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#6ea8ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="960" height="320" rx="28" fill="url(#bg)"/>
+
+  <g transform="translate(185,160)">
+    <circle r="128" fill="url(#glow)"/>
+    <circle r="106" fill="none" stroke="#2c3a66" stroke-width="1.5"/>
+    <circle r="78" fill="none" stroke="#3a4d85" stroke-width="1.5" stroke-dasharray="3 8"/>
+    <circle r="50" fill="none" stroke="#4d66ab" stroke-width="1.5"/>
+    <circle r="34" fill="none" stroke="url(#accent)" stroke-width="2" stroke-opacity="0.65"/>
+    <circle r="21" fill="url(#accent)"/>
+    <circle cx="106" cy="0" r="5" fill="#6ea8ff"/>
+    <circle cx="-55" cy="-55" r="4" fill="#9b7bff"/>
+    <circle cx="0" cy="-50" r="3.5" fill="#6ea8ff"/>
+  </g>
+
+  <rect x="396" y="92" width="44" height="6" rx="3" fill="url(#accent)"/>
+
+  <text x="390" y="182" font-family="-apple-system,'SF Pro Display','Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" font-size="118" font-weight="700" fill="#f2f6ff" letter-spacing="3">Ioni</text>
+  <text x="396" y="226" font-family="-apple-system,'SF Pro Display','Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" font-size="23" font-weight="600" fill="#8fa3cc" letter-spacing="10">OPERATING SYSTEM</text>
+  <text x="396" y="258" font-family="-apple-system,'SF Pro Display','Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" font-size="18" fill="#5f719c">built on the XNU kernel · Mach + BSD</text>
+</svg>
