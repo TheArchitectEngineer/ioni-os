@@ -288,6 +288,12 @@ build_libmalloc() {
         fi
         # every malloc target variant must default the atomic config itself
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
+        # memorystatus kqueue notes for the pressure masks in internal.h
+        if ! grep -q "IONI_NOTE_MEMORYSTATUS" "$DEPS_DIR/libmalloc/src/internal.h"; then
+                printf '/* IONI_NOTE_MEMORYSTATUS: internal SDK event.h constants */\n#ifndef NOTE_MEMORYSTATUS_MSL_STATUS\n#define NOTE_MEMORYSTATUS_PRESSURE_NORMAL 0x00000001\n#define NOTE_MEMORYSTATUS_PRESSURE_WARN 0x00000002\n#define NOTE_MEMORYSTATUS_PRESSURE_CRITICAL 0x00000004\n#define NOTE_MEMORYSTATUS_LOW_SWAP 0x00000008\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_WARN 0x00000010\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL 0x00000020\n#define NOTE_MEMORYSTATUS_MSL_STATUS 0xf0000000\n#endif\n' \
+                        | cat - "$DEPS_DIR/libmalloc/src/internal.h" > "$DEPS_DIR/libmalloc/src/internal.h.ioni" \
+                        && mv "$DEPS_DIR/libmalloc/src/internal.h.ioni" "$DEPS_DIR/libmalloc/src/internal.h"
+        fi
         xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc
 }
 try libmalloc build_libmalloc
@@ -343,6 +349,11 @@ build_libdispatch() {
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
 #include <time.h>
+/* SDK 26.5 time.h hides the clock SPI behind config guards - provide it here */
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+extern uint64_t clock_gettime_nsec_np(clockid_t __clock_id);
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
