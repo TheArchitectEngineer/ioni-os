@@ -36,11 +36,16 @@ OUTPUT="$2"
 
 AVAILABILITY_PL="${SDKROOT}/${DRIVERKITROOT}/usr/local/libexec/availability.pl"
 
+# newer SDKs no longer ship availability.pl, fall back to the vendored copy
+if [ ! -x "${AVAILABILITY_PL}" ] ; then
+    AVAILABILITY_PL="$(cd "$(dirname "$0")" && pwd)/../../tools/availability/availability.pl"
+fi
+
 if [ ! -x "${AVAILABILITY_PL}" ] ; then
     echo "Unable to locate ${AVAILABILITY_PL} (or not executable)" >&2
     exit 1
 fi
-	    
+            
 {
 cat <<EOF
 /* Copyright (c) 2010 Apple Inc. All rights reserved.
@@ -82,7 +87,7 @@ for ver in $(${AVAILABILITY_PL} --ios) ; do
     ver_minor=$2
     ver_rel=$3
     if [ -z "$ver_rel" ]; then
-	    # don't produce these defines for releases with tertiary release numbers
+            # don't produce these defines for releases with tertiary release numbers
         value=$(printf "%d%02d00" ${ver_major} ${ver_minor})
         str=$(printf "__IPHONE_%d_%d" ${ver_major} ${ver_minor})
         echo "#if defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__ >= ${value}"
@@ -100,18 +105,18 @@ for ver in $(${AVAILABILITY_PL} --macosx) ; do
     ver_minor=$2
     ver_rel=$3
     if [ -z "$ver_rel" ]; then
-	ver_rel=0
+        ver_rel=0
     fi
     if [ "$ver_major" -lt 10 -o \( "$ver_major" -eq 10 -a "$ver_minor" -lt 10 \) ]; then
-	value=$(printf "%d%d0" ${ver_major} ${ver_minor})
-	str=$(printf "__MAC_%d_%d" ${ver_major} ${ver_minor})
+        value=$(printf "%d%d0" ${ver_major} ${ver_minor})
+        str=$(printf "__MAC_%d_%d" ${ver_major} ${ver_minor})
     else
-	value=$(printf "%d%02d%02d" ${ver_major} ${ver_minor} ${ver_rel})
-	if [ "$ver_rel" -gt 0 ]; then
-	    str=$(printf "__MAC_%d_%d_%d" ${ver_major} ${ver_minor} ${ver_rel})
-	else
-	    str=$(printf "__MAC_%d_%d" ${ver_major} ${ver_minor})
-	fi
+        value=$(printf "%d%02d%02d" ${ver_major} ${ver_minor} ${ver_rel})
+        if [ "$ver_rel" -gt 0 ]; then
+            str=$(printf "__MAC_%d_%d_%d" ${ver_major} ${ver_minor} ${ver_rel})
+        else
+            str=$(printf "__MAC_%d_%d" ${ver_major} ${ver_minor})
+        fi
     fi
     echo "#if defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= ${value}"
     echo "#define __DARWIN_ALIAS_STARTING_MAC_${str}(x) x"
