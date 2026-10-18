@@ -60,7 +60,7 @@ XNU собирается только на macOS с установленным X
 KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # свой вариант
 ```
 
-При первом запуске `build.sh` вызывает `scripts/deps.sh`, который собирает fakeroot с тем, что нужно ядру: экспортированные заголовки ядра, заголовки libplatform и `libfirehose_kernel.a` из libdispatch Apple — всё запиновано на теги соответствующего release-манифеста macOS (26.5: `libdispatch-1542.100.32`, `libplatform-375.120.2`). `mig` и ctf-утилиты собираются только если Xcode их не даёт. Артефакты падают в `BUILD/sym/`: `kernel.<config>` — загружаемый образ, `.unstripped` — с символами для отладки; `./scripts/clean.sh` чистит дерево сборки.
+При первом запуске `build.sh` вызывает `scripts/deps.sh`, который собирает fakeroot с тем, что нужно ядру: экспортированные заголовки ядра, заголовки libplatform и `libfirehose_kernel.a` из libdispatch Apple — всё запиновано на теги соответствующего release-манифеста macOS (26.5: `libdispatch-1542.100.32`, `libplatform-375.120.2`). `mig` и ctf-утилиты собираются только если Xcode их не даёт. Артефакты падают в `BUILD/obj/<CONFIG>_<ARCH>/`: `kernel` — загружаемый образ, `kernel.unstripped` — с символами для отладки; `./scripts/clean.sh` чистит дерево сборки.
 
 CI запускается на каждый пуш в `main` и на pull request'ы на раннерах `macos-26` в GitHub Actions: экспорт заголовков для ARM64 и X86_64 и полная сборка **x86_64-ядра** — жёсткие гейты, бинарник x86_64-ядра выкладывается как артефакт сборки. ARM64-джоба остаётся experimental, пока для её линковки не появятся машинные библиотеки из KDK (sptm/txm).
 

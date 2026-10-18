@@ -51,7 +51,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kernel-RELEASE-X86_64
-          path: BUILD/sym/
+          path: |
+            BUILD/obj/RELEASE_X86_64/kernel
+            BUILD/obj/RELEASE_X86_64/kernel.dSYM
           if-no-files-found: error
 
   kernel-arm64:

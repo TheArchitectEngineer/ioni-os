@@ -60,7 +60,7 @@ XNU builds only on macOS with Xcode installed. The wrapper scripts hide the make
 KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # custom variant
 ```
 
-On the first run `build.sh` calls `scripts/deps.sh`, which assembles a fakeroot with the pieces the kernel needs: exported kernel headers, libplatform headers and `libfirehose_kernel.a` from Apple's libdispatch — all pinned to the tags of the matching macOS release manifest (26.5: `libdispatch-1542.100.32`, `libplatform-375.120.2`). `mig` and the ctf tools are built only when Xcode doesn't provide them. Artifacts land in `BUILD/sym/`: `kernel.<config>` is the bootable image, `.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
+On the first run `build.sh` calls `scripts/deps.sh`, which assembles a fakeroot with the pieces the kernel needs: exported kernel headers, libplatform headers and `libfirehose_kernel.a` from Apple's libdispatch — all pinned to the tags of the matching macOS release manifest (26.5: `libdispatch-1542.100.32`, `libplatform-375.120.2`). `mig` and the ctf tools are built only when Xcode doesn't provide them. Artifacts land in `BUILD/obj/<CONFIG>_<ARCH>/`: `kernel` is the bootable image, `kernel.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
 
 CI runs on every push to `main` and on pull requests on GitHub Actions `macos-26` runners: header exports for ARM64 and X86_64 and a full **x86_64 kernel build** are hard gates, and the x86_64 kernel binary is uploaded as a build artifact. The ARM64 kernel job stays experimental until its link gets KDK machine libraries (sptm/txm).
 

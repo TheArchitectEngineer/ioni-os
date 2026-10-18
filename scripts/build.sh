@@ -62,4 +62,4 @@ make -j "$(sysctl -n hw.ncpu)" \
 	ARCH_CONFIGS="$ARCH_CONFIGS" \
 	BUILD_WERROR=0
 
-ls -lh BUILD/sym
+ls -lh BUILD/obj/${KERNEL_CONFIGS%% *}_${ARCH_CONFIGS%% *}/kernel* 2>/dev/null || ls -lh BUILD/obj/
