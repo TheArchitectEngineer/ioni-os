@@ -173,7 +173,6 @@ cp "$REPO_ROOT"/libkern/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 # mach eventlink types and disklabel, kernel-user headers the SDK omits
 cp "$REPO_ROOT/osfmk/mach/mach_eventlink_types.h" "$FROOT_INC/mach/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/disklabel.h" "$FROOT_INC/sys/" 2>/dev/null || true
-cp "$REPO_ROOT/bsd/sys/event_private.h" "$FROOT_INC/sys/" 2>/dev/null || true
 # pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
 # includes <pthread/priority_private.h> which Apple ships only in the internal SDK
 mkdir -p "$FROOT_INC/pthread"
@@ -251,7 +250,7 @@ find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o
 sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/stack_logging.h" "$FROOT_INC/malloc_private.h" \
         "$FROOT_INC/thread_stack_pcs.h" "$FROOT_INC/_bounds.h" "$FROOT_INC/spawn_private.h" \
         "$FROOT_INC/sys/spawn_internal.h" "$FROOT_INC/sys/disklabel.h" \
-        "$FROOT_INC/sys/event_private.h" "$FROOT_INC/pthread/priority_private.h" 2>/dev/null || true
+        "$FROOT_INC/pthread/priority_private.h" 2>/dev/null || true
 find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
         -name "*.h" -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
 log "kernel header shims: ok"
@@ -275,7 +274,7 @@ try libpthread build_libpthread
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1' 'NOTE_MEMORYSTATUS_PRESSURE_NORMAL=0x00000001 NOTE_MEMORYSTATUS_PRESSURE_WARN=0x00000002 NOTE_MEMORYSTATUS_PRESSURE_CRITICAL=0x00000004 NOTE_MEMORYSTATUS_LOW_SWAP=0x00000008 NOTE_MEMORYSTATUS_PROC_LIMIT_WARN=0x00000010 NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL=0x00000020 NOTE_MEMORYSTATUS_MSL_STATUS=0xf0000000'
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
@@ -342,6 +341,11 @@ extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
 extern int kdebug_trace(uint32_t code, uint64_t a, uint64_t b,
         uint64_t c, uint64_t d);
+#include <sys/_types/_clockid_t.h>
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+extern uint64_t clock_gettime_nsec_np(clockid_t __clock_id);
 /* mach message aux header, kernel-user shared struct from our xnu */
 typedef struct {
         uint32_t        msgdh_size;
@@ -355,6 +359,8 @@ EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
+        # kernel atomic_private.h defaults the dependency mode off outside the kernel
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
                 -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +
