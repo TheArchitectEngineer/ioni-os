@@ -10,8 +10,10 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 ## Stage 1 — Buildable kernel
 
-- [x] Build scripts and CI: GitHub Actions builds kernels on macos-26 runners (Xcode 26.6)
-- [ ] First green build: RELEASE / DEVELOPMENT ARM64 and RELEASE X86_64
+- [x] Build scripts and CI: GitHub Actions (macos-26 runners, Xcode 26.6)
+- [x] Header export pipeline green on CI (`exporthdrs` for ARM64 + X86_64)
+- [ ] Dependency chain in CI: mig (bootstrap_cmds), ctf tools (dtrace), libplatform, libdispatch (firehose)
+- [ ] Full kernel build on CI — x86_64 first; ARM64 link needs KDK machine libraries
 - [ ] Kernel boots in a VM with serial console output
 
 ## Stage 2 — Minimal userland
@@ -44,7 +46,7 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 **Этап 0 — фундамент** (готово): база XNU импортирована, поверхностный ребрендинг применён — система отвечает `Ioni` в `uname` и в баннере загрузки.
 
-**Этап 1 — собираемое ядро**: скрипты сборки и CI готовы (GitHub Actions, раннеры macos-26), ждём первый зелёный билд, дальше — загрузка ядра в виртуальной машине.
+**Этап 1 — собираемое ядро**: скрипты сборки и CI готовы, экспорт заголовков зелёный на CI; дальше — цепочка зависимостей (mig, ctf, libdispatch) и полная линковка ядра (x86_64 сначала, ARM64 требует KDK).
 
 **Этап 2 — минимальный userland**: libc, dyld, init, shell и загружаемый ramdisk-образ.
 

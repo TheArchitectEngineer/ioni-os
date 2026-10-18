@@ -61,7 +61,7 @@ KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # custom var
 
 Variables: `KERNEL_CONFIGS` — RELEASE / DEVELOPMENT / DEBUG / PROFILE (default RELEASE); `ARCH_CONFIGS` — ARM64 / X86_64 (default ARM64); `SDKROOT` — SDK path (default macosx). Artifacts land in `BUILD/sym/`: `kernel.<config>` is the bootable image, `kernel.<config>.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
 
-CI runs on every push to `main` and on pull requests: RELEASE and DEVELOPMENT kernels for ARM64 plus RELEASE for X86_64 are built on GitHub Actions `macos-26` runners and uploaded as artifacts.
+CI runs on every push to `main` and on pull requests: header exports for ARM64 and X86_64 are a hard gate on GitHub Actions `macos-26` runners, and the full kernel build runs as an experimental job — linking the arm64 kernel needs Apple's KDK machine libraries plus a fakeroot dependency chain (mig, ctf tools, libdispatch firehose), which is the next build-system milestone.
 
 ## Licensing
 

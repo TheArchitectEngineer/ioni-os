@@ -61,7 +61,7 @@ KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # свой �
 
 Переменные: `KERNEL_CONFIGS` — RELEASE / DEVELOPMENT / DEBUG / PROFILE (по умолчанию RELEASE); `ARCH_CONFIGS` — ARM64 / X86_64 (по умолчанию ARM64); `SDKROOT` — путь к SDK (по умолчанию macosx). Артефакты падают в `BUILD/sym/`: `kernel.<config>` — загружаемый образ, `kernel.<config>.unstripped` — с символами для отладки; `./scripts/clean.sh` чистит дерево сборки.
 
-CI запускается на каждый пуш в `main` и на pull request'ы: ядра RELEASE и DEVELOPMENT для ARM64 плюс RELEASE для X86_64 собираются на раннерах `macos-26` в GitHub Actions и выгружаются в артефакты.
+CI запускается на каждый пуш в `main` и на pull request'ы: экспорт заголовков для ARM64 и X86_64 — жёсткий гейт на раннерах `macos-26` в GitHub Actions, а полная сборка ядра пока идёт как experimental-джоба — линковка arm64-ядра требует машинных библиотек из KDK и fakeroot-цепочки зависимостей (mig, ctf-утилиты, libdispatch firehose) — это следующая веха build-системы.
 
 ## Лицензия
 
