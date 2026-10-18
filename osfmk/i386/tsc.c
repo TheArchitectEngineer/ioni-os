@@ -217,6 +217,21 @@ tsc_init(void)
 	default: {
 		uint64_t msr_flex_ratio;
 		uint64_t msr_platform_info;
+		uint64_t dt_tsc_freq;
+
+		// bootloader may publish a measured TSC frequency where the ratio MSRs below are unusable (QEMU TCG)
+		dt_tsc_freq = EFI_get_frequency("TSCFrequency");
+		if (dt_tsc_freq != 0) {
+			busFreq = EFI_get_frequency("FSBFrequency");
+			if (busFreq == 0) {
+				busFreq = BASE_NHM_CLOCK_SOURCE;
+			}
+			tscGranularity = (uint32_t)(dt_tsc_freq / busFreq);
+			if (tscGranularity == 0) {
+				tscGranularity = 1;
+			}
+			break;
+		}
 
 		/* See if FLEX_RATIO is being used */
 		msr_flex_ratio = rdmsr64(MSR_FLEX_RATIO);
