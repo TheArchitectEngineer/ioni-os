@@ -33,10 +33,13 @@ clone() {
 }
 
 xb() {
-        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
-        if [ $# -gt 5 ]; then shift 5; else shift $#; fi
+        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"; _cflags="${6:-}"
         # strip Apple-internal xcconfig includes (CoreOS/*) missing from public Xcode
         find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
+        for _f in $(find "$_src" -name "*.xcconfig"); do
+                printf '\nHEADER_SEARCH_PATHS = $(inherited) %s %s\n' "$FAKEROOT/usr/local/include" "$_extra" >> "$_f"
+                [ -n "$_cflags" ] && printf 'OTHER_CFLAGS = $(inherited) %s\n' "$_cflags" >> "$_f"
+        done
         cd "$_src"
         _rc=0
         env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
@@ -46,8 +49,7 @@ xb() {
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
                 RC_ProjectNameAndSourceVersion="$_name" \
-                HEADER_SEARCH_PATHS="$(inherited) $FAKEROOT/usr/local/include $_extra" \
-                "$@" || _rc=$?
+                || _rc=$?
         cd "$REPO_ROOT"
         return $_rc
 }
@@ -102,8 +104,7 @@ try libpthread build_libpthread
 
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
-        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc "" \
-                'OTHER_CFLAGS=$(inherited) -fbounds-safety'
+        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc "" "-fbounds-safety"
 }
 try libmalloc build_libmalloc
 

@@ -29,25 +29,34 @@ mkdir -p "$(dirname "$LOG")"
 say "kernel: $KERNEL"
 ls -lh "$KERNEL"
 
-brew install -q cirruslabs/cli/tart >/dev/null 2>&1 || true
 brew install -q cirruslabs/cli/sshpass >/dev/null 2>&1 || true
-command -v tart >/dev/null 2>&1 || { say "tart not installed"; exit 1; }
 command -v sshpass >/dev/null 2>&1 || { say "sshpass not installed"; exit 1; }
-say "tart $(tart --version 2>/dev/null | head -n 1)"
+
+TART=""
+command -v tart >/dev/null 2>&1 && TART="tart"
+if [ -z "$TART" ]; then
+        say "fetching tart release"
+        curl -fL --retry 3 -o "$HOME/tart.tar.gz" https://github.com/cirruslabs/tart/releases/latest/download/tart.tar.gz || { say "tart download failed"; exit 1; }
+        tar -xzf "$HOME/tart.tar.gz" -C "$HOME"
+        rm -f "$HOME/tart.tar.gz"
+        TART="$HOME/tart.app/Contents/MacOS/tart"
+fi
+[ -x "$TART" ] || { say "tart binary missing"; exit 1; }
+say "tart: $TART ($("$TART" --version 2>/dev/null | head -n 1))"
 
 security create-keychain -p "$PASS" login.keychain >/dev/null 2>&1 || true
 security unlock-keychain -p "$PASS" login.keychain >/dev/null 2>&1 || true
 
-tart clone "$IMAGE" "$VM"
+"$TART" clone "$IMAGE" "$VM"
 say "run headless (console -> $LOG)"
-tart run "$VM" --no-graphics >>"$LOG" 2>&1 &
+"$TART" run "$VM" --no-graphics >>"$LOG" 2>&1 &
 TART_PID=$!
-cleanup() { kill "$TART_PID" >/dev/null 2>&1 || true; tart stop "$VM" >/dev/null 2>&1 || true; }
+cleanup() { kill "$TART_PID" >/dev/null 2>&1 || true; "$TART" stop "$VM" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 IP=""
 for i in $(seq 1 60); do
-        IP="$(tart ip "$VM" 2>/dev/null | head -n 1 || true)"
+        IP="$("$TART" ip "$VM" 2>/dev/null | head -n 1 || true)"
         if [ -n "$IP" ] && guest "$IP" true >/dev/null 2>&1; then
                 break
         fi
