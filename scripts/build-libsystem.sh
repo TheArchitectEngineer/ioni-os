@@ -39,6 +39,30 @@ clone() {
 # bare names inside macro parameter lists stay untouched
 STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g; s/xros\(/visionos(/g'
 
+# SDK 26 dropped bridgeos/driverkit from the UNAVAILABLE domain macros, but those
+# names also appear as macro parameter names - strip them only inside
+# API_UNAVAILABLE(...) argument spans, never in #define parameter lists
+STRIP_UNAVAIL='s#((?:__)?API_UNAVAILABLE\s*\()([^)]*)\)#$1 . join(",", grep { !/^\s*(bridgeos|driverkit)\s*$/ } split(/,/, $2)) . ")"#ge'
+
+strip_tree() {
+        find "$1" \( -name "*.h" -o -name "*.c" -o -name "*.m" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+        find "$1" \( -name "*.h" -o -name "*.c" -o -name "*.m" \) -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
+}
+
+# append a build setting in every xcconfig of a project tree (command-line
+# settings would override the whole chain, xcconfig appends inherit it)
+xcset() {
+        _tree="$1"; _setting="$2"; _value="$3"
+        find "$_tree" -name "*.xcconfig" | while IFS= read -r _f; do
+                grep -q "$_value" "$_f" 2>/dev/null && continue
+                if grep -q "^$_setting" "$_f" 2>/dev/null; then
+                        sed -i '' "s|^$_setting = \(.*\)$|$_setting = \1 $_value|" "$_f"
+                else
+                        printf '\n%s = %s\n' "$_setting" "$_value" >> "$_f"
+                fi
+        done
+}
+
 xb() {
         _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
         # drop Apple-internal xcconfig includes, keep ones shipped with Xcode
@@ -48,7 +72,7 @@ xb() {
         else
                 find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         fi
-        find "$_src" \( -name "*.h" -o -name "*.c" -o -name "*.m" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+        strip_tree "$_src"
         cd "$_src"
         # fakeroot headers ride in via CPATH (clang-native), project search paths stay untouched
         _cpath="$FAKEROOT/usr/local/include"
@@ -90,6 +114,7 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         mkdir -p "$FAKEROOT/usr/local/include/os"
         cp "$REPO_ROOT/libkern/os/base_private.h" "$FAKEROOT/usr/local/include/os/"
         find "$FAKEROOT/usr/local/include" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+        find "$FAKEROOT/usr/local/include" -name "*.h" -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
         log "libplatform headers: ok"
 else
         log "libplatform headers: cached"
@@ -112,27 +137,54 @@ build_libsyscall() {
 try libsyscall build_libsyscall
 
 # kernel-side headers the userland libs expect but the SDK no longer ships;
-# installed AFTER libsyscall because its exporthdrs rewrites fakeroot includes
+# installed AFTER libsyscall because its exporthdrs rewrites fakeroot includes;
+# vendored selectively - kernel OSAtomic.h must NOT shadow the SDK's userland one
 FROOT_INC="$FAKEROOT/usr/local/include"
 mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
         "$FROOT_INC/arm" "$FROOT_INC/i386" "$FROOT_INC/mach-o"
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
-cp "$REPO_ROOT"/libkern/libkern/*.h "$FROOT_INC/libkern/" 2>/dev/null || true
+cp "$REPO_ROOT/libkern/libkern/OSCrossEndian.h" "$FROOT_INC/libkern/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$FROOT_INC/i386/" 2>/dev/null || true
 clone dyld "$DYLD_TAG" "$DEPS_DIR/dyld"
 cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2>/dev/null || true
-find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
-        -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
-# THREAD_QOS_* graph: private kernel constants, not in any public header; base_private.h
-# is the first shim every libpthread internal compile includes
-if ! grep -q THREAD_QOS_LAST "$FROOT_INC/os/base_private.h" 2>/dev/null; then
-cat >> "$FROOT_INC/os/base_private.h" <<'EOF'
 
-/* thread qos graph (osfmk/mach/thread_policy_private.h constants) */
-#ifndef THREAD_QOS_LAST
+# os/alloc_once_private.h: Apple-internal, absent from every public tree; the
+# libplatform impl header carries the API, we add the key pthread asks for
+if [ ! -f "$FROOT_INC/os/alloc_once_private.h" ]; then
+cat > "$FROOT_INC/os/alloc_once_private.h" <<'EOF'
+#ifndef __OS_ALLOC_ONCE_PRIVATE_H
+#define __OS_ALLOC_ONCE_PRIVATE_H
+#include <os/alloc_once_impl.h>
+#ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD
+#define OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD 61
+#endif
+#endif
+EOF
+fi
+# os/feature_private.h: feature-flag SPI, Ioni always reports the fallback value
+if [ ! -f "$FROOT_INC/os/feature_private.h" ]; then
+cat > "$FROOT_INC/os/feature_private.h" <<'EOF'
+#ifndef __OS_FEATURE_PRIVATE_H
+#define __OS_FEATURE_PRIVATE_H
+#include <sys/types.h>
+#include <stdbool.h>
+static __inline bool
+os_feature_enabled_simple(const void *lib, const char *feature, bool fallback)
+{
+        (void)lib; (void)feature;
+        return fallback;
+}
+#endif
+EOF
+fi
+# thread qos graph: private kernel constants, not in any public header
+if [ ! -f "$FROOT_INC/os/thread_qos_ioni.h" ]; then
+cat > "$FROOT_INC/os/thread_qos_ioni.h" <<'EOF'
+#ifndef __OS_THREAD_QOS_IONI_H
+#define __OS_THREAD_QOS_IONI_H
 #define THREAD_QOS_UNSPECIFIED          0
 #define THREAD_QOS_MAINTENANCE          1
 #define THREAD_QOS_BACKGROUND           2
@@ -143,11 +195,19 @@ cat >> "$FROOT_INC/os/base_private.h" <<'EOF'
 #define THREAD_QOS_LAST                 7
 #endif
 EOF
-log "kernel header shims: ok"
 fi
+find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
+        "$FROOT_INC/arm" "$FROOT_INC/i386" -name "*.h" \
+        -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
+        -name "*.h" -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
+log "kernel header shims: ok"
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
+        # has no THREAD_QOS graph - inject the constants through build settings
+        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7'
         xb "$DEPS_DIR/libpthread" libpthread.xcodeproj libsystem_pthread pthread
 }
 try libpthread build_libpthread
@@ -164,20 +224,40 @@ build_libclosure() {
 }
 try libclosure build_libclosure
 
+# blocks install drops Block_private.h but not Block.h, so every consumer that
+# pulls <Block_private.h> loses BLOCK_EXPORT - ship the header ourselves
+if [ -f "$DEPS_DIR/libclosure/Block.h" ] && [ -f "$FROOT_INC/Block_private.h" ] \
+        && [ ! -f "$FROOT_INC/Block.h" ]; then
+        cp "$DEPS_DIR/libclosure/Block.h" "$FROOT_INC/Block.h"
+        sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/Block.h" 2>/dev/null || true
+        perl -0777 -pi -e "$STRIP_UNAVAIL" "$FROOT_INC/Block.h" 2>/dev/null || true
+        log "Block.h shipped to fakeroot"
+fi
+
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
         # SDK headers (sys/time.h) self-include <dispatch/time.h> from the source tree
         # before src/internal.h defines the INDIRECT guards - set them project-wide
-        _dxc="$DEPS_DIR/libdispatch/xcodeconfig"
-        for _f in libdispatch.xcconfig libfirehose.xcconfig; do
-                if [ -f "$_dxc/$_f" ] && ! grep -q "__DISPATCH_INDIRECT__" "$_dxc/$_f"; then
-                        if grep -q "^GCC_PREPROCESSOR_DEFINITIONS" "$_dxc/$_f"; then
-                                sed -i '' 's|^GCC_PREPROCESSOR_DEFINITIONS = \(.*\)$|GCC_PREPROCESSOR_DEFINITIONS = \1 __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1|' "$_dxc/$_f"
-                        else
-                                printf '\nGCC_PREPROCESSOR_DEFINITIONS = __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1\n' >> "$_dxc/$_f"
-                        fi
-                fi
-        done
+        # and force dispatch/base.h first via a prefix header
+        cat > "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h" <<'EOF'
+#ifndef __DISPATCH_INDIRECT__
+#define __DISPATCH_INDIRECT__ 1
+#endif
+#ifndef __DISPATCH_BUILDING_DISPATCH__
+#define __DISPATCH_BUILDING_DISPATCH__ 1
+#endif
+#ifndef __OS_WORKGROUP_INDIRECT__
+#define __OS_WORKGROUP_INDIRECT__ 1
+#endif
+#ifndef __OS_WORKGROUP_PRIVATE_INDIRECT__
+#define __OS_WORKGROUP_PRIVATE_INDIRECT__ 1
+#endif
+#include <dispatch/base.h>
+EOF
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
+        xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
+        find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
+                -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +
         xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch "$DEPS_DIR/libdispatch"
 }
 try libdispatch build_libdispatch
