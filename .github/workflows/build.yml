@@ -35,14 +35,34 @@ jobs:
           if-no-files-found: error
 
   kernel:
+    name: kernel RELEASE X86_64
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build kernel
+        run: ./scripts/build.sh
+        env:
+          KERNEL_CONFIGS: RELEASE
+          ARCH_CONFIGS: X86_64
+
+      - name: upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-RELEASE-X86_64
+          path: BUILD/sym/
+          if-no-files-found: error
+
+  kernel-arm64:
     name: kernel RELEASE ARM64 (experimental, needs KDK)
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 150
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: build
+      - name: build kernel
         run: ./scripts/build.sh
         env:
           KERNEL_CONFIGS: RELEASE
