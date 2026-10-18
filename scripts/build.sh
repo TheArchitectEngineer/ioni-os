@@ -22,6 +22,22 @@ export SDKROOT
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
 
+if [ "$SDKROOT" = "macosx" ]; then
+        SDK_DIR="$(xcrun -sdk macosx -show-sdk-path)"
+else
+        SDK_DIR="$SDKROOT"
+fi
+
+# plain Xcode SDKs miss include dirs that KDKs have
+for D in \
+        "usr/local/include/kernel" \
+        "usr/local/include" \
+        "System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/AppleFeatures" \
+        "System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+do
+        mkdir -p "$SDK_DIR/$D" 2>/dev/null || sudo mkdir -p "$SDK_DIR/$D"
+done
+
 echo "build: KERNEL_CONFIGS=$KERNEL_CONFIGS ARCH_CONFIGS=$ARCH_CONFIGS SDKROOT=$SDKROOT VERSION=$RC_DARWIN_KERNEL_VERSION"
 
 make -j "$(sysctl -n hw.ncpu)" \
