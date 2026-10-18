@@ -87,7 +87,7 @@ jobs:
         run: |
           KERNEL=$(find BUILD/obj -type f -name kernel | head -n1)
           echo "kernel: $KERNEL"
-          ./scripts/qemu-boot.sh "$KERNEL"
+          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8" IONI_QEMU_TIMEOUT=600 ./scripts/qemu-boot.sh "$KERNEL"
 
       - name: upload boot logs
         if: always()
@@ -97,6 +97,7 @@ jobs:
           path: |
             BUILD/qemu-serial.log
             BUILD/qemu-stdout.log
+            BUILD/qemu-debug.log
           if-no-files-found: warn
 
   kernel-arm64:

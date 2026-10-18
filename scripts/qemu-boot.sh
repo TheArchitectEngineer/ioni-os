@@ -112,6 +112,8 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -monitor none \
     -no-reboot \
     -serial "file:$SERIAL_LOG" \
+    -d int,cpu_reset,guest_errors \
+    -D "$OUT_DIR/qemu-debug.log" \
     $PFLASH_ARGS \
     -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
     > "$OUT_DIR/qemu-stdout.log" 2>&1
@@ -134,7 +136,7 @@ if ! grep -q "jumping to kernel" "$SERIAL_LOG"; then
     exit 1
 fi
 
-KERNEL_MARKS="panic(cpu|Kernel Version|panic:|BSD|pmap|APIC|IOKit|kdp|machine_info|cpu:"
+KERNEL_MARKS="panic.cpu|Kernel Version|panic:|BSD|pmap|APIC|IOKit|kdp|machine_info|cpu:"
 if grep -Eq "$KERNEL_MARKS" "$SERIAL_LOG"; then
     echo "qemu-boot: PASS kernel reached serial console"
     grep -E "$KERNEL_MARKS" "$SERIAL_LOG" | head -20
@@ -143,4 +145,8 @@ fi
 
 echo "qemu-boot: FAIL no kernel serial output detected (silent early fault?)" >&2
 tail -80 "$SERIAL_LOG"
+if [ -s "$OUT_DIR/qemu-debug.log" ]; then
+    echo "qemu-boot: qemu debug log: $(wc -l < "$OUT_DIR/qemu-debug.log") lines, tail:" >&2
+    tail -40 "$OUT_DIR/qemu-debug.log" >&2
+fi
 exit 1
