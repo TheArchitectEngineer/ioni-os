@@ -32,15 +32,21 @@ clone() {
         fi
 }
 
+STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos//g; s/, driverkit//g'
+
 xb() {
-        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"; _cflags="${6:-}"
-        # strip Apple-internal xcconfig includes (CoreOS/*) missing from public Xcode
-        find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
-        for _f in $(find "$_src" -name "*.xcconfig"); do
-                printf '\nHEADER_SEARCH_PATHS = $(inherited) %s %s\n' "$FAKEROOT/usr/local/include" "$_extra" >> "$_f"
-                [ -n "$_cflags" ] && printf 'OTHER_CFLAGS = $(inherited) %s\n' "$_cflags" >> "$_f"
-        done
+        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
+        # drop Apple-internal xcconfig includes, keep ones shipped with Xcode
+        DEVDIR="$(xcode-select -p 2>/dev/null || true)"
+        if [ -n "$DEVDIR" ] && [ -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
+                find "$_src" -name "*.xcconfig" -exec sed -i '' -E 's|^#include[[:space:]]*<CoreOS/.*||g' {} + 2>/dev/null || true
+        else
+                find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
+        fi
+        # bounds-safety annotations are no-ops without the closed toolchain
+        find "$_src" \( -name "*.h" -o -name "*.c" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
         cd "$_src"
+        _hsp="$(xcodebuild -sdk macosx -project "$_proj" -target "$_target" -showBuildSettings 2>/dev/null | awk -F' = ' '/[[:space:]]HEADER_SEARCH_PATHS =/{print $2; exit}')"
         _rc=0
         env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
@@ -49,6 +55,7 @@ xb() {
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
                 RC_ProjectNameAndSourceVersion="$_name" \
+                HEADER_SEARCH_PATHS="$_hsp $FAKEROOT/usr/local/include $_extra" \
                 || _rc=$?
         cd "$REPO_ROOT"
         return $_rc
@@ -75,6 +82,7 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         ditto "$DEPS_DIR/libpthread/private" "$FAKEROOT/usr/local/include"
         mkdir -p "$FAKEROOT/usr/local/include/os"
         cp "$REPO_ROOT/libkern/os/base_private.h" "$FAKEROOT/usr/local/include/os/"
+        find "$FAKEROOT/usr/local/include" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
         log "libplatform headers: ok"
 else
         log "libplatform headers: cached"
@@ -104,7 +112,7 @@ try libpthread build_libpthread
 
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
-        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc "" "-fbounds-safety"
+        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc
 }
 try libmalloc build_libmalloc
 

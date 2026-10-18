@@ -82,7 +82,7 @@ jobs:
 
   boot-vm:
     name: boot in VM (tart guest, in-guest kmutil)
-    runs-on: macos-26
+    runs-on: macos-15
     needs: kernel-arm64
     timeout-minutes: 90
     steps:
