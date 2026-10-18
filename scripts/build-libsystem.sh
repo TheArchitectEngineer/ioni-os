@@ -197,7 +197,7 @@ lines = open(f).readlines()
 out, depth = [], 0
 for ln in lines:
     st = ln.strip()
-    if depth == 0 and st == "#ifdef PRIVATE":
+    if depth == 0 and st in ("#ifdef PRIVATE", "#if PRIVATE"):
         depth = 1
         out.append("/* IONI_PRIVATE_LIFTED */\n")
         continue
@@ -327,7 +327,7 @@ try libpthread build_libpthread
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1'
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
@@ -447,7 +447,7 @@ try libdispatch build_libdispatch
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         # Libc clock_gettime uses the boottime SPI the SDK headers dropped
-        if ! grep -q "mach_boottime_usec" "$DEPS_DIR/Libc/gen/clock_gettime.c"; then
+        if ! grep -q "extern uint64_t mach_boottime_usec" "$DEPS_DIR/Libc/gen/clock_gettime.c"; then
                 printf '/* Ioni: boottime SPI (mach_time_private.h) */\nextern uint64_t mach_boottime_usec(void);\n' \
                         | cat - "$DEPS_DIR/Libc/gen/clock_gettime.c" > "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" \
                         && mv "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" "$DEPS_DIR/Libc/gen/clock_gettime.c"
