@@ -7,7 +7,7 @@ REPO_ROOT="$(pwd)"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/BUILD}"
 FAKEROOT="${FAKEROOT:-$BUILD_DIR/fakeroot}"
 DEPS_DIR="${DEPS_DIR:-$BUILD_DIR/deps}"
-LIBARCHS="${LIBARCHS:-x86_64 arm64}"
+LIBARCHS="${LIBARCHS:-x86_64}"
 
 LIBPLATFORM_TAG="${LIBPLATFORM_TAG:-libplatform-375.120.2}"
 LIBPTHREAD_TAG="${LIBPTHREAD_TAG:-libpthread-539.100.4}"
@@ -217,6 +217,10 @@ cat > "$FROOT_INC/os/alloc_once_private.h" <<'EOF'
 #endif
 EOF
 fi
+# os/log_pack shim: Libc os/assumes.c needs the internal log pack struct
+if [ -f "$FROOT_INC/os/log_private.h" ] && ! grep -q "os_log_pack_t" "$FROOT_INC/os/log_private.h"; then
+printf '\n/* Ioni: internal log pack surface used by os/assumes.c */\n#ifndef IONI_OS_LOG_PACK\n#define IONI_OS_LOG_PACK\ntypedef struct os_log_pack_s {\n\tconst char *olp_format;\n\tvoid *olp_data;\n\tsize_t olp_size;\n} *os_log_pack_t;\n#endif\n' >> "$FROOT_INC/os/log_private.h"
+fi
 # os/feature_private.h: feature-flag SPI, Ioni always reports the fallback value
 if [ ! -f "$FROOT_INC/os/feature_private.h" ]; then
 cat > "$FROOT_INC/os/feature_private.h" <<'EOF'
@@ -270,20 +274,10 @@ build_libpthread() {
         xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
         # has no THREAD_QOS graph - inject the constants through build settings
-        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t PRIVATE=1'
+        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
         # priority_private.h rides on the qos constants above; place it on the
         # pthread -I chain where qos_private.h expects it
         cp "$REPO_ROOT/bsd/pthread/priority_private.h" "$DEPS_DIR/libpthread/private/pthread/priority_private.h" 2>/dev/null || true
-        # qos.c needs the priority encoding inlines unconditionally - the SDK's own
-        # qos_private.h can win the include guard race, so append the guard-free
-        # content to types_internal.h which every libpthread TU includes first
-        if ! grep -q "IONI_PRIORITY_INLINES" "$DEPS_DIR/libpthread/src/types_internal.h"; then
-                printf '\n/* IONI_PRIORITY_INLINES: priority_private.h content, guard-free */\n' \
-                        >> "$DEPS_DIR/libpthread/src/types_internal.h"
-                grep -v "_PTHREAD_PRIORITY_PRIVATE_H_" \
-                        "$DEPS_DIR/libpthread/private/pthread/priority_private.h" \
-                        >> "$DEPS_DIR/libpthread/src/types_internal.h"
-        fi
         xb "$DEPS_DIR/libpthread" libpthread.xcodeproj libsystem_pthread pthread
 }
 try libpthread build_libpthread
@@ -359,12 +353,17 @@ build_libdispatch() {
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
 #include <time.h>
-#include <Block.h>
 /* SDK 26.5 time.h hides the clock SPI behind config guards - provide it here */
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
 #endif
 extern uint64_t clock_gettime_nsec_np(unsigned int __clock_id);
+/* blocks: the case-insensitive <Block.h> lookup picks up libdispatch's own
+ * dispatch/block.h stub, so the block API rides here instead */
+extern void *_Block_copy(const void *aBlock);
+extern void _Block_release(const void *aBlock);
+#define Block_copy(...) ((__typeof(__VA_ARGS__))_Block_copy(__unsafe_forge_single(const void *, (const void *)(__VA_ARGS__))))
+#define Block_release(...) _Block_release(__unsafe_forge_single(const void *, (const void *)(__VA_ARGS__)))
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
