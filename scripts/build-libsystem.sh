@@ -163,6 +163,13 @@ clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
 clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
 cp "$DEPS_DIR/libmalloc/private/stack_logging.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/libmalloc/private/malloc_private.h" "$FROOT_INC/" 2>/dev/null || true
+# memorystatus kqueue notes: internal SDK event.h constants the malloc masks rely on
+if [ -f "$FROOT_INC/malloc_private.h" ] \
+        && ! grep -q NOTE_MEMORYSTATUS_MSL_STATUS "$FROOT_INC/malloc_private.h"; then
+printf '#ifndef NOTE_MEMORYSTATUS_MSL_STATUS\n#define NOTE_MEMORYSTATUS_PRESSURE_NORMAL 0x00000001\n#define NOTE_MEMORYSTATUS_PRESSURE_WARN 0x00000002\n#define NOTE_MEMORYSTATUS_PRESSURE_CRITICAL 0x00000004\n#define NOTE_MEMORYSTATUS_LOW_SWAP 0x00000008\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_WARN 0x00000010\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL 0x00000020\n#define NOTE_MEMORYSTATUS_MSL_STATUS 0xf0000000\n#endif\n' \
+        | cat - "$FROOT_INC/malloc_private.h" > "$FROOT_INC/malloc_private.h.ioni" \
+        && mv "$FROOT_INC/malloc_private.h.ioni" "$FROOT_INC/malloc_private.h"
+fi
 cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
 # spawn SPI: kernel-user shared header from our xnu, the SDK ships only the public half
@@ -274,7 +281,7 @@ try libpthread build_libpthread
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1' 'NOTE_MEMORYSTATUS_PRESSURE_NORMAL=0x00000001 NOTE_MEMORYSTATUS_PRESSURE_WARN=0x00000002 NOTE_MEMORYSTATUS_PRESSURE_CRITICAL=0x00000004 NOTE_MEMORYSTATUS_LOW_SWAP=0x00000008 NOTE_MEMORYSTATUS_PROC_LIMIT_WARN=0x00000010 NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL=0x00000020 NOTE_MEMORYSTATUS_MSL_STATUS=0xf0000000'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
@@ -341,11 +348,6 @@ extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
 extern int kdebug_trace(uint32_t code, uint64_t a, uint64_t b,
         uint64_t c, uint64_t d);
-#include <sys/_types/_clockid_t.h>
-#ifndef CLOCK_REALTIME
-#define CLOCK_REALTIME 0
-#endif
-extern uint64_t clock_gettime_nsec_np(clockid_t __clock_id);
 /* mach message aux header, kernel-user shared struct from our xnu */
 typedef struct {
         uint32_t        msgdh_size;
