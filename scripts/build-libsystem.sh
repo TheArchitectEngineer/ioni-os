@@ -32,7 +32,10 @@ clone() {
         fi
 }
 
-STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos//g; s/, driverkit//g'
+# strip clang bounds-safety annotations (closed toolchain), keep availability args intact:
+# bridgeos/driverkit are only removed when they carry a numeric version arg -
+# bare names inside macro parameter lists (e.g. DISPATCH_OSX_SUPPORTS_AT_LEAST) stay
+STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g'
 
 xb() {
         _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
@@ -43,19 +46,20 @@ xb() {
         else
                 find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         fi
-        # bounds-safety annotations are no-ops without the closed toolchain
         find "$_src" \( -name "*.h" -o -name "*.c" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
         cd "$_src"
-        _hsp="$(xcodebuild -sdk macosx -project "$_proj" -target "$_target" -showBuildSettings 2>/dev/null | awk -F' = ' '/[[:space:]]HEADER_SEARCH_PATHS =/{print $2; exit}')"
+        # fakeroot headers ride in via CPATH (clang-native), project search paths stay untouched
+        _cpath="$FAKEROOT/usr/local/include"
+        [ -n "$_extra" ] && _cpath="$_cpath:$_extra"
         _rc=0
-        env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
+        env CPATH="$_cpath" \
+                LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
                 ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" CODE_SIGN_IDENTITY="-" \
                 OBJROOT="$BUILD_DIR/obj.$_name" \
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
                 RC_ProjectNameAndSourceVersion="$_name" \
-                HEADER_SEARCH_PATHS="$_hsp $FAKEROOT/usr/local/include $_extra" \
                 || _rc=$?
         cd "$REPO_ROOT"
         return $_rc
@@ -86,6 +90,31 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         log "libplatform headers: ok"
 else
         log "libplatform headers: cached"
+fi
+
+# kernel-side headers the userland libs expect but the SDK no longer ships
+FROOT_INC="$FAKEROOT/usr/local/include"
+mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys"
+cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
+# THREAD_QOS_* graph: private kernel constants, not in any public header; base_private.h
+# is the first shim every libpthread internal compile includes
+if ! grep -q THREAD_QOS_LAST "$FROOT_INC/os/base_private.h" 2>/dev/null; then
+cat >> "$FROOT_INC/os/base_private.h" <<'EOF'
+
+/* thread qos graph (osfmk/mach/thread_policy_private.h constants) */
+#ifndef THREAD_QOS_LAST
+#define THREAD_QOS_UNSPECIFIED          0
+#define THREAD_QOS_MAINTENANCE          1
+#define THREAD_QOS_BACKGROUND           2
+#define THREAD_QOS_UTILITY              3
+#define THREAD_QOS_LEGACY               4
+#define THREAD_QOS_USER_INITIATED       5
+#define THREAD_QOS_USER_INTERACTIVE     6
+#define THREAD_QOS_LAST                 7
+#endif
+EOF
+log "os headers + qos shim: ok"
 fi
 
 # libsyscall (libsystem_kernel source) from our xnu
@@ -144,4 +173,5 @@ log "fails:$FAILS"
 log "fakeroot libraries:"
 find "$FAKEROOT/usr" -name "*.dylib" -o -name "*.a" 2>/dev/null | head -30
 log "done"
+[ -z "$FAILS" ] || exit 1
 exit 0
