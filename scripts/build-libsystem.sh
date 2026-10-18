@@ -184,6 +184,7 @@ cp "$REPO_ROOT/bsd/machine/disklabel.h" "$FROOT_INC/machine/disklabel.h" 2>/dev/
 cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null || true
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
 cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
+cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
 # pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
 # includes <pthread/priority_private.h> which Apple ships only in the internal SDK
 mkdir -p "$FROOT_INC/pthread"
