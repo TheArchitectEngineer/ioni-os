@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-APSL_2.0-4d66ab)
 ![Kernel](https://img.shields.io/badge/kernel-XNU-101a35)
 ![Arch](https://img.shields.io/badge/arch-arm64_·_x86__64-3a4d85)
-![Stage](https://img.shields.io/badge/stage-foundation-e0a437)
+![Stage](https://img.shields.io/badge/stage-kernel-3a4d85)
 [![build](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml/badge.svg)](https://github.com/mel0k1/ioni-os/actions/workflows/build.yml)
 
 </div>
@@ -20,7 +20,7 @@ Ioni is an experimental operating system built on **XNU** — the hybrid kernel 
 
 The idea behind Ioni is to take this proven foundation and build an independent, open operating system around it — keeping the engineering quality of Darwin while breaking free of the Apple platform lock-in. Instead of inventing a kernel from zero, the project spends its energy on the layers above it: userland, package management, and eventually a graphical desktop.
 
-The project is at the **foundation stage**. The kernel source base is imported and surface branding is applied — the system already identifies itself as `Ioni` through `uname -s`, `sysctl kern.ostype` and the kernel boot banner. Everything deeper (ABI, syscalls, driver stack) is deliberately left untouched: while Ioni's own userland grows, it can lean on the existing Darwin ecosystem instead of fighting it.
+The project is past the **foundation stage**. The kernel source base is imported, surface branding is applied — the system already identifies itself as `Ioni` through `uname -s`, `sysctl kern.ostype` and the kernel boot banner — and the build system now produces kernel binaries on CI. The first pieces of Ioni's own userland (`init`, a shell) exist as well. Everything deeper (ABI, syscalls, driver stack) is deliberately kept close to upstream: while Ioni's own userland grows, it can lean on the existing Darwin ecosystem instead of fighting it.
 
 ## Goals
 
@@ -28,8 +28,8 @@ Big milestones on the way, smaller steps between them:
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Kernel builds and boots in a VM | in progress |
-| 2 | Minimal userland: libc, init, shell | planned |
+| 1 | Kernel builds and boots in a VM | building · boot planned |
+| 2 | Minimal userland: libc, init, shell | started — init, shell, rootfs image |
 | 3 | **Homebrew port** — package management on Ioni | goal |
 | 4 | **XQuartz + FluxBox** — a graphical X11 desktop | goal |
 
@@ -49,19 +49,29 @@ The repository currently holds the XNU source base:
 | `pexpert/` | Platform Expert: early boot and platform discovery |
 | `security/` | Kernel security subsystem (MAC framework) |
 | `libkdd/` `libsa/` `tools/` `tests/` | Kernel debug data, standalone libs, tooling, tests |
+| `userland/` | Ioni's own init and shell — the first native pieces |
 
 ## Building
 
-XNU builds only on macOS with Xcode installed. The build wrapper hides the make details:
+XNU builds only on macOS with Xcode installed. The wrapper scripts hide the make details:
 
 ```sh
 ./scripts/build.sh                                                  # RELEASE, this machine's arch
 KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # custom variant
 ```
 
-Variables: `KERNEL_CONFIGS` — RELEASE / DEVELOPMENT / DEBUG / PROFILE (default RELEASE); `ARCH_CONFIGS` — ARM64 / X86_64 (default ARM64); `SDKROOT` — SDK path (default macosx). Artifacts land in `BUILD/sym/`: `kernel.<config>` is the bootable image, `kernel.<config>.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
+On the first run `build.sh` calls `scripts/deps.sh`, which assembles a fakeroot with the pieces the kernel needs: exported kernel headers, libplatform headers and `libfirehose_kernel.a` from Apple's libdispatch — all pinned to the tags of the matching macOS release manifest (26.5: `libdispatch-1542.100.32`, `libplatform-375.120.2`). `mig` and the ctf tools are built only when Xcode doesn't provide them. Artifacts land in `BUILD/sym/`: `kernel.<config>` is the bootable image, `.unstripped` keeps symbols for debugging; `./scripts/clean.sh` wipes the build tree.
 
-CI runs on every push to `main` and on pull requests: header exports for ARM64 and X86_64 are a hard gate on GitHub Actions `macos-26` runners, and the full kernel build runs as an experimental job — linking the arm64 kernel needs Apple's KDK machine libraries plus a fakeroot dependency chain (mig, ctf tools, libdispatch firehose), which is the next build-system milestone.
+CI runs on every push to `main` and on pull requests on GitHub Actions `macos-26` runners: header exports for ARM64 and X86_64 and a full **x86_64 kernel build** are hard gates, and the x86_64 kernel binary is uploaded as a build artifact. The ARM64 kernel job stays experimental until its link gets KDK machine libraries (sptm/txm).
+
+## Userland
+
+The first pieces of Ioni's own userland live in `userland/`:
+
+- `init` — PID 1: binds the console, spawns the shell, reaps orphans and respawns the shell when it exits
+- `ionish` — a small POSIX shell: `cd`, `echo`, `pwd`, `env` and `exit` builtins, external commands via fork+exec
+
+Both build against the host SDK today — binary-compatible with the XNU base — and are smoke-tested in CI on every run. `scripts/rootfs.sh` assembles a root filesystem (`/sbin/init`, `/bin/sh`, `/etc/motd`, `/etc/rc`) into an HFS+ `ioni-rootfs.dmg`, uploaded as a CI artifact. Growing this into a self-built libc (Libsystem) and dyld is the next userland milestone.
 
 ## Licensing
 

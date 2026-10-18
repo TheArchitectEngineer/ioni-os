@@ -18,9 +18,13 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 ## Stage 2 — Minimal userland
 
-- [ ] libSystem / libc builds against the Ioni kernel
-- [ ] dyld and an init process (launchd equivalent or minimal init)
-- [ ] Shell and BSD utilities, bootable ramdisk image
+- [x] init process: console binding, shell spawn, orphan reaping (`userland/init`)
+- [x] POSIX shell with builtins: cd / echo / pwd / env / exit (`userland/ionish`)
+- [x] Rootfs layout and HFS+ image builder (`scripts/rootfs.sh`), CI artifact
+- [ ] libSystem / libc built from source against the Ioni kernel
+- [ ] dyld
+- [ ] Shell and BSD utilities on top of the native libc
+- [ ] Bootable image: kernel + rootfs in a VM
 
 ## Stage 3 — Homebrew
 
@@ -48,7 +52,7 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 **Этап 1 — собираемое ядро**: скрипты сборки и CI готовы, экспорт заголовков зелёный на CI; дальше — цепочка зависимостей (mig, ctf, libdispatch) и полная линковка ядра (x86_64 сначала, ARM64 требует KDK).
 
-**Этап 2 — минимальный userland**: libc, dyld, init, shell и загружаемый ramdisk-образ.
+**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; дальше — собственная libc (Libsystem), dyld, BSD-утилиты и загружаемый образ с ядром.
 
 **Этап 3 — Homebrew**: портирование пакетного менеджера и собственный tap.
 

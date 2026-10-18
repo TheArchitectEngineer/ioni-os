@@ -1,3 +1,5 @@
 BUILD/
 *.o
 *.dSYM
+userland/init
+userland/ionish

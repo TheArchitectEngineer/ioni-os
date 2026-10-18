@@ -67,3 +67,28 @@ jobs:
         env:
           KERNEL_CONFIGS: RELEASE
           ARCH_CONFIGS: ARM64
+
+  userland:
+    name: userland init + ionish
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: make -C userland all
+
+      - name: smoke test
+        run: |
+          ./userland/init -V
+          ./userland/ionish -c 'echo ioni-userland-ok'
+
+      - name: rootfs image
+        run: ./scripts/rootfs.sh
+
+      - name: upload rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioni-rootfs
+          path: BUILD/ioni-rootfs.dmg
+          if-no-files-found: error
