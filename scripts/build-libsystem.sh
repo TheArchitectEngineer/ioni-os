@@ -160,6 +160,9 @@ cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
 # spawn SPI: kernel-user shared header from our xnu, the SDK ships only the public half
 cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/spawn_private.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/sys/spawn_internal.h" 2>/dev/null || true
+# remaining libkern os headers (log_private and friends) the Libc sources expect
+cp "$REPO_ROOT"/libkern/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 # libproc SPI: Apple-internal declarations, SDK libproc.h misses them
 if [ ! -f "$FROOT_INC/libproc_internal.h" ]; then
 cat > "$FROOT_INC/libproc_internal.h" <<'EOF'
@@ -299,6 +302,7 @@ build_libdispatch() {
 #ifndef __OS_WORKGROUP_PRIVATE_INDIRECT__
 #define __OS_WORKGROUP_PRIVATE_INDIRECT__ 1
 #endif
+#include <Availability.h>
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
 #include <time.h>
