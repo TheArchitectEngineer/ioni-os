@@ -237,6 +237,14 @@ WARNFLAGS_STD := $(WARNFLAGS_STD) \
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wno-switch-default
 
+# new diagnostics from public Xcode 26 clang, not enabled in Apple's
+# internal toolchain: reserved identifiers are pervasive in xnu, the
+# ms-bitfield-padding case targets an ABI the kernel does not use
+WARNFLAGS_STD := $(WARNFLAGS_STD) \
+	-Wno-reserved-identifier \
+	-Wno-ms-bitfield-padding \
+	-Wno-unnecessary-virtual-specifier \
+	-Wno-unused-but-set-variable
 # Opt-ins:
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wpointer-arith \
