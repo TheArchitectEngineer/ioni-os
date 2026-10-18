@@ -36,8 +36,10 @@ clone() {
 # strip clang bounds-safety annotations (closed toolchain) and map internal
 # availability domains to public SDK ones: the public SDK ships visionos, not xros,
 # so 'xros(1.1)' in Apple opensource headers must become 'visionos(1.1)';
-# bare names inside macro parameter lists stay untouched
-STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g; s/xros\(/visionos(/g'
+# bare names inside macro parameter lists stay untouched;
+# __unsafe_forge_* are working cast macros with arguments - they are defined
+# via build settings, never stripped
+STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g; s/xros\(/visionos(/g'
 
 # SDK 26 dropped bridgeos/driverkit from the UNAVAILABLE domain macros, but those
 # names also appear as macro parameter names - strip them only inside
@@ -156,6 +158,21 @@ clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
 cp "$DEPS_DIR/libmalloc/private/stack_logging.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
+# spawn SPI: kernel-user shared header from our xnu, the SDK ships only the public half
+cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/spawn_private.h" 2>/dev/null || true
+# libproc SPI: Apple-internal declarations, SDK libproc.h misses them
+if [ ! -f "$FROOT_INC/libproc_internal.h" ]; then
+cat > "$FROOT_INC/libproc_internal.h" <<'EOF'
+#ifndef _IONI_LIBPROC_INTERNAL_H
+#define _IONI_LIBPROC_INTERNAL_H
+#include <stdint.h>
+#include <sys/types.h>
+#include <mach/mach.h>
+extern int proc_importance_assertion_begin_with_msg(void *msg, uint32_t *base_priority, uint64_t *assertion_token);
+extern int proc_importance_assertion_complete(uint64_t assertion_token);
+#endif
+EOF
+fi
 
 # os/alloc_once_private.h: Apple-internal, absent from every public tree; the
 # libplatform impl header carries the API, we add the key pthread asks for
@@ -218,6 +235,8 @@ build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
         # the Xcode-shipped CoreOS xcconfig carries -Werror - cancel via leaf appends
         xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error'
+        # SPI_AVAILABLE and the ptrcheck forge casts are Apple-internal, SDK lacks them
+        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
         # has no THREAD_QOS graph - inject the constants through build settings
         xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t'
@@ -228,7 +247,7 @@ try libpthread build_libpthread
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
@@ -282,11 +301,17 @@ build_libdispatch() {
 #endif
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
+#include <time.h>
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
+/* mach message aux header, kernel-user shared struct from our xnu */
+typedef struct {
+        uint32_t        msgdh_size;
+        uint32_t        msgdh_reserved;
+} mach_msg_aux_header_t;
 EOF
-        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
@@ -299,7 +324,7 @@ try libdispatch build_libdispatch
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c
 }
 try libc_static build_libc_static
@@ -307,7 +332,7 @@ try libc_static build_libc_static
 build_libsystem_c() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c
 }
 try libsystem_c build_libsystem_c
