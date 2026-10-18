@@ -50,6 +50,8 @@ The repository currently holds the XNU source base:
 | `security/` | Kernel security subsystem (MAC framework) |
 | `libkdd/` `libsa/` `tools/` `tests/` | Kernel debug data, standalone libs, tooling, tests |
 | `userland/` | Ioni's own init and shell — the first native pieces |
+| `boot/xnu-loader/` | UEFI bootloader (BSD-3, vendored from PureDarwin/xnu-loader): boots the x86_64 kernel Mach-O on QEMU |
+| `boot/kc-tools/` | Open kernel collection builder (BSD-3, vendored from PureDarwin/kc-tools) |
 
 ## Building
 
@@ -64,6 +66,20 @@ On the first run `build.sh` calls `scripts/deps.sh`, which assembles a fakeroot 
 
 CI runs on every push to `main` and on pull requests on GitHub Actions `macos-26` runners: header exports for ARM64 and X86_64 and a full **x86_64 kernel build** are hard gates, and the x86_64 kernel binary is uploaded as a build artifact. The ARM64 kernel job stays experimental until its link gets KDK machine libraries (sptm/txm).
 
+## Booting in QEMU
+
+The x86_64 kernel boots in QEMU via the vendored [xnu-loader](https://github.com/PureDarwin/xnu-loader) UEFI application — no macOS, no kmutil, no nested virtualization, so it runs on plain Linux hosts and GitHub CI runners:
+
+```sh
+sudo apt install qemu-system-x86 ovmf mtools dosfstools
+./scripts/gnuefi.sh
+cmake -S boot/xnu-loader -B boot/xnu-loader/build -DGNU_EFI_DIR=$HOME/.local/gnu-efi
+cmake --build boot/xnu-loader/build -j
+./scripts/qemu-boot.sh BUILD/obj/RELEASE_X86_64/kernel
+```
+
+`scripts/qemu-boot.sh` builds a FAT ESP image (`BOOTX64.EFI` + `kernel`), starts OVMF + QEMU (q35, TCG) with the serial console captured to `BUILD/qemu-serial.log`, and passes when the kernel produces serial output. `IONI_BOOT_ARGS` overrides the loader default boot-args; logs land in `BUILD/`. The same flow runs in CI on an `ubuntu-24.04` runner on every push.
+
 ## Userland
 
 The first pieces of Ioni's own userland live in `userland/`:
@@ -75,4 +91,4 @@ Both build against the host SDK today — binary-compatible with the XNU base �
 
 ## Licensing
 
-XNU is distributed under the **Apple Public Source License 2.0** (APSL-2.0) — the full text ships in [APPLE_LICENSE](APPLE_LICENSE). Ioni inherits the license for everything derived from XNU; original Ioni documentation in this repository is published under the same terms for simplicity.
+XNU is distributed under the **Apple Public Source License 2.0** (APSL-2.0) — the full text ships in [APPLE_LICENSE](APPLE_LICENSE). Ioni inherits the license for everything derived from XNU; original Ioni documentation in this repository is published under the same terms for simplicity. The vendored boot tools (`boot/xnu-loader`, `boot/kc-tools`) keep their own **BSD 3-Clause** license and upstream copyright — see the `LICENSE` file in each directory.

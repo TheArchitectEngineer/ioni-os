@@ -56,6 +56,49 @@ jobs:
             BUILD/obj/RELEASE_X86_64/kernel.dSYM
           if-no-files-found: error
 
+  boot-qemu:
+    name: boot X86_64 in QEMU (xnu-loader)
+    runs-on: ubuntu-24.04
+    needs: kernel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf mtools dosfstools
+
+      - name: build gnu-efi
+        run: ./scripts/gnuefi.sh
+
+      - name: build xnu-loader
+        run: |
+          cmake -S boot/xnu-loader -B boot/xnu-loader/build -DCMAKE_BUILD_TYPE=Release -DGNU_EFI_DIR=$HOME/.local/gnu-efi
+          cmake --build boot/xnu-loader/build -j
+
+      - name: fetch kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-RELEASE-X86_64
+          path: BUILD/obj
+
+      - name: boot in qemu
+        run: |
+          KERNEL=$(find BUILD/obj -type f -name kernel | head -n1)
+          echo "kernel: $KERNEL"
+          ./scripts/qemu-boot.sh "$KERNEL"
+
+      - name: upload boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-boot-x86_64-logs
+          path: |
+            BUILD/qemu-serial.log
+            BUILD/qemu-stdout.log
+          if-no-files-found: warn
+
   kernel-arm64:
     name: kernel RELEASE ARM64 (VMAPPLE, KDK)
     runs-on: macos-26

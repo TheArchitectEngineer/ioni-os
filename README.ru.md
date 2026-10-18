@@ -50,6 +50,8 @@ Ioni — экспериментальная операционная систе�
 | `security/` | Подсистема безопасности ядра (MAC-фреймворк) |
 | `libkdd/` `libsa/` `tools/` `tests/` | Отладочные данные ядра, библиотеки, инструменты, тесты |
 | `userland/` | Собственные init и шелл Ioni — первые нативные куски |
+| `boot/xnu-loader/` | UEFI-загрузчик (BSD-3, вендорен из PureDarwin/xnu-loader): грузит x86_64-ядро на QEMU |
+| `boot/kc-tools/` | Открытый сборщик kernel collection (BSD-3, вендорен из PureDarwin/kc-tools) |
 
 ## Сборка
 
@@ -64,6 +66,20 @@ KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=X86_64 ./scripts/build.sh   # свой �
 
 CI запускается на каждый пуш в `main` и на pull request'ы на раннерах `macos-26` в GitHub Actions: экспорт заголовков для ARM64 и X86_64 и полная сборка **x86_64-ядра** — жёсткие гейты, бинарник x86_64-ядра выкладывается как артефакт сборки. ARM64-джоба остаётся experimental, пока для её линковки не появятся машинные библиотеки из KDK (sptm/txm).
 
+## Загрузка в QEMU
+
+x86_64-ядро грузится в QEMU через вендоренный UEFI-загрузчик [xnu-loader](https://github.com/PureDarwin/xnu-loader) — без macOS, без kmutil, без nested virtualization: работает на обычном Linux-хосте и на GitHub CI-раннерах:
+
+```sh
+sudo apt install qemu-system-x86 ovmf mtools dosfstools
+./scripts/gnuefi.sh
+cmake -S boot/xnu-loader -B boot/xnu-loader/build -DGNU_EFI_DIR=$HOME/.local/gnu-efi
+cmake --build boot/xnu-loader/build -j
+./scripts/qemu-boot.sh BUILD/obj/RELEASE_X86_64/kernel
+```
+
+`scripts/qemu-boot.sh` собирает FAT ESP-образ (`BOOTX64.EFI` + `kernel`), запускает OVMF + QEMU (q35, TCG) с захватом serial-консоли в `BUILD/qemu-serial.log` и проходит, если ядро выдало serial-вывод. `IONI_BOOT_ARGS` переопределяет дефолтные boot-args загрузчика; логи падают в `BUILD/`. Тот же сценарий крутится в CI на `ubuntu-24.04`-раннере на каждый пуш.
+
 ## Userland
 
 Первые куски собственного userland'а Ioni лежат в `userland/`:
@@ -75,4 +91,4 @@ CI запускается на каждый пуш в `main` и на pull reques
 
 ## Лицензия
 
-XNU распространяется по лицензии **Apple Public Source License 2.0** (APSL-2.0) — полный текст лежит в файле [APPLE_LICENSE](APPLE_LICENSE). Ioni наследует эту лицензию для всего, что производно от XNU; оригинальная документация Ioni в репозитории публикуется на тех же условиях — для простоты.
+XNU распространяется по лицензии **Apple Public Source License 2.0** (APSL-2.0) — полный текст лежит в файле [APPLE_LICENSE](APPLE_LICENSE). Ioni наследует эту лицензию для всего, что производно от XNU; оригинальная документация Ioni в репозитории публикуется на тех же условиях — для простоты. Вендоренные загрузочные утилиты (`boot/xnu-loader`, `boot/kc-tools`) сохраняют собственную лицензию **BSD 3-Clause** и копирайт апстрима — см. файл `LICENSE` в каждом каталоге.
