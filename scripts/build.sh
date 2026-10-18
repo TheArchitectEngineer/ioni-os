@@ -43,7 +43,7 @@ done
 
 if [ ! -f "$FAKEROOT/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
 	echo "build: fakeroot incomplete, running deps.sh"
-	FAKEROOT="$(pwd)/$FAKEROOT" ./scripts/deps.sh
+	FAKEROOT="$(pwd)/$FAKEROOT" sh ./scripts/deps.sh
 fi
 
 run_cp() {
