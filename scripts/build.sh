@@ -100,14 +100,33 @@ if [ "${IONI_KC:-0}" = "1" ]; then
         KC_KERNEL="$OBJ_DIR/kernel"
         [ -f "$KC_KERNEL" ] || KC_KERNEL="$OBJ_DIR/kernel.${KC_VARIANT}.vmapple"
         command -v ipsw >/dev/null 2>&1 || brew install -q ipsw
-        KEXTS="$(ipsw kernel kmutil inspect -x --filter "$KC_FILTER")"
-        echo "build: kc kext entries: $(printf '%s\n' "$KEXTS" | grep -c '^-b\|^ -b' || true)"
+        KEXTS="$(ipsw kernel kmutil inspect -x --filter "$KC_FILTER" 2>/dev/null || true)"
+        if [ -z "$KEXTS" ]; then
+                echo "build: no kext list from ipsw, trying plain kmutil inspect"
+                KEXTS="$(kmutil inspect -V release --no-header 2>/dev/null | awk '{print " -b " $1; }' | grep -Ev "$KC_FILTER" || true)"
+        fi
         echo "build: kmutil create $KC_BASE from $KC_KERNEL"
-        # shellcheck disable=SC2086
-        kmutil create -v -V "$KC_VARIANT" -a arm64e -n boot -s none \
-                --kdk "$KDKROOT" \
-                -B "$KC_BASE" \
-                -k "$KC_KERNEL" \
-                $KEXTS
-        ls -lh BUILD/obj/ioni.*
+        kc_try() {
+                # shellcheck disable=SC2086
+                kmutil create -v -V "$KC_VARIANT" -a arm64e -n boot -s none \
+                        --kdk "$1" \
+                        -B "$KC_BASE" \
+                        -k "$KC_KERNEL" \
+                        $KEXTS
+        }
+        KC_OK=0
+        if kc_try "$KDKROOT"; then
+                KC_OK=1
+        else
+                echo "build: KC with $KDKROOT failed, retrying with host-matching KDK"
+                ipsw download kdk --host --install -o /tmp/kdk-host || true
+                HOST_KDK="$(ls -d /Library/Developer/KDKs/*.kdk 2>/dev/null | tail -n 1)"
+                if [ -n "$HOST_KDK" ] && kc_try "$HOST_KDK"; then
+                        KC_OK=1
+                else
+                        echo "build: KC build failed (kernel artifact is still uploaded)"
+                fi
+        fi
+        echo "build: KC_OK=$KC_OK"
+        ls -lh BUILD/obj/ioni.* 2>/dev/null || true
 fi
