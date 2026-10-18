@@ -185,6 +185,10 @@ cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null |
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
 cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
+# work intervals and personas: shared kernel-user headers the SDK 26 trimmed
+cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/proc_info.h" "$FROOT_INC/sys/proc_info.h" 2>/dev/null || true
 # pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
 # includes <pthread/priority_private.h> which Apple ships only in the internal SDK
 mkdir -p "$FROOT_INC/pthread"
@@ -408,6 +412,12 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # Libc clock_gettime uses the boottime SPI the SDK headers dropped
+        if ! grep -q "mach_boottime_usec" "$DEPS_DIR/Libc/gen/clock_gettime.c"; then
+                printf '/* Ioni: boottime SPI (mach_time_private.h) */\nextern uint64_t mach_boottime_usec(void);\n' \
+                        | cat - "$DEPS_DIR/Libc/gen/clock_gettime.c" > "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" \
+                        && mv "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" "$DEPS_DIR/Libc/gen/clock_gettime.c"
+        fi
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c
