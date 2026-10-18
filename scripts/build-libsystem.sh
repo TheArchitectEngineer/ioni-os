@@ -183,7 +183,7 @@ cp "$REPO_ROOT/bsd/sys/disklabel.h" "$FROOT_INC/sys/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/machine/disklabel.h" "$FROOT_INC/machine/disklabel.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null || true
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
-cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
+cp "$REPO_ROOT"/vendor/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
 # posix1e acl support references the closed membership framework header
 if [ ! -f "$FROOT_INC/membershipPriv.h" ]; then
