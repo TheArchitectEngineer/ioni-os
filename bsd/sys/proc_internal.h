@@ -437,6 +437,12 @@ struct proc {
 	volatile uint64_t was_throttled __attribute__((aligned(8))); /* Counter for number of throttled I/Os */
 	volatile uint64_t did_throttle __attribute__((aligned(8)));  /* Counter for number of I/Os this proc throttled */
 
+	/*
+	 * Saved argv[0] during exec. Present iff the process has the no-read-procargs entitlement.
+	 * If non-null, points to a fixed size allocation of MAXPATHLEN bytes.
+	 */
+	char *p_execpath;
+
 #if DIAGNOSTIC
 	unsigned int p_fdlock_pc[4];
 	unsigned int p_fdunlock_pc[4];
@@ -486,7 +492,11 @@ struct proc {
 #endif /* CONFIG_FREEZE */
 #endif /* CONFIG_MEMORYSTATUS */
 
-	_Atomic uint32_t  p_user_faults; /* count the number of user faults generated */
+// Index for `p_user_faults` for the global fault count limit
+#define PROC_P_USER_FAULTS_GLOBAL_IDX 0
+// Index for `p_user_faults` for OS_REASON_SECURITY_SOFT_TRAPS namespace fault limit
+#define PROC_P_USER_FAULTS_SOFT_TRAPS_IDX 1
+	_Atomic uint16_t  p_user_faults[2]; /* count the number of user faults generated */
 
 	uint32_t          p_memlimit_increase; /* byte increase for memory limit for dyld SPI rdar://problem/49950264, structure packing 32-bit and 64-bit */
 
@@ -505,6 +515,7 @@ struct proc {
 };
 
 #define PGRPID_DEAD 0xdeaddead
+#define SYSCTL_PROCARGS_NO_READ_ENTITLEMENT "com.apple.private.no-read-procargs"
 
 /* p_listflag */
 #define P_LIST_WAITING          0x00000010
@@ -542,6 +553,7 @@ struct proc {
 #define P_LVMRSRCOWNER  0x01000000      /* can handle the resource ownership of  */
 #define P_LTERM_DECRYPTFAIL     0x04000000      /* process terminating due to key failure to decrypt */
 #define P_LTERM_JETSAM          0x08000000      /* process is being jetsam'd */
+#define P_LWASSOFT              0x10000000      /* process had soft mode disabled due to ptrace */
 
 #define P_JETSAM_VMPAGESHORTAGE 0x00000000      /* jetsam: lowest jetsam priority proc, killed due to vm page shortage */
 #define P_JETSAM_VMTHRASHING    0x10000000      /* jetsam: lowest jetsam priority proc, killed due to vm thrashing */
@@ -590,6 +602,7 @@ struct proc {
 #define P_VFS_IOPOLICY_NOCACHE_WRITE_FS_BLKSIZE         0x0800
 #define P_VFS_IOPOLICY_SUPPORT_LONG_PATHS               0x1000
 #define P_VFS_IOPOLICY_ENTITLED_RESERVE_ACCESS          0x2000
+#define P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES_ORIG  0x4000 /* preserves original at-launch policy */
 
 #define P_VFS_IOPOLICY_INHERITED_MASK                   \
 	(P_VFS_IOPOLICY_FORCE_HFS_CASE_SENSITIVITY | \
@@ -603,7 +616,8 @@ struct proc {
 	P_VFS_IOPOLICY_DISALLOW_RW_FOR_O_EVTONLY | \
 	P_VFS_IOPOLICY_ALTLINK | \
 	P_VFS_IOPOLICY_NOCACHE_WRITE_FS_BLKSIZE | \
-	P_VFS_IOPOLICY_SUPPORT_LONG_PATHS)
+	P_VFS_IOPOLICY_SUPPORT_LONG_PATHS | \
+	P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES_ORIG)
 
 #define P_VFS_IOPOLICY_VALID_MASK                       \
 	(P_VFS_IOPOLICY_INHERITED_MASK | \
@@ -772,6 +786,9 @@ struct proc_ident {
 _Static_assert(sizeof(pid_t) == 4, "proc_ident assumes a 32-bit pid_t");
 _Static_assert(PID_MAX < (1 << PROC_IDENT_PID_BIT_COUNT), "proc_ident assumes PID_MAX requires less than 28bits");
 _Static_assert(NO_PID < (1 << PROC_IDENT_PID_BIT_COUNT), "proc_ident assumes NO_PID requires less than 28bits");
+
+/* try to acquire proc ref on proc pointer (that can hold dead proc, but memory must be valid) */
+proc_t proc_ref_nowait(proc_t p);
 #endif
 
 #define BSD_SIMUL_EXECS         33 /* 32 , allow for rounding */
@@ -827,6 +844,7 @@ extern void proc_spinlock(struct proc *);
 extern void proc_spinunlock(struct proc *);
 extern void proc_list_lock(void);
 extern void proc_list_unlock(void);
+extern void proc_list_lock_held(void);
 extern void proc_klist_lock(void);
 extern void proc_klist_unlock(void);
 extern void proc_fdlock(struct proc *);
@@ -859,7 +877,45 @@ __private_extern__ struct proc *proc_find_zombref(pid_t);       /* Find zombie b
 __private_extern__ struct proc *proc_find_zombref_locked(pid_t); /* Find zombie by id. */
 __private_extern__ void proc_drop_zombref(struct proc * p);     /* Drop zombie ref. */
 
+/*
+ * This function is used to inc/dec proc count per user.
+ * User of the function must obey the contract:
+ *     - cannot have spurious calls to this function (e.g. sending -1 decrement to proc without procs on it)
+ *     - for every positive diff - there will be sent negative diff when the proc will die (to avoid uid leaks)
+ *     - this function uses `proc_list_*lock` functions for synchronizations
+ */
 extern size_t   chgproccnt(uid_t uid, int diff);
+
+/* This function is to provide a way to resolve conflict on caller side, instead of
+ * relying on @f chgproccnt doing that.
+ *
+ * `proc_list_lock` is expected to be locked when calling this function.
+ *
+ * This function (same as @f chgproccnt) cannot be called spuriously, callers
+ * are expected to have precise control when this can be called spuriously (e.g. due
+ * to race conditions and missing synchronizations ) and resolve conflicts before calling
+ * this function.
+ *
+ * Main constraints for this function are:
+ *      1) if newuip is provided => `diff > 0`
+ *      2) diff is never == 0
+ *      3) this function return a value to be kfree'd
+ *      4) caller guarantees that element by uid exists or newuip is passed
+ * IMPORTANT INVARIANT:
+ *  - this function may return only one value to be freed:
+ *      - in one case it may be the `newuip` that we didn't need due to some other
+ *              thread added element concurrently
+ *      - the only other case is when we remove element from list due to ui_proccnt == 0
+ *              this case is possible only with diff < 0, hence `newuip` couldn't be provided
+ *
+ * @p uid is the uid number to change proc count off
+ * @p diff is the delta value to apply
+ * @p newuip - opportunistically allocated element
+ * @p[out] out - value of proc count for given uid is returned via this argument
+ *
+ * Returns value to dellocate (if any)
+ */
+extern struct uidinfo *chgproccnt_locked(uid_t uid, int diff, struct uidinfo *newuip, size_t *out);
 extern void     pinsertchild(struct proc *parent, struct proc *child, bool in_exec);
 extern void     p_reparentallchildren(proc_t old_proc, proc_t new_proc);
 extern int      setsid_internal(struct proc *p);
@@ -940,6 +996,7 @@ void proc_transfer_knotes(struct proc *old_proc, struct proc *new_proc);
 void proc_knote_drain(struct proc *p);
 void proc_setregister(proc_t p);
 void proc_resetregister(proc_t p);
+void proc_disable_sec_soft_mode_locked(proc_t p);
 bool proc_get_pthread_jit_allowlist(proc_t p, bool *late_out);
 void proc_set_pthread_jit_allowlist(proc_t p, bool late);
 /* returns the first thread_t in the process, or NULL XXX for NFS, DO NOT USE */
@@ -981,6 +1038,9 @@ extern void proc_setexecutableuuid(proc_t, const uuid_t);
 extern const unsigned char *__counted_by(sizeof(uuid_t)) proc_executableuuid_addr(proc_t);
 extern void proc_getresponsibleuuid(proc_t target_proc, unsigned char *__counted_by(size)responsible_uuid, unsigned long size);
 extern void proc_setresponsibleuuid(proc_t target_proc, unsigned char *__counted_by(size)responsible_uuid, unsigned long size);
+
+extern bool proc_was_ptraced_during_soft_mode(proc_t p);
+extern void proc_set_ptraced_during_soft_mode(proc_t p);
 
 #pragma mark - process iteration
 

@@ -38,6 +38,7 @@
  */
 __enum_closed_decl(arm64_core_type_t, unsigned int, {
 	E_CORE = MPIDR_CORETYPE_ACC_E,
+	M_CORE = MPIDR_CORETYPE_ACC_M,
 	P_CORE = MPIDR_CORETYPE_ACC_P,
 });
 
@@ -49,7 +50,17 @@ __enum_closed_decl(arm64_core_type_t, unsigned int, {
 static inline arm64_core_type_t
 arm64_core_type(void)
 {
+#ifdef __arm64__
 	return (arm64_core_type_t)((__builtin_arm_rsr64("MPIDR_EL1") >> MPIDR_CORETYPE_SHIFT) & MPIDR_CORETYPE_MASK);
+#else
+	/**
+	 * This header file is indirectly included by the SPTM userspace testing
+	 * system which can get built and run on non-arm64 systems. In that case,
+	 * just return a hardcoded value to avoid issues with
+	 * `__builtin_arm_rsr64()` not existing.
+	 */
+	return P_CORE;
+#endif /* __arm64__ */
 }
 
 /*
@@ -64,6 +75,17 @@ arm64_is_e_core(void)
 	return arm64_core_type() == E_CORE;
 }
 
+/*
+ * Convenience wrapper around arm64_core_type() which determines whether the
+ * executing CPU is an M-core.
+ *
+ * @return Whether the executing CPU is an M-core.
+ */
+static inline bool
+arm64_is_m_core(void)
+{
+	return arm64_core_type() == M_CORE;
+}
 
 /*
  * Convenience wrapper around arm64_core_type() which determines whether the
@@ -91,6 +113,8 @@ arm64_core_type_to_string(arm64_core_type_t core_type)
 	switch (core_type) {
 	case E_CORE:
 		return "E-core";
+	case M_CORE:
+		return "M-core";
 	case P_CORE:
 		return "P-core";
 	default:

@@ -492,6 +492,7 @@ exit:
 IOReturn
 IONVRAMCHRPHandler::unserializeVariables(void)
 {
+	IOReturn                    ret = kIOReturnSuccess;
 	uint32_t                    cnt, cntStart;
 	const uint8_t               *propName, *propData;
 	uint32_t                    propNameLength, propDataLength, regionIndex;
@@ -567,7 +568,8 @@ IONVRAMCHRPHandler::unserializeVariables(void)
 				if (_provider->_diags) {
 					_provider->_diags->logVariable(currentRegion->type,
 					    kIONVRAMOperationInit, varName,
-					    (void *)(uintptr_t)(cnt - cntStart));
+					    (void *)(uintptr_t)propDataLength,
+					    (void *)(uintptr_t)cntStart);
 				}
 
 				if (currentRegion->type == kIONVRAMPartitionSystem) {
@@ -578,6 +580,13 @@ IONVRAMCHRPHandler::unserializeVariables(void)
 			}
 		}
 	}
+
+	DEBUG_ALWAYS("_commonSize %#x, _systemSize %#x\n", _commonPartitionSize, _systemPartitionSize);
+
+	ret = handleEphDM();
+	verify_noerr_action(ret, panic("handleEphDM failed with ret=%08x", ret));
+
+	DEBUG_INFO("_commonUsed %#x, _systemUsed %#x\n", _commonUsed, _systemUsed);
 
 	if (_provider->_diags) {
 		OSSharedPtr<OSNumber> val = OSNumber::withNumber(getSystemUsed(), 32);
@@ -601,7 +610,7 @@ IONVRAMCHRPHandler::unserializeVariables(void)
 
 	DEBUG_INFO("%s _varDict=%p\n", __FUNCTION__, _varDict ? _varDict.get() : nullptr);
 
-	return kIOReturnSuccess;
+	return ret;
 }
 
 IOReturn
@@ -801,8 +810,7 @@ IONVRAMCHRPHandler::setVariableInternal(const uuid_t varGuid, const char *variab
 
 		if (_provider->_diags) {
 			_provider->_diags->logVariable(getPartitionTypeForGUID(varGuid),
-			    kIONVRAMOperationDelete, variableName,
-			    nullptr);
+			    kIONVRAMOperationDelete, variableName);
 		}
 	}
 

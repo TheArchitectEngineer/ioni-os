@@ -68,7 +68,6 @@ int os_reason_alloc_buffer(os_reason_t cur_reason, uint32_t osr_bufsize);
 
 typedef struct _exception_info {
 	int os_reason;
-	int signal;
 	exception_type_t exception_type;
 	mach_exception_data_type_t mx_code;
 	mach_exception_data_type_t mx_subcode;
@@ -78,16 +77,49 @@ typedef struct _exception_info {
 	} kt_info;
 } exception_info_t;
 
-#define PX_FLAGS_NONE           0
-/* think twice about userspace debugging experience before using PX_DEBUG_NO_HONOR */
-#define PX_DEBUG_NO_HONOR       (1 << 0) /* force exit even when debugging */
-#define PX_KTRIAGE              (1 << 1) /* leave a ktriage record */
-#define PX_PSIGNAL              (1 << 2) /* send sig instead of forced exit */
-#define PX_NO_EXCEPTION_UTHREAD (1 << 3) /* do not set bsdthread exception */
+/* flags for exit_with_mach_exception */
 
+/*
+ * None, force exit the task with SIGKILL using exit_with_reason,
+ * while generating a crash report for the killed task.
+ */
+#define PX_FLAGS_NONE               0
+/*
+ * Leave a ktriage record.
+ */
+#define PX_KTRIAGE                  (1 << 0)
+/*
+ * Send SIGKILL using psignal, instead of exit_with_reason.
+ * This is used when userspace handled the exception, and we
+ * do not need to generate a crash report.
+ */
+#define PX_NO_CRASH_REPORT          (1 << 1)
+
+/*
+ * Terminates execution of a task, unconditionally and fatally.
+ *
+ * For call-sites that intend to raise fatal exceptions, it's highly
+ * recommended to use the unified generic exit_with_fatal_exception_and_notify
+ * since it implements the longstanding policy about dev-mode and debuggers.
+ */
 int exit_with_mach_exception(struct proc *p, exception_info_t exception, uint32_t flags);
+
+/*
+ * Enforce the policy for fatal exceptions; first, use task_exception_notify
+ * to respect dev-mode and debuggers. Then, unconditionally and fatally
+ * kill the task, with an uncatchable SIGKILL, regardless of how userspace
+ * responded.
+ */
+int exit_with_fatal_exception_and_notify(
+	struct proc *p,
+	int os_reason,
+	exception_type_t exception_type,
+	mach_exception_data_type_t mx_code,
+	mach_exception_data_type_t mx_subcode,
+	uint32_t flags);
+
 #if CONFIG_EXCLAVES
-int exit_with_exclave_exception(struct proc *p, exception_info_t exception, uint32_t flags);
+int exit_with_exclave_exception(struct proc *p, exception_info_t exception);
 #endif
 void exit_with_mach_exception_using_ast(exception_info_t exception, uint32_t flags, bool fatal);
 
@@ -109,61 +141,62 @@ void os_reason_set_description_data(os_reason_t cur_reason, uint32_t type, void 
 /*
  * Reason namespaces.
  */
-#define OS_REASON_INVALID       0
-#define OS_REASON_JETSAM        1
-#define OS_REASON_SIGNAL        2
-#define OS_REASON_CODESIGNING   3
-#define OS_REASON_HANGTRACER    4
-#define OS_REASON_TEST          5
-#define OS_REASON_DYLD          6
-#define OS_REASON_LIBXPC        7
-#define OS_REASON_OBJC          8
-#define OS_REASON_EXEC          9
-#define OS_REASON_SPRINGBOARD   10
-#define OS_REASON_TCC           11
-#define OS_REASON_REPORTCRASH   12
-#define OS_REASON_COREANIMATION 13
-#define OS_REASON_AGGREGATED    14
-#define OS_REASON_RUNNINGBOARD  15
-#define OS_REASON_ASSERTIOND    OS_REASON_RUNNINGBOARD  /* old name */
-#define OS_REASON_SKYWALK       16
-#define OS_REASON_SETTINGS      17
-#define OS_REASON_LIBSYSTEM     18
-#define OS_REASON_FOUNDATION    19
-#define OS_REASON_WATCHDOG      20
-#define OS_REASON_METAL         21
-#define OS_REASON_WATCHKIT      22
-#define OS_REASON_GUARD         23
-#define OS_REASON_ANALYTICS     24
-#define OS_REASON_SANDBOX       25
-#define OS_REASON_SECURITY      26
-#define OS_REASON_ENDPOINTSECURITY      27
-#define OS_REASON_PAC_EXCEPTION 28
-#define OS_REASON_BLUETOOTH_CHIP 29
-#define OS_REASON_PORT_SPACE    30
-#define OS_REASON_WEBKIT        31
-#define OS_REASON_BACKLIGHTSERVICES 32
-#define OS_REASON_MEDIA 33
-#define OS_REASON_ROSETTA 34
-#define OS_REASON_LIBIGNITION 35
-#define OS_REASON_BOOTMOUNT 36
-
-
-#define OS_REASON_REALITYKIT 38
-#define OS_REASON_AUDIO      39
-#define OS_REASON_WAKEBOARD  40
-#define OS_REASON_CORERC     41
-#define OS_REASON_SELF_RESTRICT 42
-#define OS_REASON_ARKIT      43
-#define OS_REASON_CAMERA     44
-#define OS_REASON_BACKBOARD  45
-#define OS_REASON_POWEREXCEPTIONS 46
-#define OS_REASON_SECINIT    47
+#define OS_REASON_INVALID             0
+#define OS_REASON_JETSAM              1
+#define OS_REASON_SIGNAL              2
+#define OS_REASON_CODESIGNING         3
+#define OS_REASON_HANGTRACER          4
+#define OS_REASON_TEST                5
+#define OS_REASON_DYLD                6
+#define OS_REASON_LIBXPC              7
+#define OS_REASON_OBJC                8
+#define OS_REASON_EXEC                9
+#define OS_REASON_SPRINGBOARD         10
+#define OS_REASON_TCC                 11
+#define OS_REASON_REPORTCRASH         12
+#define OS_REASON_COREANIMATION       13
+#define OS_REASON_AGGREGATED          14
+#define OS_REASON_RUNNINGBOARD        15
+#define OS_REASON_ASSERTIOND          OS_REASON_RUNNINGBOARD  /* old name */
+#define OS_REASON_SKYWALK             16
+#define OS_REASON_SETTINGS            17
+#define OS_REASON_LIBSYSTEM           18
+#define OS_REASON_FOUNDATION          19
+#define OS_REASON_WATCHDOG            20
+#define OS_REASON_METAL               21
+#define OS_REASON_WATCHKIT            22
+#define OS_REASON_GUARD               23
+#define OS_REASON_ANALYTICS           24
+#define OS_REASON_SANDBOX             25
+#define OS_REASON_SECURITY            26
+#define OS_REASON_ENDPOINTSECURITY    27
+#define OS_REASON_PAC_EXCEPTION       28
+#define OS_REASON_BLUETOOTH_CHIP      29
+#define OS_REASON_PORT_SPACE          30
+#define OS_REASON_WEBKIT              31
+#define OS_REASON_BACKLIGHTSERVICES   32
+#define OS_REASON_MEDIA               33
+#define OS_REASON_ROSETTA             34
+#define OS_REASON_LIBIGNITION         35
+#define OS_REASON_BOOTMOUNT           36
+#define OS_REASON_MTE_FAIL            37
+#define OS_REASON_REALITYKIT          38
+#define OS_REASON_AUDIO               39
+#define OS_REASON_WAKEBOARD           40
+#define OS_REASON_CORERC              41
+#define OS_REASON_SELF_RESTRICT       42
+#define OS_REASON_ARKIT               43
+#define OS_REASON_CAMERA              44
+#define OS_REASON_BACKBOARD           45
+#define OS_REASON_POWEREXCEPTIONS     46
+#define OS_REASON_SECINIT             47
+#define OS_REASON_SECURITY_SOFT_TRAPS 48
+#define OS_REASON_RESOURCES           49
 
 /*
  * Update whenever new OS_REASON namespaces are added.
  */
-#define OS_REASON_MAX_VALID_NAMESPACE OS_REASON_SECINIT
+#define OS_REASON_MAX_VALID_NAMESPACE OS_REASON_RESOURCES
 
 #define OS_REASON_BUFFER_MAX_SIZE 5120
 
@@ -184,7 +217,12 @@ void os_reason_set_description_data(os_reason_t cur_reason, uint32_t type, void 
 /*
  * Set of flags that are allowed to be passed from userspace
  */
-#define OS_REASON_FLAG_MASK_ALLOWED_FROM_USER (OS_REASON_FLAG_CONSISTENT_FAILURE | OS_REASON_FLAG_ONE_TIME_FAILURE | OS_REASON_FLAG_NO_CRASH_REPORT | OS_REASON_FLAG_ABORT | OS_REASON_FLAG_CAPTURE_LOGS | OS_REASON_FLAG_SECURITY_SENSITIVE)
+#define OS_REASON_FLAG_MASK_ALLOWED_FROM_USER (OS_REASON_FLAG_CONSISTENT_FAILURE \
+	        | OS_REASON_FLAG_ONE_TIME_FAILURE \
+	        | OS_REASON_FLAG_NO_CRASH_REPORT \
+	        | OS_REASON_FLAG_ABORT \
+	        | OS_REASON_FLAG_CAPTURE_LOGS \
+	        | OS_REASON_FLAG_SECURITY_SENSITIVE)
 
 /*
  * Macros to encode the exit reason namespace and first 32 bits of code in exception code
@@ -300,6 +338,13 @@ int terminate_with_payload(int pid, uint32_t reason_namespace, uint64_t reason_c
 #define EXEC_EXIT_REASON_BAD_PSATTR         19
 #define EXEC_EXIT_REASON_NOX86EXEC          20
 #define EXEC_EXIT_REASON_MAP_EXEC_FAILURE   21
+
+/* Specific reasons related to resources management */
+#define RESOURCES_LIMIT_MACH_PORTS_EXHAUSTION       1
+#define RESOURCES_LIMIT_FILE_DESCRIPTORS_EXHAUSTION 2
+#define RESOURCES_LIMIT_KQWORKLOOPS_EXHAUSTION      3
+
+
 /*
  * guard reasons
  */

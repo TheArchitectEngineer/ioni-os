@@ -864,7 +864,10 @@ cluster_verify_thread(void)
 	thread_set_thread_name(self, "cluster_verify_thread");
 #if __AMP__
 	if (ecore_verify_threads) {
-		thread_soft_bind_cluster_type(self, 'E');
+		kern_return_t kr = thread_soft_bind_pset_type(self, 'E');
+		if (kr != KERN_SUCCESS) {
+			printf("%s: WARN: failed to bind thread to cluster type; does the hardware topology match expectations?\n", __FUNCTION__);
+		}
 	}
 #endif /* __AMP__ */
 #if !defined(__x86_64__)
@@ -1015,7 +1018,7 @@ cluster_ioerror(upl_t upl, int upl_offset, int abort_size, int error, int io_fla
 		} else if (page_in) {
 			upl_abort_code = UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_ERROR;
 		} else {
-			upl_abort_code = UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_DUMP_PAGES;
+			upl_abort_code = UPL_ABORT_FREE_ON_EMPTY /* | UPL_ABORT_DUMP_PAGES */;
 		}
 
 		ubc_upl_abort_range(upl, upl_offset, abort_size, upl_abort_code);
@@ -3355,7 +3358,11 @@ next_dwrite:
 			    UPL_CLEAN_IN_PLACE | UPL_SET_INTERNAL | UPL_SET_LITE | UPL_SET_IO_WIRE;
 
 			kret = vm_map_get_upl(map,
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+			    vm_memtag_canonicalize(map, (vm_map_offset_t)(iov_base & ~((user_addr_t)PAGE_MASK))),
+#else /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 			    (vm_map_offset_t)(iov_base & ~((user_addr_t)PAGE_MASK)),
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 			    &upl_size,
 			    &upl,
 			    NULL,
@@ -3677,7 +3684,11 @@ next_cwrite:
 
 	vm_map_t map = UIO_SEG_IS_USER_SPACE(uio->uio_segflg) ? current_map() : kernel_map;
 	kret = vm_map_get_upl(map,
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	    vm_memtag_canonicalize(map, vm_map_trunc_page(iov_base, vm_map_page_mask(map))),
+#else /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 	    vm_map_trunc_page(iov_base, vm_map_page_mask(map)),
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 	    &upl_size, &upl[cur_upl], NULL, &pages_in_pl, &upl_flags, VM_KERN_MEMORY_FILE, 0);
 
 	if (kret != KERN_SUCCESS) {
@@ -3688,6 +3699,14 @@ next_cwrite:
 		goto wait_for_cwrites;
 	}
 	num_upl++;
+
+	if (!(upl_flags & UPL_PHYS_CONTIG)) {
+		/*
+		 * The created UPL needs to have the UPL_PHYS_CONTIG flag.
+		 */
+		error = EINVAL;
+		goto wait_for_cwrites;
+	}
 
 	/*
 	 * Consider the possibility that upl_size wasn't satisfied.
@@ -6067,7 +6086,11 @@ next_cread:
 
 	vm_map_t map = UIO_SEG_IS_USER_SPACE(uio->uio_segflg) ? current_map() : kernel_map;
 	kret = vm_map_get_upl(map,
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	    vm_memtag_canonicalize(map, vm_map_trunc_page(iov_base, vm_map_page_mask(map))),
+#else /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 	    vm_map_trunc_page(iov_base, vm_map_page_mask(map)),
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 	    &upl_size, &upl[cur_upl], NULL, &pages_in_pl, &upl_flags, VM_KERN_MEMORY_FILE, 0);
 
 	KERNEL_DEBUG((FSDBG_CODE(DBG_FSRW, 92)) | DBG_FUNC_END,
@@ -6081,6 +6104,14 @@ next_cread:
 		goto wait_for_creads;
 	}
 	num_upl++;
+
+	if (!(upl_flags & UPL_PHYS_CONTIG)) {
+		/*
+		 * The created UPL needs to have the UPL_PHYS_CONTIG flag.
+		 */
+		error = EINVAL;
+		goto wait_for_creads;
+	}
 
 	if (upl_size < upl_needed_size) {
 		/*
@@ -6246,7 +6277,11 @@ cluster_io_type(struct uio *uio, int *io_type, u_int32_t *io_length, u_int32_t m
 
 		vm_map_t map = UIO_SEG_IS_USER_SPACE(uio->uio_segflg) ? current_map() : kernel_map;
 		if ((vm_map_get_upl(map,
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+		    vm_memtag_canonicalize(map, vm_map_trunc_page(iov_base, vm_map_page_mask(map))),
+#else /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 		    vm_map_trunc_page(iov_base, vm_map_page_mask(map)),
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 		    &upl_size, &upl, NULL, NULL, &upl_flags, VM_KERN_MEMORY_FILE, 0)) != KERN_SUCCESS) {
 			/*
 			 * the user app must have passed in an invalid address
@@ -6790,7 +6825,7 @@ cluster_try_push(struct cl_writebehind *wbp, vnode_t vp, off_t EOF, int push_fla
 		struct  cl_extent cl;
 		int retval;
 
-		flags = io_flags & (IO_PASSIVE | IO_CLOSE);
+		flags = io_flags & (IO_PASSIVE | IO_CLOSE | IO_SYNC);
 
 		/*
 		 * try to push each cluster in turn...

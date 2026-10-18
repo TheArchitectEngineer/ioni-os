@@ -48,11 +48,6 @@ struct proc_platform_ro_data {
 	uint32_t p_sdk;
 };
 
-struct task_token_ro_data {
-	security_token_t sec_token;
-	audit_token_t audit_token;
-};
-
 struct task_filter_ro_data {
 	uint8_t *__unsafe_indexable mach_trap_filter_mask; /* Mach trap filter bitmask (len: mach_trap_count bits) */
 	uint8_t *__unsafe_indexable mach_kobj_filter_mask; /* Mach kobject filter bitmask (len: mach_kobj_count bits) */
@@ -87,12 +82,12 @@ struct proc_ro {
 	});
 
 	__xnu_struct_group(task_ro_data, task_data, {
-		/* Task security and audit tokens */
-		struct task_token_ro_data task_tokens;
 #ifdef CONFIG_MACF
 		struct task_filter_ro_data task_filters;
 #endif
 		uint32_t t_flags_ro;                               /* RO-protected task flags (see osfmk/kern/task.h) */
+
+		/* This is not inherited on fork/exec, must be re-evaluated */
 		task_control_port_options_t task_control_port_options;
 	});
 };

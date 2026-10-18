@@ -43,10 +43,15 @@
 #include <kern/machine.h>
 #include <kern/kpc.h>
 #include <kern/monotonic.h>
+#include <kern/startup.h>
 
 #include <machine/atomic.h>
 #include <arm64/proc_reg.h>
 #include <arm64/machine_machdep.h>
+#include <arm64/x86_64_compat.h>
+#if CONFIG_SPTM
+#include <arm64/sop.h>
+#endif
 #include <arm/cpu_data_internal.h>
 #include <arm/machdep_call.h>
 #include <arm/misc_protos.h>
@@ -58,6 +63,9 @@
 
 #include <sys/kdebug.h>
 
+#if HYPERVISOR
+#include <arm64/hv/hv.h>
+#endif
 
 #include <san/kcov_stksz.h>
 
@@ -73,11 +81,14 @@ extern int debug_task;
 /* zone for debug_state area */
 ZONE_DEFINE_TYPE(ads_zone, "arm debug state", arm_debug_state_t, ZC_NONE);
 ZONE_DEFINE_TYPE(user_ss_zone, "user save state", arm_context_t, ZC_NONE);
+#if HAVE_MACHINE_THREAD_MATRIX_STATE
+static SECURITY_READ_ONLY_LATE(zone_t) matrix_ss_zone;
+#endif
+
 
 #if HAS_ARM_FEAT_SME
 static SECURITY_READ_ONLY_LATE(uint16_t) sme_svl_b;
-/* zone for arm_sme_saved_state_t allocations */
-static SECURITY_READ_ONLY_LATE(zone_t) sme_ss_zone;
+SECURITY_READ_ONLY_LATE(arm_state_hdr_t) sme_state_hdr;
 #endif
 
 void
@@ -156,11 +167,92 @@ machine_save_sme_context(thread_t old, arm_sme_saved_state_t *old_sme_ss, const 
 }
 
 static void
+machine_apply_sme_priority(uint64_t wanted_smpri_el1)
+{
+#if USE_SME_PRIORITY
+	const uint64_t active_smpri_el1 = __builtin_arm_rsr64("SMPRI_EL1");
+	if (__improbable(active_smpri_el1 != wanted_smpri_el1)) {
+		__builtin_arm_wsr64("SMPRI_EL1", wanted_smpri_el1);
+		arm_context_switch_requires_sync();
+	}
+#else
+#pragma unused(wanted_smpri_el1)
+#endif /* USE_SME_PRIORITY */
+}
+
+/*
+ * Map the thread's scheduler priority parameters to an SME priority.
+ *
+ * For the set of clutch buckets {BG, UT, DF, etc...}, the partial order of a
+ * "has higher priority than" relation over this set is mapped onto the SME
+ * hardware. Threads are mapped to the lowest priority within each of their
+ * corresponding buckets.
+ *
+ * +----------------------------------------------------------------+
+ * | res |  BG  |  UT  |  DF  |  IN  |  FG  | FIX-TS | FIX-RT | res |
+ * +----------------------------------------------------------------+
+ *    0  | 1  2 | 3  4 | 5  6 | 7  8 | 9 10 |  11 12 |  13 14 |  15
+ */
+__pure2 static uint64_t
+machine_thread_compute_sme_priority_internal(sched_mode_t mode, sched_bucket_t bucket)
+{
+	uint64_t out = SMPRI_EL1_DEFAULT;
+	switch (bucket) {
+	case TH_BUCKET_FIXPRI: {
+		/* Prefer REALTIME mode threads above TIMESHARE. */
+		const uint8_t offset = mode == TH_MODE_REALTIME ? 13 : 11;
+		out = SMPRI_EL1_MIN + offset;
+		break;
+	}
+	case TH_BUCKET_SHARE_FG:
+		out = SMPRI_EL1_MIN + 9;
+		break;
+#if CONFIG_SCHED_CLUTCH
+	case TH_BUCKET_SHARE_IN:
+		out = SMPRI_EL1_MIN + 7;
+		break;
+#endif /* CONFIG_SCHED_CLUTCH */
+	case TH_BUCKET_SHARE_DF:
+		out = SMPRI_EL1_MIN + 5;
+		break;
+	case TH_BUCKET_SHARE_UT:
+		out = SMPRI_EL1_MIN + 3;
+		break;
+	case TH_BUCKET_SHARE_BG:
+		out = SMPRI_EL1_MIN + 1;
+		break;
+	default:
+		MACH_ASSERT_DO(panic("Unexpected scheduler bucket: %d", bucket));
+	}
+	return out;
+}
+
+uint64_t
+machine_thread_get_sme_priority(thread_t thread)
+{
+	return machine_thread_compute_sme_priority_internal(
+		thread->sched_mode, thread->th_sched_bucket);
+}
+
+void
+machine_thread_update_sme_priority(thread_t thread)
+{
+	if (machine_thread_get_sme_state(thread) && (thread == current_thread_volatile())) {
+		machine_apply_sme_priority(machine_thread_get_sme_priority(thread));
+	}
+	/*
+	 * If thread has SME state but isn't on core, it will be synched the next
+	 * time that happens.
+	 */
+}
+
+static void
 machine_restore_sme_context(thread_t new, const arm_sme_saved_state_t *new_sme_ss, const struct arm_matrix_cpu_state *cpu_state)
 {
 	__builtin_arm_wsr64("TPIDR2_EL0", new->machine.tpidr2_el0);
 
 	if (new_sme_ss) {
+		machine_apply_sme_priority(machine_thread_get_sme_priority(new));
 		if (machine_thread_has_valid_za(new_sme_ss)) {
 			if (!cpu_state->za_is_enabled) {
 				asm volatile ("smstart za");
@@ -169,29 +261,39 @@ machine_restore_sme_context(thread_t new, const arm_sme_saved_state_t *new_sme_s
 		} else if (cpu_state->za_is_enabled) {
 			asm volatile ("smstop za");
 		}
-
-		arm_sme_trap_at_el0(false);
 	}
 }
 
 static void
-machine_disable_sme_context(const struct arm_matrix_cpu_state *cpu_state)
+machine_clear_sme_context(const struct arm_matrix_cpu_state *cpu_state)
 {
 	if (cpu_state->za_is_enabled) {
 		asm volatile ("smstop za");
 	}
-
-	arm_sme_trap_at_el0(true);
 }
 #endif /* HAS_ARM_FEAT_SME */
 
 
 #if HAVE_MACHINE_THREAD_MATRIX_STATE
 static void
+machine_trap_el0_matrix_instructions(bool enable_el0_trap,
+    const struct arm_matrix_cpu_state *cpu_state)
+{
+#pragma unused(cpu_state)
+
+#if HAS_ARM_FEAT_SME
+	if (arm_sme_version()) {
+		arm_sme_trap_at_el0(enable_el0_trap);
+	}
+#endif
+}
+
+static void
 machine_switch_matrix_context(thread_t old, thread_t new)
 {
 	struct arm_matrix_cpu_state cpu_state;
 	arm_get_matrix_cpu_state(&cpu_state);
+	bool enable_el0_trap = true;
 
 
 #if HAS_ARM_FEAT_SME
@@ -206,7 +308,7 @@ machine_switch_matrix_context(thread_t old, thread_t new)
 
 #if HAS_ARM_FEAT_SME
 	if (cpu_state.have_sme && !new_sme_ss) {
-		machine_disable_sme_context(&cpu_state);
+		machine_clear_sme_context(&cpu_state);
 	}
 #endif /* HAS_ARM_FEAT_SME */
 
@@ -214,14 +316,20 @@ machine_switch_matrix_context(thread_t old, thread_t new)
 #if HAS_ARM_FEAT_SME
 	if (cpu_state.have_sme) {
 		machine_restore_sme_context(new, new_sme_ss, &cpu_state);
+		if (new_sme_ss) {
+			enable_el0_trap = false;
+		}
 	}
 #endif /* HAS_ARM_FEAT_SME */
 
+
+	machine_trap_el0_matrix_instructions(enable_el0_trap, &cpu_state);
 
 }
 
 
 #endif /* HAVE_MACHINE_THREAD_MATRIX_STATE */
+
 
 
 
@@ -243,6 +351,78 @@ machine_thread_switch_cpu_data(thread_t old, thread_t new)
 
 	new->machine.CpuDatap = datap;
 	new->machine.pcpu_data_base_and_cpu_number = base;
+}
+
+/**
+ * routine: machine_switch_cpu_data
+ *
+ * Helper function used by pmap_and_extended_context to switch CPU data,
+ * and handle setting a proper value for TPIDR_EL0.
+ *
+ */
+
+static inline void
+machine_switch_cpu_data(thread_t old, thread_t new)
+{
+#if !__ARM_KERNEL_PROTECT__
+	/*
+	 * If the old thread was entitled for x18 preservation, save away
+	 * the TPIDR_EL0 bit that tells us whether x18 should actually be
+	 * preserved.
+	 *
+	 * The arm_machine_flags bit saving the TPIDR_EL0 bit is only
+	 * honored when the thread is entitled, so we do not care to save
+	 * it when it is not.
+	 */
+	uint32_t const old_flags = old->machine.arm_machine_flags;
+
+	if (get_threadtask(old)->preserve_x18_entitled) {
+		uint64_t tpidr = __builtin_arm_rsr64("TPIDR_EL0");
+
+		if ((bool)(old_flags & ARM_MACHINE_THREAD_PRESERVE_X18_SAVE) !=
+		    (bool)(tpidr & MACHDEP_TPIDR_FLAG_PRESERVE_X18)) {
+			// Toggle the thread flag if the TPIDR flag changed.
+			old->machine.arm_machine_flags ^= ARM_MACHINE_THREAD_PRESERVE_X18_SAVE;
+		}
+	}
+
+	/*
+	 * If the new thread's proper arm_machine_flag indicates it is
+	 * entitled for x18 preservation, *and* the arm_machine_flag that
+	 * saved away the TPIDR_EL0 flag that indicated whether the thread
+	 * actually wants x18 to be preserved, restore that
+	 * arm_machine_flag back into TPIDR_EL0. Restoring x18 is then
+	 * done in locore.s, when all other GPRs are restored as well.
+	 *
+	 * Otherwise (not entitled, or don't want to preserve), we have to
+	 * clear the TPIDR_EL0 bit, to prevent the context switch path
+	 * from restoring x18.
+	 */
+	uint64_t new_tpidr;
+
+	if (new->machine.arm_machine_flags & ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL) {
+		new_tpidr = MACHDEP_TPIDR_FLAG_PRESERVE_X18;
+
+		new->machine.arm_machine_flags &= ~ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL;
+	} else if (new->machine.arm_machine_flags & (ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL)) {
+		new_tpidr = MACHDEP_TPIDR_FLAG_PRESERVE_X18;
+	} else {
+		new_tpidr = 0;
+	}
+
+#else /* !__ARM_KERNEL_PROTECT__ */
+
+	uint64_t new_tpidr = 0;
+
+#endif /* !__ARM_KERNEL_PROTECT__ */
+
+	machine_thread_switch_cpu_data(old, new);
+
+	/*
+	 * Restore the CPU-specific parts of TPIDR_EL0 (i.e. cluster and CPU ID).
+	 */
+	new_tpidr |= new->machine.CpuDatap->cpu_tpidr_el0 & MACHDEP_TPIDR_CPU_DATA_MASK;
+	__builtin_arm_wsr64("TPIDR_EL0", new_tpidr);
 }
 
 /**
@@ -269,10 +449,16 @@ machine_switch_pmap_and_extended_context(thread_t old, thread_t new)
 
 
 
+
+
 	new_pmap = new->map->pmap;
 	bool pmap_changed = old->map->pmap != new_pmap;
 	bool sec_override_changed =
+#if HAS_MTE
+	    ml_thread_get_sec_override(old) != ml_thread_get_sec_override(new);
+#else
 	    false;
+#endif
 
 	if (pmap_changed || sec_override_changed) {
 		pmap_switch(new_pmap, new);
@@ -302,7 +488,7 @@ machine_switch_pmap_and_extended_context(thread_t old, thread_t new)
 	}
 
 
-	machine_thread_switch_cpu_data(old, new);
+	machine_switch_cpu_data(old, new);
 }
 
 /*
@@ -352,7 +538,11 @@ machine_thread_on_core(thread_t thread)
 boolean_t
 machine_thread_on_core_allow_invalid(thread_t thread)
 {
+#if HAS_MTE
+	#define _copyin_fn      _copyin_atomic64_allow_invalid_kernel_tag
+#else
 	#define _copyin_fn      _copyin_atomic64
+#endif
 
 	extern int _copyin_fn(const char *src, uint64_t *dst);
 	uint64_t addr;
@@ -491,8 +681,26 @@ machine_thread_process_signature(thread_t __unused thread, task_t __unused task)
 	 * thread state, as if the signature could actually change from an
 	 * actual signature to another.
 	 */
+
+	/*
+	 * Force the machine flag to save x18 if the new thread has the
+	 * entitlement that "always" preserves x18 (as opposed to the one
+	 * that allows the thread to toggle the bit).
+	 *
+	 * In reality, there is no difference between these two
+	 * entitlements after initial setup. The only real difference is
+	 * that threads with the "always" entitlement start with the
+	 * preserve-x18 bit set, while threads carrying the newer "toggle"
+	 * entitlement start with it cleared.
+	 *
+	 * A thread with the "always" entitlement may, in theory, still
+	 * opt to toggle x18 preservation off during runtime, as it was
+	 * not worth implementing a separate context switch path that
+	 * forces x18 preservation. If you don't want to turn it off, just
+	 * don't use the new API to do so!
+	 */
 #if !__ARM_KERNEL_PROTECT__
-	thread->machine.arm_machine_flags &= ~(ARM_MACHINE_THREAD_PRESERVE_X18);
+	thread->machine.arm_machine_flags &= ~(ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL);
 #endif /* !__ARM_KERNEL_PROTECT__ */
 	thread->machine.arm_machine_flags &= ~(ARM_MACHINE_THREAD_USES_1GHZ_TIMBASE);
 
@@ -506,12 +714,12 @@ machine_thread_process_signature(thread_t __unused thread, task_t __unused task)
 			/* Note that for x86_64 translation specifically, the
 			 * context switch path implicitly switches x18 regardless
 			 * of this flag. */
-			thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18;
+			thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL;
 		}
 #endif /* CONFIG_ROSETTA */
 
-		if (task->preserve_x18) {
-			thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18;
+		if (task->preserve_x18_always) {
+			thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL;
 		}
 #endif /* !__ARM_KERNEL_PROTECT__ */
 
@@ -526,7 +734,7 @@ machine_thread_process_signature(thread_t __unused thread, task_t __unused task)
 		 * __ARM_KERNEL_PROTECT__, which make real destructive use of
 		 * x18.)
 		 */
-		thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18;
+		thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_PRESERVE_X18_SAVE;
 #endif /* !__ARM_KERNEL_PROTECT__ */
 		thread->machine.arm_machine_flags |= ARM_MACHINE_THREAD_USES_1GHZ_TIMBASE;
 	}
@@ -555,9 +763,18 @@ machine_thread_destroy(thread_t thread)
 		thread->machine.uNeon = NULL;
 		thread->machine.contextData = NULL;
 
-#if HAS_ARM_FEAT_SME
-		machine_thread_sme_state_free(thread);
-#endif
+#if HAVE_MACHINE_THREAD_MATRIX_STATE
+		if (thread->machine.umatrix_hdr) {
+			zfree(matrix_ss_zone, thread->machine.umatrix_hdr);
+			thread->machine.umatrix_hdr = NULL;
+		}
+#endif /* HAVE_MACHINE_THREAD_MATRIX_STATE */
+#if HYPERVISOR
+		if (thread->hv_thread_target) {
+			hv_callback_thread_destroy(thread->hv_thread_target);
+			thread->hv_thread_target = NULL;
+		}
+#endif /* HYPERVISOR */
 
 		zfree(user_ss_zone, thread_user_ss);
 	}
@@ -567,10 +784,21 @@ machine_thread_destroy(thread_t thread)
 			arm_debug_set(NULL);
 		}
 
-		if (os_ref_release(&thread->machine.DebugData->ref) == 0) {
-			zfree(ads_zone, thread->machine.DebugData);
-		}
+		arm_debug_state_t *pTmp = thread->machine.DebugData;
+		thread->machine.DebugData = NULL;
+		free_debug_state(pTmp);
 	}
+
+#if CONFIG_SPTM
+	/*
+	 * Unmap any redzone stack page that was mapped for this thread.
+	 * This is the cleanup path for threads that terminate while still
+	 * having a mapped redzone page.
+	 */
+	if (thread->machine.kredzonestack && thread->kernel_stack) {
+		sop_unmap_redzone_page(thread);
+	}
+#endif /* CONFIG_SPTM */
 }
 
 
@@ -578,7 +806,7 @@ machine_thread_destroy(thread_t thread)
 static arm_sme_saved_state_t *
 zalloc_sme_saved_state(void)
 {
-	arm_sme_saved_state_t *sme_ss = zalloc_flags(sme_ss_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	arm_sme_saved_state_t *sme_ss = zalloc_flags(matrix_ss_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	sme_ss->hdr.flavor = ARM_SME_SAVED_STATE;
 	sme_ss->hdr.count = arm_sme_saved_state_count(sme_svl_b);
 	sme_ss->svl_b = sme_svl_b;
@@ -602,21 +830,9 @@ machine_thread_sme_state_alloc(thread_t thread)
 	arm_sme_trap_at_el0(false);
 	__builtin_arm_isb(ISB_SY);
 	thread->machine.usme = sme_ss;
-
+	machine_thread_update_sme_priority(thread);
 	enable_preemption();
-
 	return KERN_SUCCESS;
-}
-
-void
-machine_thread_sme_state_free(thread_t thread)
-{
-	arm_sme_saved_state_t *sme_ss = machine_thread_get_sme_state(thread);
-
-	if (sme_ss) {
-		thread->machine.usme = NULL;
-		zfree(sme_ss_zone, sme_ss);
-	}
 }
 
 static void
@@ -651,6 +867,15 @@ machine_thread_matrix_state_dup(thread_t target)
 	thread_t thread = current_thread();
 
 #if HAS_ARM_FEAT_SME
+	/*
+	 * TPIDR2_EL0 is accessible even when there's no active matrix state.
+	 * xnu normally only spills it during context-switch events, so
+	 * current_thread()->machine.tpidr2_el0 may not hold the current value.
+	 */
+	if (arm_sme_version()) {
+		target->machine.tpidr2_el0 = __builtin_arm_rsr64("TPIDR2_EL0");
+	}
+
 	const arm_sme_saved_state_t *sme_ss = machine_thread_get_sme_state(thread);
 	if (sme_ss) {
 		machine_thread_sme_state_dup(sme_ss, target);
@@ -668,13 +893,24 @@ machine_thread_matrix_state_dup(thread_t target)
 void
 machine_thread_init(void)
 {
+#if HAVE_MACHINE_THREAD_MATRIX_STATE
+	vm_size_t matrix_ss_size = 0;
+	zone_create_flags_t matrix_ss_flags = ZC_NONE;
+
+
 #if HAS_ARM_FEAT_SME
 	if (arm_sme_version()) {
 		sme_svl_b = arm_sme_svl_b();
-		vm_size_t size = arm_sme_saved_state_count(sme_svl_b) * sizeof(unsigned int);
-		sme_ss_zone = zone_create_ext("SME saved state", size, ZC_NONE, ZONE_ID_ANY, NULL);
+		sme_state_hdr.flavor = ARM_SME_SAVED_STATE;
+		sme_state_hdr.count = arm_sme_saved_state_count(sme_svl_b);
+		matrix_ss_size = MAX(matrix_ss_size, sme_state_hdr.count * sizeof(unsigned int));
 	}
-#endif
+#endif /* HAS_ARM_FEAT_SME */
+
+	if (matrix_ss_size) {
+		matrix_ss_zone = zone_create_ext("matrix saved state", matrix_ss_size, matrix_ss_flags, ZONE_ID_ANY, NULL);
+	}
+#endif /* HAVE_MACHINE_THREAD_MATRIX_STATE */
 }
 
 /*
@@ -713,6 +949,17 @@ machine_stack_detach(thread_t thread)
 #if CONFIG_STKSZ
 	kcov_stksz_set_thread_stack(thread, stack);
 #endif
+#if CONFIG_SPTM
+	/*
+	 * If this thread has a redzone page mapped, unmap it now BEFORE
+	 * we clear kernel_stack. We need kernel_stack to calculate the VA.
+	 * This prevents leaking redzone pages when threads are destroyed
+	 * after their stacks are detached.
+	 */
+	if (thread->machine.kredzonestack) {
+		sop_unmap_redzone_page(thread);
+	}
+#endif /* CONFIG_SPTM */
 	thread->kernel_stack = 0;
 	thread->machine.kstackptr = NULL;
 
@@ -744,6 +991,16 @@ machine_stack_attach(thread_t thread,
 	kcov_stksz_set_thread_stack(thread, 0);
 #endif
 	void *kstackptr = (void *)(stack + kernel_stack_size - sizeof(struct thread_kernel_state));
+#if CONFIG_SPTM && (DEVELOPMENT || DEBUG)
+	/*
+	 * Artificially reduce stack size for testing stack overflow protection.
+	 * Only apply after lockdown to avoid affecting early boot threads.
+	 * Align to 16 bytes to prevent stack alignment faults.
+	 */
+	if (startup_phase >= STARTUP_SUB_LOCKDOWN) {
+		kstackptr = (void *)(((uintptr_t)kstackptr - sop_kstack_reduce) & ~0xFUL);
+	}
+#endif
 	thread->machine.kstackptr = kstackptr;
 	thread_initialize_kernel_state(thread);
 
@@ -800,13 +1057,46 @@ machine_stack_handoff(thread_t old,
 	kpc_off_cpu(old);
 #endif /* CONFIG_CPU_COUNTERS */
 
+#if CONFIG_SPTM
+	/*
+	 * Don't transfer kredzonestack ownership to avoid stale mappings.
+	 * If the old thread had a redzone page mapped, unmap it now BEFORE
+	 * detaching the stack (we need old->kernel_stack to calculate the VA).
+	 * The new thread will remap the redzone page on demand if needed.
+	 *
+	 * This avoids issues where kredzonestack indicates a page is mapped
+	 * but the actual mapping no longer exists (e.g., if the page was
+	 * unmapped through pmap operations that bypassed sop_unmap_redzone_page).
+	 */
+	if (old->machine.kredzonestack) {
+		sop_unmap_redzone_page(old);
+	}
+#endif /* CONFIG_SPTM */
+
 	stack = machine_stack_detach(old);
 #if CONFIG_STKSZ
 	kcov_stksz_set_thread_stack(new, 0);
 #endif
 	new->kernel_stack = stack;
 	void *kstackptr = (void *)(stack + kernel_stack_size - sizeof(struct thread_kernel_state));
+#if CONFIG_SPTM && (DEVELOPMENT || DEBUG)
+	/*
+	 * Artificially reduce stack size for testing stack overflow protection.
+	 * Only apply after lockdown to avoid affecting early boot threads.
+	 * Align to 16 bytes to prevent stack alignment faults.
+	 */
+	if (startup_phase >= STARTUP_SUB_LOCKDOWN) {
+		kstackptr = (void *)(((uintptr_t)kstackptr - sop_kstack_reduce) & ~0xFUL);
+	}
+#endif
 	new->machine.kstackptr = kstackptr;
+#if CONFIG_SPTM
+	/*
+	 * The new thread starts with no redzone page mapped.
+	 * It will be remapped on demand if needed.
+	 */
+	new->machine.kredzonestack = 0;
+#endif /* CONFIG_SPTM */
 	if (stack == old->reserved_stack) {
 		assert(new->reserved_stack);
 		old->reserved_stack = new->reserved_stack;
@@ -895,9 +1185,7 @@ arm_debug_set32(arm_debug_state_t *debug_state)
 
 	/* Release previous debug state. */
 	if (cpu_debug != NULL) {
-		if (os_ref_release(&cpu_debug->ref) == 0) {
-			zfree(ads_zone, cpu_debug);
-		}
+		free_debug_state(cpu_debug);
 	}
 
 	switch (debug_info->num_breakpoint_pairs) {
@@ -1104,9 +1392,7 @@ arm_debug_set64(arm_debug_state_t *debug_state)
 
 	/* Release previous debug state. */
 	if (cpu_debug != NULL) {
-		if (os_ref_release(&cpu_debug->ref) == 0) {
-			zfree(ads_zone, cpu_debug);
-		}
+		free_debug_state(cpu_debug);
 	}
 
 	switch (debug_info->num_breakpoint_pairs) {

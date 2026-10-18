@@ -138,7 +138,7 @@ thread_quantum_expire(
 	commpage_update_mach_approximate_time(ctime);
 #endif /* CONFIG_MACH_APPROXIMATE_TIME */
 
-	sched_update_pset_avg_execution_time(processor->processor_set, thread->quantum_remaining, ctime, thread->th_sched_bucket);
+	SCHED(update_pset_avg_execution_time)(processor->processor_set, thread->quantum_remaining, ctime, thread->th_sched_bucket);
 
 	recount_switch_thread(&snap, thread, get_threadtask(thread));
 	recount_log_switch_thread(&snap);
@@ -961,9 +961,13 @@ sched_set_thread_mode(thread_t thread, sched_mode_t new_mode)
 	}
 #endif /* CONFIG_SCHED_AUTO_JOIN */
 
+	sched_mode_t old_mode = thread->sched_mode;
 	thread->sched_mode = new_mode;
 
 	SCHED(update_thread_bucket)(thread);
+
+	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED_MODE_CHANGE) | DBG_FUNC_NONE,
+	    thread_tid(thread), old_mode, new_mode, thread->th_sched_bucket);
 }
 
 /*

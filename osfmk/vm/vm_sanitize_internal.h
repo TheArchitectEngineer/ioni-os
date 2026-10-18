@@ -93,6 +93,7 @@ __enum_closed_decl(vm_sanitize_caller_id_t, uint32_t, {
 
 	/* map/remap */
 	VM_SANITIZE_CALLER_ID_VM_MAP_REMAP,
+	VM_SANITIZE_CALLER_ID_VM_MAP_REALLOCATE,
 	VM_SANITIZE_CALLER_ID_MMAP,
 	VM_SANITIZE_CALLER_ID_MREMAP_ENCRYPTED,
 	VM_SANITIZE_CALLER_ID_MAP_WITH_LINKING_NP,
@@ -190,9 +191,6 @@ __enum_closed_decl(vm_sanitize_caller_id_t, uint32_t, {
  * @const VM_SANITIZE_FLAGS_CHECK_USER_MEM_MAP_FLAGS
  * Reject non user allowed mem map flags for memory entry.
  *
- * @const VM_SANITIZE_FLAGS_CANONICALIZE
- * Canonicalize address for KASAN_TBI
- *
  * @const VM_SANITIZE_FLAGS_CHECK_ALIGNED_SIZE
  * Checks that the size is aligned to map page size.
  *
@@ -211,7 +209,7 @@ __options_closed_decl(vm_sanitize_flags_t, uint32_t, {
 	VM_SANITIZE_FLAGS_GET_UNALIGNED_VALUES     = 0x00000010,
 	VM_SANITIZE_FLAGS_REALIGN_START            = 0x00000020,
 	VM_SANITIZE_FLAGS_CHECK_USER_MEM_MAP_FLAGS = 0x00000040,
-	VM_SANITIZE_FLAGS_CANONICALIZE             = 0x00000080,
+	/* 0x00000080 */
 	VM_SANITIZE_FLAGS_CHECK_ALIGNED_SIZE       = 0x00000100,
 	VM_SANITIZE_FLAGS_CHECK_ADDR_RANGE         = 0x00000200,
 });
@@ -288,6 +286,7 @@ VM_SANITIZE_DECL_CALLER(MUNMAP);
 
 /* map/remap */
 VM_SANITIZE_DECL_CALLER(VM_MAP_REMAP);
+VM_SANITIZE_DECL_CALLER(VM_MAP_REALLOCATE);
 VM_SANITIZE_DECL_CALLER(MMAP);
 VM_SANITIZE_DECL_CALLER(MREMAP_ENCRYPTED);
 VM_SANITIZE_DECL_CALLER(MAP_WITH_LINKING_NP);
@@ -627,6 +626,64 @@ __attribute__((always_inline, warn_unused_result))
 vm_size_struct_t vm_sanitize_compute_ut_size(
 	vm_addr_struct_t        addr_u,
 	vm_addr_struct_t        end_u);
+
+#if CONFIG_KERNEL_TAGGING || HAS_MTE_EMULATION_SHIMS
+/*!
+ * @function vm_sanitize_canonicalize_ut_addr
+ *
+ * @abstract
+ * Canonicalizes and returns unsafe address from unsafe address.
+ * Intended to be used prior to address/offset sanitization.
+ *
+ * @param map				map containing the unsafe address
+ * @param addr_u			unsafe address
+ * @returns					unsafe address, canonicalized
+ */
+__attribute__((always_inline, warn_unused_result))
+vm_addr_struct_t vm_sanitize_canonicalize_ut_addr(
+	vm_map_t                        map,
+	vm_addr_struct_t                addr_u);
+
+/*!
+ * @function vm_sanitize_canonicalize_ut_addr_end
+ *
+ * @abstract
+ * Returns canonicalized unsafe start and end addresses.
+ * Verifies that @c addr_u and @c end_u have the same tag.
+ * Intended to be used prior to address-end sanitization.
+ *
+ * @param map				map containing the unsafe address
+ * @param addr_u		    unsafe address, IN/OUT
+ * @param end_u             unsafe end, IN/OUT
+ * @returns                 KERN_SUCCESS if addr_u and end_u have the same tag,
+ *                          KERN_INVALID_ARGUMENT if not
+ */
+__attribute__((always_inline, warn_unused_result))
+kern_return_t vm_sanitize_canonicalize_ut_addr_end(
+	vm_map_t                                map,
+	vm_addr_struct_t                 *const addr_u,
+	vm_addr_struct_t                 *const end_u);
+
+/*!
+ * @function vm_sanitize_validate_non_canonical_ut_addr
+ *
+ * @abstract
+ * Check whether an address is in its canonical form. Reject
+ * (KERN_INVALID_ARGUMENT) addresses that are not.
+ * Intended to be used prior to address/offset sanitization.
+ *
+ * @param map				map containing the unsafe address
+ * @param addr_u			unsafe address
+ * @returns					KERN_SUCCESS if the address is canonical,
+ *                          kERN_INVALID_ARGUMENT if not.
+ */
+__attribute__((always_inline, warn_unused_result))
+kern_return_t
+vm_sanitize_validate_non_canonical_ut_addr(
+	vm_map_t                map,
+	vm_addr_struct_t        addr_u);
+
+#endif /* CONFIG_KERNEL_TAGGING || HAS_MTE_EMULATION_SHIMS */
 
 /*!
  * @function vm_sanitize_addr

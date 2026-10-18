@@ -41,10 +41,13 @@ def ShowInterrupts(cmd_args=None):
             cpu_data_entry = Cast(element, 'cpu_data_t *')
             print("CPU {} IRQ: {:d}\n".format(y, cpu_data_entry.cpu_stat.irq_ex_cnt))
             print("CPU {} IPI: {:d}\n".format(y, cpu_data_entry.cpu_stat.ipi_cnt))
+            pmi_count = '-'
             try:
-                print("CPU {} PMI: {:d}\n".format(y, cpu_data_entry.cpu_monotonic.mtc_npmis))
-            except AttributeError:
+                # PMIs are only tracked on `CONFIG_CPU_COUNTERS` kernels.
+                pmi_count = f'{cpu_data_entry.cpu_cpc.ccp_cpmu_pmi_count:d}'
+            except KeyError:
                 pass
+            print("CPU {} PMI: {}\n".format(y, pmi_count))
             print("CPU {} TMR: {:d}\n".format(y, cpu_data_entry.cpu_stat.timer_cnt))
             x = x + 1
         y = y + 1
@@ -584,7 +587,7 @@ def ShowRunQSummary(runq):
         params: runq - value representing struct run_queue *
     """
 
-    print("    runq: count {: <10d} highq: {: <10d} urgency {: <10d}\n".format(runq.count, int32(runq.highq), runq.urgency))
+    print("    runq: count {: <10d} highq: {: <10d} urgency {: <10d}".format(runq.count, int32(runq.highq), runq.urgency))
 
     runq_queue_i = 0
     runq_queue_count = sizeof(runq.queues) // sizeof(runq.queues[0])
@@ -599,31 +602,42 @@ def ShowRunQSummary(runq):
             for thread in ParanoidIterateLinkageChain(runq_queue_head, "thread_t", "runq_links", circleQueue=True):
                 runq_queue_this_count += 1
 
-            print("      Queue [{: <#012x}] Priority {: <3d} count {:d}\n".format(runq_queue_head, runq_queue_i, runq_queue_this_count))
-            print("\t" + GetThreadSummary.header + "\n")
+            print("      Queue [{: <#012x}] Priority {: <3d} count {:d}".format(runq_queue_head, runq_queue_i, runq_queue_this_count))
+            print("\t" + GetThreadSummary.header)
             for thread in ParanoidIterateLinkageChain(runq_queue_head, "thread_t", "runq_links", circleQueue=True):
-                print("\t" + GetThreadSummary(thread) + "\n")
+                print("\t" + GetThreadSummary(thread))
                 if config['verbosity'] > vHUMAN :
-                    print("\t" + GetThreadBackTrace(thread, prefix="\t\t") + "\n")
+                    print("\t" + GetThreadBackTrace(thread, prefix="\t\t"))
 
 def ShowRTRunQSummary(rt_runq):
     if (hex(rt_runq.count) == hex(0xfdfdfdfd)) :
-        print("    Realtime Queue ({:<#012x}) uninitialized\n".format(rt_runq))
+        print("    Realtime Queue ({:<#012x}) uninitialized".format(rt_runq))
         return
-    print("    Realtime Queue ({:<#012x}) Count {:d}\n".format(rt_runq, rt_runq.count))
+    print("    Realtime Queue ({:<#012x}) Count {:d}".format(rt_runq, rt_runq.count))
     if rt_runq.count != 0:
         rt_pri_bitmap = int(rt_runq.bitmap[0])
         for rt_index in IterateBitmap(rt_pri_bitmap):
             rt_pri_rq = addressof(rt_runq.rt_queue_pri[rt_index])
-            print("        Realtime Queue Index {:d} ({:<#012x}) Count {:d}\n".format(rt_index, rt_pri_rq, rt_pri_rq.pri_count))
-            print("\t" + GetThreadSummary.header + "\n")
+            print("        Realtime Queue Index {:d} ({:<#012x}) Count {:d}".format(rt_index, rt_pri_rq, rt_pri_rq.pri_count))
+            print("\t" + GetThreadSummary.header + "")
             for rt_runq_thread in ParanoidIterateLinkageChain(rt_pri_rq.pri_queue, "thread_t", "runq_links", circleQueue=False):
-                print("\t" + GetThreadSummary(rt_runq_thread) + "\n")
+                print("\t" + GetThreadSummary(rt_runq_thread) + "")
 
 def ShowActiveThread(processor):
     if (processor.active_thread != 0) :
         print("\t" + GetThreadSummary.header)
         print("\t" + GetThreadSummary(processor.active_thread))
+
+def ShowPulledThreadQueue(threadq, name):
+    if (threadq.ptq_queue_active != 0) :
+        print("\t" + "{:s} (pending smr_cpu_down cpus: ({:#0x}))".format(name, threadq.ptq_needs_smr_cpu_down))
+        print("\t\t" + GetThreadSummary.header)
+        for thread in ParanoidIterateLinkageChain(threadq.ptq_threadq, "thread_t", "runq_links", circleQueue=True):
+            print("\t\t" + GetThreadSummary(thread))
+
+def ShowPulledThreads(processor):
+    ShowPulledThreadQueue(processor.processor_threadq, "Pulled Thread Queue")
+    ShowPulledThreadQueue(processor.processor_threadq_interrupt, "Interrupt Pulled Thread Queue")
 
 @lldb_command('showallprocessors')
 @lldb_command('showscheduler')
@@ -631,13 +645,6 @@ def ShowScheduler(cmd_args=None):
     """  Routine to print information of all psets and processors
          Usage: showscheduler
     """
-    if GetEnumValue('pset_cluster_type_t', 'MAX_PSET_TYPES') > 1:
-        # AMP platform
-        node = addressof(kern.globals.pset_nodes[0])
-    else:
-        # SMP platform
-        node = addressof(kern.globals.pset_node0)
-
     show_priority_runq = 0
     show_priority_pset_runq = 0
     show_clutch = 0
@@ -659,7 +666,7 @@ def ShowScheduler(cmd_args=None):
     else :
         print("Unknown sched_string {:s}".format(sched_string))
 
-    print("Scheduler: {:s}\n".format(sched_string))
+    print("Scheduler: {:s}".format(sched_string))
 
     if show_clutch == 0 and show_edge == 0:
         run_buckets = kern.globals.sched_run_buckets
@@ -669,9 +676,9 @@ def ShowScheduler(cmd_args=None):
         share_df_count = run_buckets[GetEnumValue('sched_bucket_t::TH_BUCKET_SHARE_DF')]
         share_ut_count = run_buckets[GetEnumValue('sched_bucket_t::TH_BUCKET_SHARE_UT')]
         share_bg_count = run_buckets[GetEnumValue('sched_bucket_t::TH_BUCKET_SHARE_BG')]
-        print("Processors: {g.processor_avail_count:d} Runnable threads: {:d} Fixpri threads: {:d}\n".format(run_count, fixpri_count, g=kern.globals))
-        print("FG Timeshare threads: {:d} DF Timeshare threads: {:d} UT Timeshare threads: {:d} BG Timeshare threads: {:d}\n".format(share_fg_count, share_df_count, share_ut_count, share_bg_count))
-    
+        print("Processors: {g.processor_avail_count:d} Runnable threads: {:d} Fixpri threads: {:d}".format(run_count, fixpri_count, g=kern.globals))
+        print("FG Timeshare threads: {:d} DF Timeshare threads: {:d} UT Timeshare threads: {:d} BG Timeshare threads: {:d}".format(share_fg_count, share_df_count, share_ut_count, share_bg_count))
+
     processor_offline     = GetEnumValue('processor_state_t::PROCESSOR_OFF_LINE')
     processor_idle        = GetEnumValue('processor_state_t::PROCESSOR_IDLE')
     processor_dispatching = GetEnumValue('processor_state_t::PROCESSOR_DISPATCHING')
@@ -679,13 +686,22 @@ def ShowScheduler(cmd_args=None):
 
     print()
 
+    node = kern.globals.sched_boot_pset_node
     while node != 0:
         pset = node.psets
         pset = kern.GetValueFromAddress(unsigned(pset), 'struct processor_set *')
 
         while pset != 0:
-            print("Processor Set  {: <#012x} Count {:d} (cpu_id {:<#x}-{:<#x})\n".format(pset,
+            print("Processor Set  {: <#012x} Count {:d} (cpu_id {:<#x}-{:<#x})".format(pset,
                 unsigned(pset.cpu_set_count), pset.cpu_set_low, pset.cpu_set_hi))
+
+            deferred_str = ""
+            if hasattr(pset, "pending_deferred_AST_cpu_mask") :
+                deferred_str = " deferred: {:#x}".format(pset.pending_deferred_AST_cpu_mask)
+
+            print("\tpending ASTs: urgent: {:#x} preempt: {:#x} spill: {:#x} rt_spill: {:#x}{:s}".format(
+                pset.pending_AST_URGENT_cpu_mask, pset.pending_AST_PREEMPT_cpu_mask,
+                pset.pending_spill_cpu_mask, pset.rt_pending_spill_cpu_mask, deferred_str))
 
             rt_runq = kern.GetValueFromAddress(unsigned(addressof(pset.rt_runq)), 'struct rt_queue *')
             ShowRTRunQSummary(rt_runq)
@@ -698,14 +714,14 @@ def ShowScheduler(cmd_args=None):
 
             processor_array = kern.globals.processor_array
 
-            print("Active Processors:\n")
+            print("Active Processors:")
             active_bitmap = int(pset.cpu_state_map[processor_dispatching]) | int(pset.cpu_state_map[processor_running])
             for cpuid in IterateBitmap(active_bitmap):
                 processor = processor_array[cpuid]
                 if processor != 0:
                     print("    " + GetProcessorSummary(processor), end='')
                     ShowActiveThread(processor)
-
+                    ShowPulledThreads(processor)
                     if show_priority_runq:
                         runq = processor.runq
                         if runq.count != 0:
@@ -713,7 +729,7 @@ def ShowScheduler(cmd_args=None):
             print()
 
 
-            print("Idle Processors:\n")
+            print("Idle Processors:")
             idle_bitmap = int(pset.cpu_state_map[processor_idle])
             if hasattr(pset, "primary_map"):
                 idle_bitmap = idle_bitmap & int(pset.primary_map)
@@ -722,6 +738,7 @@ def ShowScheduler(cmd_args=None):
                 if processor != 0:
                     print("    " + GetProcessorSummary(processor), end='')
                     ShowActiveThread(processor)
+                    ShowPulledThreads(processor)
 
                     if show_priority_runq:
                         runq = processor.runq
@@ -731,13 +748,14 @@ def ShowScheduler(cmd_args=None):
 
 
             if hasattr(pset, "primary_map"):
-                print("Idle Secondary Processors:\n")
+                print("Idle Secondary Processors:")
                 idle_bitmap = int(pset.cpu_state_map[processor_idle]) & ~(int(pset.primary_map))
                 for cpuid in IterateBitmap(idle_bitmap):
                     processor = processor_array[cpuid]
                     if processor != 0:
                         print("    " + GetProcessorSummary(processor), end='')
                         ShowActiveThread(processor)
+                        ShowPulledThreads(processor)
 
                         if show_priority_runq:
                             runq = processor.runq
@@ -746,7 +764,7 @@ def ShowScheduler(cmd_args=None):
                 print()
 
 
-            print("Other Processors:\n")
+            print("Other Processors:")
             other_bitmap = 0
             for i in range(processor_offline, processor_idle):
                 other_bitmap |= int(pset.cpu_state_map[i])
@@ -756,6 +774,7 @@ def ShowScheduler(cmd_args=None):
                 if processor != 0:
                     print("    " + GetProcessorSummary(processor), end='')
                     ShowActiveThread(processor)
+                    ShowPulledThreads(processor)
 
                     if show_priority_runq:
                         runq = processor.runq
@@ -764,17 +783,15 @@ def ShowScheduler(cmd_args=None):
             print()
 
             if show_clutch or show_edge:
-                cluster_type = 'SMP'
-                if pset.pset_cluster_type != 0:
-                    cluster_type = GetEnumName('pset_cluster_type_t', pset.pset_cluster_type, 'PSET_AMP_')
-                print("=== Clutch Scheduler Hierarchy Pset{:d} (Type: {:s}) ] ===\n\n".format(pset.pset_cluster_id, cluster_type))
+                pset_type = GetEnumName('pset_type_t', pset.pset_type, "PSET_")
+                print("=== Clutch Scheduler Hierarchy Pset{:d} (Type: {:s}) ] ===\n\n".format(pset.pset_id, pset_type))
                 ShowSchedClutchForPset(pset)
 
             pset = pset.pset_list
 
         node = node.node_list
 
-    print("\nCrashed Threads Queue: ({:<#012x})\n".format(addressof(kern.globals.crashed_threads_queue)))
+    print("\nCrashed Threads Queue: ({:<#012x})".format(addressof(kern.globals.crashed_threads_queue)))
     first = True
     for thread in ParanoidIterateLinkageChain(kern.globals.crashed_threads_queue, "thread_t", "runq_links"):
         if first:
@@ -784,7 +801,7 @@ def ShowScheduler(cmd_args=None):
 
     def dump_mpsc_thread_queue(name, head):
         head = addressof(head)
-        print("\n{:s}: ({:<#012x})\n".format(name, head))
+        print("\n{:s}: ({:<#012x})".format(name, head))
         first = True
         for thread in IterateMPSCQueue(head.mpd_queue, 'struct thread', 'mpsc_links'):
             if first:
@@ -794,7 +811,7 @@ def ShowScheduler(cmd_args=None):
 
     def dump_thread_exception_queue(name, head):
         head = addressof(head)
-        print("\n{:s}: ({:<#012x})\n".format(name, head))
+        print("\n{:s}: ({:<#012x})".format(name, head))
         first = True
         for exception_elt in IterateMPSCQueue(head.mpd_queue, 'struct thread_exception_elt', 'link'):
             if first:
@@ -807,10 +824,9 @@ def ShowScheduler(cmd_args=None):
     dump_mpsc_thread_queue("Waiting For Kernel Stacks Queue", kern.globals.thread_stack_queue)
     dump_thread_exception_queue("Thread Exception Queue", kern.globals.thread_exception_queue)
     dump_mpsc_thread_queue("Thread Deallocate Queue", kern.globals.thread_deallocate_queue)
+    print()
 
     print(kern.globals.pcs)
-
-    print()
 
 # EndMacro: showallprocessors
 
@@ -1269,4 +1285,3 @@ def ShowAllCallouts(cmd_args=None):
     PrintThreadCallThreads()
 
 # EndMacro: showallcallouts
-

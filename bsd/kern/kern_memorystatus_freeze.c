@@ -108,11 +108,7 @@ unsigned int memorystatus_max_frozen_demotions_daily = 0;
 unsigned int memorystatus_thaw_count_demotion_threshold = 0;
 unsigned int memorystatus_min_thaw_refreeze_threshold;
 
-#if XNU_TARGET_OS_WATCH
 #define FREEZE_DYNAMIC_THREAD_DELAY_ENABLED_DEFAULT true
-#else
-#define FREEZE_DYNAMIC_THREAD_DELAY_ENABLED_DEFAULT false
-#endif
 boolean_t memorystatus_freeze_dynamic_thread_delay_enabled = FREEZE_DYNAMIC_THREAD_DELAY_ENABLED_DEFAULT;
 SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_dynamic_thread_delay_enabled, CTLFLAG_RW | CTLFLAG_LOCKED, &memorystatus_freeze_dynamic_thread_delay_enabled, 0, "");
 
@@ -120,6 +116,42 @@ SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_dynamic_thread_delay_enabled, C
 #define FREEZE_APPS_IDLE_DELAY_MULTIPLIER_SLOW 30
 #define FREEZE_APPS_IDLE_DELAY_MULTIPLIER_DEFAULT FREEZE_APPS_IDLE_DELAY_MULTIPLIER_FAST
 unsigned int memorystatus_freeze_apps_idle_delay_multiplier = FREEZE_APPS_IDLE_DELAY_MULTIPLIER_DEFAULT;
+
+#define MEMORYSTATUS_FREEZE_PREVENT_REFREEZE_OF_RECENTLY_THAWED_DEFAULT true
+
+#if XNU_TARGET_OS_WATCH
+#define MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_DEFAULT 1
+#define MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_PREVENT_REFREEZE_SECONDS_DEFAULT (60 * 15)
+#else
+#define MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_DEFAULT 5
+#define MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_PREVENT_REFREEZE_SECONDS_DEFAULT (60 * 25)
+#endif
+#define MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_MAX 10
+
+TUNABLE_WRITEABLE(boolean_t, memorystatus_freeze_prevent_refreeze_of_recently_thawed,
+    "memorystatus_freeze_prevent_refreeze_of_recently_thawed",
+    MEMORYSTATUS_FREEZE_PREVENT_REFREEZE_OF_RECENTLY_THAWED_DEFAULT);
+TUNABLE_WRITEABLE(uint32_t, memorystatus_freeze_last_processes_thawed_cache_size,
+    "memorystatus_freeze_last_processes_thawed_cache_size",
+    MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_DEFAULT);
+TUNABLE_WRITEABLE(uint32_t, memorystatus_freeze_last_processes_thawed_prevent_refreeze_seconds,
+    "memorystatus_freeze_last_processes_thawed_prevent_refreeze_seconds",
+    MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_PREVENT_REFREEZE_SECONDS_DEFAULT);
+EXPERIMENT_FACTOR_UINT(memorystatus_freeze_prevent_refreeze_of_recently_thawed,
+    &memorystatus_freeze_prevent_refreeze_of_recently_thawed, 0, 1, "");
+EXPERIMENT_FACTOR_UINT(memorystatus_freeze_last_processes_thawed_cache_size,
+    &memorystatus_freeze_last_processes_thawed_cache_size, 0, MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_MAX, "");
+EXPERIMENT_FACTOR_UINT(memorystatus_freeze_last_processes_thawed_prevent_refreeze_seconds,
+    &memorystatus_freeze_last_processes_thawed_prevent_refreeze_seconds, 0, UINT32_MAX, "");
+pid_t    memorystatus_freeze_last_processes_thawed_pid[MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_MAX];
+uint64_t memorystatus_freeze_last_processes_thawed_ts[MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_MAX];
+
+#define MEMORYSTATUS_FREEZE_DAEMONS_ALL_ALLOWED_DEFAULT FALSE
+TUNABLE_WRITEABLE(boolean_t, memorystatus_freeze_daemons_all_allowed,
+    "memorystatus_freeze_daemons_all_allowed",
+    MEMORYSTATUS_FREEZE_DAEMONS_ALL_ALLOWED_DEFAULT);
+EXPERIMENT_FACTOR_UINT(memorystatus_freeze_daemons_all_allowed,
+    &memorystatus_freeze_daemons_all_allowed, FALSE, TRUE, "");
 
 #if (XNU_TARGET_OS_IOS && !XNU_TARGET_OS_XR) || XNU_TARGET_OS_WATCH
 #define FREEZE_ENABLED_DEFAULT TRUE
@@ -136,6 +168,14 @@ unsigned int memorystatus_frozen_processes_max = 0;
 unsigned int memorystatus_frozen_shared_mb = 0;
 unsigned int memorystatus_frozen_shared_mb_max = 0;
 unsigned int memorystatus_freeze_shared_mb_per_process_max = 0; /* Max. MB allowed per process to be freezer-eligible. */
+
+#define MEMORYSTATUS_FREEZE_SHARED_MEMORY_DEFAULT FALSE
+TUNABLE_WRITEABLE(boolean_t, memorystatus_freeze_shared_memory,
+    "memorystatus_freeze_shared_memory",
+    MEMORYSTATUS_FREEZE_SHARED_MEMORY_DEFAULT);
+EXPERIMENT_FACTOR_LEGACY_INT(_kern_memorystatus, freeze_shared_memory, &memorystatus_freeze_shared_memory, 0, 1,
+    "Freeze shared memory and freeze procs over shared memory limit");
+
 #if XNU_TARGET_OS_WATCH
 unsigned int memorystatus_freeze_private_shared_pages_ratio = 1; /* Ratio of private:shared pages for a process to be freezer-eligible. */
 #else
@@ -184,7 +224,7 @@ static uint32_t memorystatus_freeze_calculate_new_budget(
 	uint32_t rollover);
 
 struct memorystatus_freezer_candidate_list memorystatus_global_freeze_list = {NULL, 0};
-struct memorystatus_freezer_candidate_list memorystatus_global_demote_list = {NULL, 0};
+
 /*
  * When enabled, freeze candidates are chosen from the memorystatus_global_freeze_list
  * in order (as opposed to using the older LRU approach).
@@ -194,12 +234,12 @@ struct memorystatus_freezer_candidate_list memorystatus_global_demote_list = {NU
 #else
 #define FREEZER_USE_ORDERED_LIST_DEFAULT 0
 #endif
-int memorystatus_freezer_use_ordered_list = FREEZER_USE_ORDERED_LIST_DEFAULT;
+TUNABLE_WRITEABLE(boolean_t, memorystatus_freezer_use_ordered_list, "memorystatus_freezer_use_ordered_list", FREEZER_USE_ORDERED_LIST_DEFAULT);
 EXPERIMENT_FACTOR_LEGACY_UINT(_kern, memorystatus_freezer_use_ordered_list, &memorystatus_freezer_use_ordered_list, 0, 1, "");
 /*
  * When enabled, demotion candidates are chosen from memorystatus_global_demotion_list
  */
-int memorystatus_freezer_use_demotion_list = 0;
+TUNABLE_WRITEABLE(boolean_t, memorystatus_freezer_use_demotion_list, "memorystatus_freezer_use_demotion_list", FALSE);
 EXPERIMENT_FACTOR_LEGACY_UINT(_kern, memorystatus_freezer_use_demotion_list, &memorystatus_freezer_use_demotion_list, 0, 1, "");
 
 extern boolean_t vm_swap_max_budget(uint64_t *);
@@ -437,12 +477,6 @@ sysctl_memorystatus_freeze_budget_multiplier SYSCTL_HANDLER_ARGS
 		if (!VM_CONFIG_FREEZER_SWAP_IS_ACTIVE) {
 			return ENOTSUP;
 		}
-#if !(DEVELOPMENT || DEBUG)
-		if (val > 100) {
-			/* Can not increase budget on release. */
-			return EINVAL;
-		}
-#endif
 		lck_mtx_lock(&freezer_mutex);
 
 		memorystatus_freeze_budget_multiplier = val;
@@ -487,10 +521,9 @@ SYSCTL_UINT(_kern, OID_AUTO, memorystatus_refreeze_eligible_count, CTLFLAG_RD | 
  * Default is 10% of system-wide task limit.
  */
 
-SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_shared_mb_max, CTLFLAG_RW | CTLFLAG_LOCKED, &memorystatus_frozen_shared_mb_max, 0, "");
-SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_shared_mb, CTLFLAG_RD | CTLFLAG_LOCKED, &memorystatus_frozen_shared_mb, 0, "");
-
-SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_shared_mb_per_process_max, CTLFLAG_RW | CTLFLAG_LOCKED, &memorystatus_freeze_shared_mb_per_process_max, 0, "");
+EXPERIMENT_FACTOR_LEGACY_UINT(_kern, memorystatus_freeze_shared_mb_max, &memorystatus_frozen_shared_mb_max, 0, UINT32_MAX, "");
+EXPERIMENT_FACTOR_LEGACY_UINT(_kern, memorystatus_freeze_shared_mb, &memorystatus_frozen_shared_mb, 0, UINT32_MAX, "");
+EXPERIMENT_FACTOR_LEGACY_UINT(_kern, memorystatus_freeze_shared_mb_per_process_max, &memorystatus_freeze_shared_mb_per_process_max, 0, UINT32_MAX, "");
 
 boolean_t memorystatus_freeze_throttle_enabled = TRUE;
 SYSCTL_UINT(_kern, OID_AUTO, memorystatus_freeze_throttle_enabled, CTLFLAG_RW | CTLFLAG_LOCKED, &memorystatus_freeze_throttle_enabled, 0, "");
@@ -588,7 +621,9 @@ again:
 		}
 
 		KDBG(MEMSTAT_CODE(BSD_MEMSTAT_FREEZE) | DBG_FUNC_START, memorystatus_available_pages, pid, max_pages);
-		error = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty, max_pages, &shared, &freezer_error_code, FALSE /* eval only */);
+		error = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty,
+		    max_pages, &shared, &freezer_error_code,
+		    memorystatus_freeze_shared_memory ? FREEZE_SHARED : FREEZE_NONE);
 		if (!error || freezer_error_code == FREEZER_ERROR_LOW_PRIVATE_SHARED_RATIO) {
 			memorystatus_freezer_stats.mfs_shared_pages_skipped += shared;
 		}
@@ -1013,7 +1048,9 @@ continue_eval:
 			uint32_t max_pages = 0;
 			int freezer_error_code = 0;
 
-			error = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty, max_pages, &shared, &freezer_error_code, TRUE /* eval only */);
+			error = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty,
+			    max_pages, &shared, &freezer_error_code,
+			    FREEZE_EVAL_ONLY & (memorystatus_freeze_shared_memory ? FREEZE_SHARED : FREEZE_NONE));
 
 			if (error) {
 				list_entry->p_freeze_error_code = freezer_error_code;
@@ -1857,7 +1894,9 @@ memorystatus_freeze_process(
 	KDBG(MEMSTAT_CODE(BSD_MEMSTAT_FREEZE) | DBG_FUNC_START, memorystatus_available_pages, aPid, max_pages);
 
 	max_pages = MIN(max_pages, UINT32_MAX);
-	kr = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty, (uint32_t) max_pages, &shared, &freezer_error_code, FALSE /* eval only */);
+	kr = task_freeze(proc_task(p), &purgeable, &wired, &clean, &dirty,
+	    (uint32_t) max_pages, &shared, &freezer_error_code,
+	    memorystatus_freeze_shared_memory ? FREEZE_SHARED : FREEZE_NONE);
 	if (kr == KERN_SUCCESS || freezer_error_code == FREEZER_ERROR_LOW_PRIVATE_SHARED_RATIO) {
 		memorystatus_freezer_stats.mfs_shared_pages_skipped += shared;
 	}
@@ -2090,7 +2129,7 @@ memorystatus_freezer_candidate_list_get_proc(
 		 */
 		unsigned int band = JETSAM_PRIORITY_IDLE;
 		p = memorystatus_get_first_proc_locked(&band, TRUE);
-		while (p != NULL && band <= memorystatus_freeze_max_candidate_band) {
+		while (p != NULL) {
 			if (strncmp(entry->proc_name, p->p_name, sizeof(proc_name_t)) == 0) {
 				if (pid_mismatch_counter != NULL) {
 					(*pid_mismatch_counter)++;
@@ -2387,33 +2426,27 @@ memorystatus_demote_frozen_processes_using_thaw_count(bool urgent_mode)
 }
 
 static unsigned int
-memorystatus_demote_frozen_processes_using_demote_list(bool urgent_mode)
+memorystatus_demote_frozen_processes_using_demote_flag(bool urgent_mode)
 {
 	LCK_MTX_ASSERT(&freezer_mutex, LCK_MTX_ASSERT_OWNED);
 	LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_NOTOWNED);
 	assert(memorystatus_freezer_use_demotion_list);
+	proc_t p;
 	unsigned int demoted_proc_count = 0;
 
 	proc_list_lock();
-	for (size_t i = 0; i < memorystatus_global_demote_list.mfcl_length; i++) {
-		proc_t p = memorystatus_freezer_candidate_list_get_proc(
-			&memorystatus_global_demote_list,
-			i,
-			&memorystatus_freezer_stats.mfs_demote_pid_mismatches);
-		if (p != NULL && memorystatus_freeze_proc_is_refreeze_eligible(p)) {
+	unsigned int band = JETSAM_PRIORITY_FREEZER;
+	p = memorystatus_get_first_proc_locked(&band, TRUE);
+	while (p != NULL) {
+		if (p->p_memstat_state & P_MEMSTAT_NEEDS_DEMOTION) {
 			memorystatus_demote_frozen_process(p, urgent_mode);
-			/* Remove this entry now that it's been demoted. */
-			memorystatus_global_demote_list.mfcl_list[i].pid = NO_PID;
+			p->p_memstat_state &= ~P_MEMSTAT_NEEDS_DEMOTION;
 			demoted_proc_count++;
-			/*
-			 * We only demote one proc at a time in this mode.
-			 * This gives jetsam a chance to kill the recently demoted processes.
-			 */
-			break;
 		}
+		p = memorystatus_get_next_proc_locked(&band, p, TRUE);
 	}
-
 	proc_list_unlock();
+
 	return demoted_proc_count;
 }
 
@@ -2461,7 +2494,7 @@ memorystatus_demote_frozen_processes(bool urgent_mode)
 	 * The thaw count policy will scan through the frozen band.
 	 */
 	if (memorystatus_freezer_use_demotion_list) {
-		demoted_proc_count += memorystatus_demote_frozen_processes_using_demote_list(urgent_mode);
+		demoted_proc_count += memorystatus_demote_frozen_processes_using_demote_flag(urgent_mode);
 
 		if (demoted_proc_count == 0 && urgent_mode) {
 			/*
@@ -2916,8 +2949,8 @@ memorystatus_freeze_thread(void *param __unused, wait_result_t wr __unused)
 
 	lck_mtx_lock(&freezer_mutex);
 	if (memorystatus_freeze_enabled) {
-		if (memorystatus_freezer_use_demotion_list && memorystatus_refreeze_eligible_count > 0) {
-			memorystatus_demote_frozen_processes(false); /* Normal mode. Consider demoting thawed processes. */
+		if (memorystatus_freezer_use_demotion_list) {
+			memorystatus_demote_frozen_processes(false); /* Normal mode. Demote all in list. */
 		}
 		while (num_frozen < max_to_freeze &&
 		    memorystatus_can_freeze(&memorystatus_freeze_swap_low) &&
@@ -3201,7 +3234,31 @@ memorystatus_cmd_grp_set_freeze_list(user_addr_t buffer, size_t buffer_size)
 errno_t
 memorystatus_cmd_grp_set_demote_list(user_addr_t buffer, size_t buffer_size)
 {
-	return set_freezer_candidate_list(buffer, buffer_size, &memorystatus_global_demote_list);
+	proc_t p;
+	int ent = 0;
+	struct memorystatus_freezer_candidate_list demote_list = {NULL, 0};
+
+	/* Copyin candidate list */
+	errno_t ret = set_freezer_candidate_list(buffer, buffer_size, &demote_list);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* Set P_MEMSTAT_NEEDS_DEMOTION on list members */
+	proc_list_lock();
+	for (ent = 0; ent < demote_list.mfcl_length; ent++) {
+		p = memorystatus_freezer_candidate_list_get_proc(&demote_list, ent, NULL);
+		if (p != PROC_NULL) {
+			p->p_memstat_state |= P_MEMSTAT_NEEDS_DEMOTION;
+		}
+	}
+	proc_list_unlock();
+
+	/* Free list and wake up freezer thread */
+	kfree_data(demote_list.mfcl_list, demote_list.mfcl_length * sizeof(memorystatus_properties_freeze_entry_v1));
+	thread_wakeup((event_t)&memorystatus_freeze_wakeup);
+
+	return 0;
 }
 
 void
@@ -3233,6 +3290,73 @@ memorystatus_freezer_mark_ui_transition(proc_t p)
 
 out:
 	proc_list_unlock();
+}
+
+/*
+ * Cache of pids of most-recently thawed processes.
+ * Used to reduce excessive rapid thaw/refreeze cycles.
+ *
+ * There is a very small chance of false-positive mis-identification
+ * of a process due to eventual pid reuse, but for that to happen,
+ * a pid would have to be reused within the timeout period (e.g. 15 minutes),
+ * and even then the only consequence might be that that one process is
+ * temporarily passed over for refreezing until the timeout expires.
+ *
+ * FIXME (rdar://161250797) switch from PIDs to unique process IDs
+ */
+
+void
+memorystatus_freeze_record_process_thawed(proc_t p)
+{
+	unsigned int slot = 0;
+	pid_t procpid = proc_getpid(p);
+
+	assert(memorystatus_freeze_last_processes_thawed_cache_size <= MEMORYSTATUS_FREEZE_LAST_PROCESSES_THAWED_CACHE_SIZE_MAX);
+
+	for (slot = 0; slot < memorystatus_freeze_last_processes_thawed_cache_size; slot++) {
+		if (memorystatus_freeze_last_processes_thawed_pid[slot] == procpid) {
+			// Found existing table entry for this pid
+			break;
+		}
+	}
+
+	if (slot == memorystatus_freeze_last_processes_thawed_cache_size) {
+		// Did not find an existing table entry for this pid; select the oldest to evict
+		int oldest_slot = 0;
+		uint64_t oldest_ts = memorystatus_freeze_last_processes_thawed_ts[oldest_slot];
+		for (slot = 1; slot < memorystatus_freeze_last_processes_thawed_cache_size; slot++) {
+			if (memorystatus_freeze_last_processes_thawed_ts[slot] < oldest_ts) {
+				oldest_ts = memorystatus_freeze_last_processes_thawed_ts[slot];
+				oldest_slot = slot;
+			}
+		}
+		slot = oldest_slot;
+	}
+
+	memorystatus_freeze_last_processes_thawed_pid[slot] = proc_getpid(p);
+	memorystatus_freeze_last_processes_thawed_ts[slot] = mach_absolute_time();
+}
+
+bool
+memorystatus_freeze_was_process_recently_thawed(proc_t p)
+{
+	unsigned int slot;
+	bool recent_thaw = false;
+	pid_t procpid = proc_getpid(p);
+
+	for (slot = 0; slot < memorystatus_freeze_last_processes_thawed_cache_size; slot++) {
+		if (memorystatus_freeze_last_processes_thawed_pid[slot] == procpid) {
+			// Found existing table entry for this pid
+			uint64_t timeout_delta_abs;
+			nanoseconds_to_absolutetime(memorystatus_freeze_last_processes_thawed_prevent_refreeze_seconds * NSEC_PER_SEC, &timeout_delta_abs);
+			if (mach_absolute_time() < (memorystatus_freeze_last_processes_thawed_ts[slot] + timeout_delta_abs)) {
+				recent_thaw = true;
+			}
+			break;
+		}
+	}
+
+	return recent_thaw;
 }
 
 #endif /* CONFIG_FREEZE */

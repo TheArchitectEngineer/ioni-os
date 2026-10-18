@@ -116,11 +116,7 @@ struct vm_counters vm_counters;
 
 os_refgrp_decl(, vm_object_refgrp, "vm_object", NULL);
 
-#if DEVELOPMENT || DEBUG
 extern struct memory_object_pager_ops shared_region_pager_ops;
-extern unsigned int shared_region_pagers_resident_count;
-extern unsigned int shared_region_pagers_resident_peak;
-#endif /* DEVELOPMENT || DEBUG */
 
 #if VM_OBJECT_TRACKING
 btlog_t vm_object_tracking_btlog;
@@ -242,6 +238,9 @@ const vm_object_t                       kernel_object_default = &kernel_object_s
 static struct vm_object                 compressor_object_store VM_PAGE_PACKED_ALIGNED;
 const vm_object_t                       compressor_object = &compressor_object_store;
 
+static struct vm_object                 sentinel_object_store VM_PAGE_PACKED_ALIGNED;
+const vm_object_t                       sentinel_object = &sentinel_object_store;
+
 /*
  * This object holds all pages that have been retired due to errors like ECC.
  * The system should never use the page or look at its contents. The offset
@@ -250,9 +249,29 @@ const vm_object_t                       compressor_object = &compressor_object_s
 static struct vm_object                 retired_pages_object_store VM_PAGE_PACKED_ALIGNED;
 const vm_object_t                       retired_pages_object = &retired_pages_object_store;
 
+#if HAS_MTE
+/*
+ * This object holds all pages that are currently being used to hold MTE tags.
+ * The pages are wired and may have no pmap mappings of any kind.
+ * The object offset will be the same as physical address.
+ */
+static struct vm_object                 mte_tags_object_store VM_PAGE_PACKED_ALIGNED;
+const vm_object_t                       mte_tags_object = &mte_tags_object_store;
+
+/*
+ * This object is for pages that would have been on kernel_object_default, except
+ * that they are using MTE tags.
+ */
+static struct vm_object                 kernel_object_tagged_store VM_PAGE_PACKED_ALIGNED;
+const vm_object_t                       kernel_object_tagged = &kernel_object_tagged_store;
+#endif /* HAS_MTE */
 
 static struct vm_object                 exclaves_object_store VM_PAGE_PACKED_ALIGNED;
 const vm_object_t                       exclaves_object = &exclaves_object_store;
+#if HAS_MTE
+static struct vm_object                 exclaves_object_tagged_store VM_PAGE_PACKED_ALIGNED;
+const vm_object_t                       exclaves_object_tagged = &exclaves_object_tagged_store;
+#endif /* HAS_MTE */
 
 
 /*
@@ -393,6 +412,7 @@ static const struct vm_object vm_object_template = {
 	.purgeable_volatilizer_bt = {0},
 #endif /* DEBUG */
 	.vmo_provenance = VM_MAP_SERIAL_NONE,
+	.vmo_pl_req_in_progress = 0,
 };
 
 LCK_GRP_DECLARE(vm_object_lck_grp, "vm_object");
@@ -439,6 +459,10 @@ static queue_head_t vm_object_reaper_queue; /* protected by vm_object_reaper_loc
 unsigned int vm_object_reap_count = 0;
 unsigned int vm_object_reap_count_async = 0;
 
+#if HAS_MTE
+unsigned int vm_object_no_compressor_pager_for_mte_count = 0;
+TUNABLE(bool, vm_object_allow_compressor_pager_for_mte, "compress_mte", true);
+#endif
 
 #define vm_object_reaper_lock()         \
 	        lck_mtx_lock(&vm_object_reaper_lock_data)
@@ -484,7 +508,7 @@ vm_object_set_size(
  *	Returns a new object with the given size.
  */
 
-__private_extern__ void
+__exported_hidden void
 _vm_object_allocate(
 	vm_object_size_t        size,
 	vm_object_t             object,
@@ -511,7 +535,7 @@ _vm_object_allocate(
 #endif /* VM_OBJECT_TRACKING_OP_CREATED */
 }
 
-__private_extern__ vm_object_t
+__exported_hidden vm_object_t
 vm_object_allocate(
 	vm_object_size_t        size, vm_map_serial_t provenance)
 {
@@ -557,8 +581,10 @@ vm_object_bootstrap(void)
 	 * VM_MAX_KERNEL_ADDRESS (vm_last_addr) is a maximum address, not a size.
 	 */
 	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, kernel_object_default, VM_MAP_SERIAL_SPECIAL);
+	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, sentinel_object, VM_MAP_SERIAL_SPECIAL);
 	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, compressor_object, VM_MAP_SERIAL_SPECIAL);
 	kernel_object_default->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+	sentinel_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
 	compressor_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
 	kernel_object_default->no_tag_update = TRUE;
 
@@ -568,12 +594,32 @@ vm_object_bootstrap(void)
 	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, retired_pages_object, VM_MAP_SERIAL_SPECIAL);
 	retired_pages_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
 
+#if HAS_MTE
+	/*
+	 * The object to hold MTE tag pages.
+	 */
+	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, mte_tags_object, VM_MAP_SERIAL_SPECIAL);
+	mte_tags_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+
+	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, kernel_object_tagged, VM_MAP_SERIAL_SPECIAL);
+	kernel_object_tagged->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+	kernel_object_tagged->no_tag_update = TRUE;
+	kernel_object_tagged->wimg_bits = VM_WIMG_MTE;
+#endif /* HAS_MTE */
 
 	/**
 	 * The object to hold pages owned by exclaves.
 	 */
 	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, exclaves_object, VM_MAP_SERIAL_SPECIAL);
 	exclaves_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+#if HAS_MTE
+	/**
+	 * The object to hold MTE tag pages owned by exclaves.
+	 */
+	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, exclaves_object_tagged, VM_MAP_SERIAL_SPECIAL);
+	exclaves_object_tagged->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+	exclaves_object_tagged->wimg_bits = VM_WIMG_MTE;
+#endif /* HAS_MTE */
 }
 
 #if CONFIG_IOSCHED
@@ -624,7 +670,7 @@ unsigned long vm_object_deallocate_shared_successes = 0;
 unsigned long vm_object_deallocate_shared_failures = 0;
 unsigned long vm_object_deallocate_shared_swap_failures = 0;
 
-__private_extern__ void
+__exported_hidden void
 vm_object_deallocate(
 	vm_object_t     object)
 {
@@ -759,12 +805,33 @@ vm_object_deallocate(
 				    object->named &&
 				    pager != MEMORY_OBJECT_NULL) {
 					vm_object_mapping_begin(object);
+					assert(pager->mo_last_unmap_ctid == 0);
+					/*
+					 * Signal that we're the thread that triggered
+					 * the memory_object_last_unmap(), so that we
+					 * don't deadlock in vm_object_destroy() if this
+					 * was the last reference and we're releasing
+					 * the pager there.
+					 */
+					pager->mo_last_unmap_ctid = thread_get_ctid(current_thread());
 					vm_object_unlock(object);
 
 					memory_object_last_unmap(pager);
+					/* pager might no longer be valid now */
+					pager = MEMORY_OBJECT_NULL;
 
 					vm_object_lock(object);
+
 					vm_object_mapping_end(object);
+					pager = object->pager;
+					if (pager != MEMORY_OBJECT_NULL) {
+						/*
+						 * The pager is still there, so reset its
+						 * "mo_last_unmap_ctid" now that we're done.
+						 */
+						assert3u(pager->mo_last_unmap_ctid, ==, thread_get_ctid(current_thread()));
+						pager->mo_last_unmap_ctid = 0;
+					}
 				}
 			}
 			assert(os_ref_get_count_raw(&object->ref_count) > 0);
@@ -817,10 +884,10 @@ vm_object_deallocate(
 		 *	before destroying or caching the object.
 		 */
 
-		if (object->pager_created && !object->pager_initialized) {
+		if (object->pager_created && !object->pager_ready) {
 			assert(!object->can_persist);
 			vm_object_sleep(object,
-			    VM_OBJECT_EVENT_PAGER_INIT,
+			    VM_OBJECT_EVENT_PAGER_READY,
 			    THREAD_UNINT,
 			    LCK_SLEEP_UNLOCK);
 			continue;
@@ -927,7 +994,7 @@ take_page:
 
 		vm_page_unlock_queues();
 
-		vm_page_free_prepare_object(p, TRUE);
+		vm_page_free_prepare_object(p);
 
 		return p;
 	}
@@ -1517,13 +1584,11 @@ vm_object_reap(
 		assert(object->vo_owner == NULL);
 	}
 
-#if DEVELOPMENT || DEBUG
 	if (object->object_is_shared_cache &&
 	    object->pager != NULL &&
 	    object->pager->mo_pager_ops == &shared_region_pager_ops) {
-		OSAddAtomic(-object->resident_page_count, &shared_region_pagers_resident_count);
+		VM_COUNTER_ATOMIC_SUB(&vm_page_shared_region_count, object->resident_page_count);
 	}
-#endif /* DEVELOPMENT || DEBUG */
 
 	pager = object->pager;
 	object->pager = MEMORY_OBJECT_NULL;
@@ -1579,15 +1644,12 @@ vm_object_reap(
 			delta = (object->resident_page_count -
 			    object->wired_page_count);
 			if (delta != 0) {
-				assert(vm_page_purgeable_count >= delta);
-				OSAddAtomic(-delta,
-				    (SInt32 *)&vm_page_purgeable_count);
+				counter_add(&vm_page_purgeable_count,
+				    -(int64_t)delta);
 			}
 			if (object->wired_page_count != 0) {
-				assert(vm_page_purgeable_wired_count >=
-				    object->wired_page_count);
-				OSAddAtomic(-object->wired_page_count,
-				    (SInt32 *)&vm_page_purgeable_wired_count);
+				counter_add(&vm_page_purgeable_wired_count,
+				    -(int64_t)object->wired_page_count);
 			}
 			VM_OBJECT_SET_PURGABLE(object, VM_PURGABLE_EMPTY);
 		} else if (object->purgable == VM_PURGABLE_NONVOLATILE ||
@@ -1686,6 +1748,9 @@ vm_object_reap_freelist(vm_page_t local_free_q, bool do_disconnect, bool set_cac
 		}
 
 		if (set_cache_attr) {
+#if HAS_MTE
+			assert(!local_free_q->vmp_using_mte);
+#endif /* HAS_MTE */
 			const unified_page_list_t pmap_batch_list = {
 				.page_slist = local_free_q,
 				.type = UNIFIED_PAGE_LIST_TYPE_VM_PAGE_LIST,
@@ -1710,7 +1775,7 @@ vm_object_reap_pages(
 	bool            set_cache_attr_needed;
 	pmap_flush_context      pmap_flush_context_storage;
 
-	if (reap_type == REAP_DATA_FLUSH) {
+	if (reap_type == REAP_DATA_FLUSH || reap_type == REAP_DATA_FLUSH_CLEAN) {
 		/*
 		 * We need to disconnect pages from all pmaps before
 		 * releasing them to the free list
@@ -1786,7 +1851,9 @@ restart_after_sleep:
 
 			vm_page_lock_queues();
 		}
-		if (reap_type == REAP_DATA_FLUSH || reap_type == REAP_TERMINATE) {
+		if (reap_type == REAP_DATA_FLUSH ||
+		    reap_type == REAP_DATA_FLUSH_CLEAN ||
+		    reap_type == REAP_TERMINATE) {
 			if (p->vmp_busy || p->vmp_cleaning) {
 				vm_page_unlock_queues();
 				/*
@@ -1802,11 +1869,23 @@ restart_after_sleep:
 
 				goto restart_after_sleep;
 			}
-			if (p->vmp_laundry) {
+			if (p->vmp_laundry && reap_type != REAP_DATA_FLUSH_CLEAN) {
 				vm_pageout_steal_laundry(p, TRUE);
 			}
 		}
 		switch (reap_type) {
+		case REAP_DATA_FLUSH_CLEAN:
+			if (!p->vmp_dirty &&
+			    p->vmp_wpmapped &&
+			    pmap_is_modified(VM_PAGE_GET_PHYS_PAGE(p))) {
+				SET_PAGE_DIRTY(p, FALSE);
+			}
+			if (p->vmp_dirty) {
+				/* only flush clean pages */
+				continue;
+			}
+			OS_FALLTHROUGH;
+
 		case REAP_DATA_FLUSH:
 			if (VM_PAGE_WIRED(p)) {
 				/*
@@ -2120,7 +2199,7 @@ vm_object_destroy(
 	if (object->object_is_shared_cache &&
 	    object->pager != NULL &&
 	    object->pager->mo_pager_ops == &shared_region_pager_ops) {
-		OSAddAtomic(-object->resident_page_count, &shared_region_pagers_resident_count);
+		VM_COUNTER_ATOMIC_SUB(&vm_page_shared_region_count, object->resident_page_count);
 	}
 #endif /* DEVELOPMENT || DEBUG */
 
@@ -2134,8 +2213,27 @@ vm_object_destroy(
 	 * Wait for the existing paging activity (that got
 	 * through before we nulled out the pager) to subside.
 	 */
-
 	vm_object_paging_wait(object, THREAD_UNINT);
+	vm_object_pl_req_wait(object, THREAD_UNINT);
+
+	/*
+	 * Memory objects usually stay alive while their
+	 * VM object is still mapped but vnodes can get
+	 * reclaimed by forced unmounts while still mapped,
+	 * for example, so we could be racing with a
+	 * memory_object_map() or memory_object_last_unmap()
+	 * here.
+	 * We should wait for any memory_object_map/last_unmap()
+	 * to complete, except if we're the thread calling
+	 * memory_object_last_unmap() on this memory object.
+	 */
+	if (old_pager != MEMORY_OBJECT_NULL &&
+	    old_pager->mo_last_unmap_ctid == thread_get_ctid(current_thread())) {
+		old_pager->mo_last_unmap_ctid = 0;
+	} else {
+		vm_object_mapping_wait(object, THREAD_UNINT);
+	}
+
 	vm_object_unlock(object);
 
 	/*
@@ -2364,6 +2462,15 @@ deactivate_pages_in_object(
 					    (madvise_free_debug ||
 					    (madvise_free_debug_sometimes &&
 					    madvise_free_counter++ & 0x1))) {
+						if (!vm_object_no_shadowing(object, true)) {
+							/*
+							 * There might be some pending
+							 * copy-on-write around this
+							 * VM object, so let's not write
+							 * to its pages.
+							 */
+							flags |= DEACTIVATE_KILL_NO_WRITE;
+						} else
 						/*
 						 * zero-fill the page (or every
 						 * other page) now to simulate
@@ -2371,11 +2478,14 @@ deactivate_pages_in_object(
 						 * re-faulted.
 						 */
 #if CONFIG_TRACK_UNMODIFIED_ANON_PAGES
-						if (!m->vmp_unmodified_ro) {
-#else /* CONFIG_TRACK_UNMODIFIED_ANON_PAGES */
-						if (true) {
+						if (!m->vmp_unmodified_ro)
 #endif /* CONFIG_TRACK_UNMODIFIED_ANON_PAGES */
-							pmap_zero_page(VM_PAGE_GET_PHYS_PAGE(m));
+						{
+							pmap_zero_page_with_options(VM_PAGE_GET_PHYS_PAGE(m),
+#if HAS_MTE
+							    m->vmp_using_mte ? cppvZeroPageTags :
+#endif /* HAS_MTE */
+							    0);
 						}
 					}
 					m->vmp_precious = FALSE;
@@ -2422,7 +2532,9 @@ deactivate_pages_in_object(
 					}
 #endif /* CONFIG_TRACK_UNMODIFIED_ANON_PAGES */
 #endif /* 0 */
-					vm_object_compressor_pager_state_clr(object, offset);
+					if (vm_object_no_shadowing(object, true)) {
+						vm_object_compressor_pager_state_clr(object, offset);
+					}
 
 					if ((flags & DEACTIVATE_REUSABLE) && !m->vmp_reusable) {
 						assert(!(flags & DEACTIVATE_ALL_REUSABLE));
@@ -2489,7 +2601,8 @@ deactivate_pages_in_object(
 				 * map so we don't bother paging it back in if it's touched again in the future.
 				 */
 
-				if ((flags & DEACTIVATE_KILL) && (object->internal)) {
+				if ((flags & DEACTIVATE_KILL) && (object->internal) &&
+				    vm_object_no_shadowing(object, true)) {
 					vm_object_compressor_pager_state_clr(object, offset);
 
 					if (pmap != PMAP_NULL) {
@@ -2904,7 +3017,7 @@ vm_object_zero_page(vm_page_t m)
  * This function may drop the object lock while waiting for a page that is
  * busy and will restart the operation for the specific offset.
  */
-kern_return_t
+__mockable kern_return_t
 vm_object_zero(
 	vm_object_t                     object,
 	vm_object_offset_t              *cur_offset_p,
@@ -3274,6 +3387,9 @@ vm_object_copy_slowly(
 	vm_object_offset_t      src_offset,
 	vm_object_size_t        size,
 	boolean_t               interruptible,
+#if HAS_MTE
+	bool                    create_mte_object,
+#endif /* HAS_MTE */
 	vm_object_t             *_result_object)        /* OUT */
 {
 	vm_object_t             new_object;
@@ -3306,6 +3422,16 @@ vm_object_copy_slowly(
 	size = vm_object_round_page(src_offset + size) - vm_object_trunc_page(src_offset);
 	src_offset = vm_object_trunc_page(src_offset);
 
+#if HAS_MTE
+	/*
+	 * Retain the original provenance despite the fact we're creating a byte-for-byte copy.
+	 * As far as I can think, this doesn't have a consequence either way:
+	 * The only path for which we copy slowly MTE-enabled objects is on the fork path,
+	 * during which the two maps will hold the same ID anyway.
+	 * For objects that'll never be MTE-mapped, the provenance has no consequence anyway.
+	 * I'm carrying over the ID here just because it seems more tidy than dropping it.
+	 */
+#endif /* HAS_MTE */
 	new_object = vm_object_allocate(size, src_object->vmo_provenance);
 	new_offset = 0;
 	if (src_object->copy_strategy == MEMORY_OBJECT_COPY_NONE &&
@@ -3314,6 +3440,18 @@ vm_object_copy_slowly(
 		new_object->vo_inherit_copy_none = true;
 	}
 
+#if HAS_MTE
+	/*
+	 * The new object should hold MTE enabled pages. This is a byproduct
+	 * of our current forking strategy.
+	 */
+	if (create_mte_object) {
+		vm_object_mte_set(new_object);
+
+		assert(src_object->copy_strategy == MEMORY_OBJECT_COPY_NONE);
+		new_object->copy_strategy = src_object->copy_strategy;
+	}
+#endif /* HAS_MTE */
 
 	assert(size == trunc_page_64(size));    /* Will the loop terminate? */
 
@@ -3328,7 +3466,7 @@ vm_object_copy_slowly(
 	    src_offset += PAGE_SIZE_64,
 	    new_offset += PAGE_SIZE_64, size -= PAGE_SIZE_64
 	    ) {
-		vm_page_t       new_page;
+		vm_page_t         new_page;
 		vm_fault_return_t result;
 		vm_grab_options_t options;
 
@@ -3355,7 +3493,7 @@ vm_object_copy_slowly(
 			kern_return_t   error_code;
 			vm_object_t     result_page_object;
 
-
+			vm_page_grab_prime();
 			vm_object_lock(src_object);
 
 			if (src_object->internal &&
@@ -3436,7 +3574,7 @@ vm_object_copy_slowly(
 			    FALSE,     /* page not looked up */
 			    &prot, &_result_page, &top_page,
 			    (int *)0,
-			    &error_code, FALSE, &fault_info);
+			    &error_code, FALSE, &fault_info, NULL);
 
 			switch (result) {
 			case VM_FAULT_SUCCESS:
@@ -3622,7 +3760,12 @@ static uint32_t copy_delayed_max_collisions;
 static uint32_t copy_delayed_lock_contention;
 static uint32_t copy_delayed_protect_iterate;
 
+#if XNU_TARGET_OS_OSX
 unsigned int vm_object_copy_delayed_paging_wait_disable = 0;
+#else /* XNU_TARGET_OS_OSX */
+unsigned int vm_object_copy_delayed_paging_wait_disable = 1;
+#endif /* XNU_TARGET_OS_OSX */
+
 /*
  *	Routine:	vm_object_copy_delayed [internal]
  *
@@ -3694,8 +3837,6 @@ vm_object_copy_delayed(
 
 	copy_size = vm_object_round_page(copy_size);
 Retry:
-	// For iOS, we want to always skip this block. For other OS types, we use the sysctl to control the flow.
- #if !XNU_TARGET_OS_IOS
 	if (!vm_object_copy_delayed_paging_wait_disable) {
 		/*
 		 * Wait for paging in progress.
@@ -3712,7 +3853,15 @@ Retry:
 			vm_object_paging_wait(src_object, THREAD_UNINT);
 		}
 	}
-#endif
+	if (src_object->vmo_pl_req_in_progress) {
+		if (src_object_shared) {
+			vm_object_unlock(src_object);
+			vm_object_lock(src_object);
+			src_object_shared = false;
+			goto Retry;
+		}
+		vm_object_pl_req_wait(src_object, THREAD_UNINT);
+	}
 
 	/*
 	 *	See whether we can reuse the result of a previous
@@ -3797,6 +3946,22 @@ Retry:
 					if (!vm_page_is_fictitious(p) &&
 					    p->vmp_offset >= old_copy->vo_size &&
 					    p->vmp_offset < copy_size) {
+						if (p->vmp_busy && p->vmp_absent) {
+							/*
+							 * A busy/absent page is still
+							 * waiting for its contents.
+							 * It should not be mapped in user
+							 * space (because it has no valid
+							 * contents) so no need to
+							 * write-protect it for copy-on-write.
+							 * It could have been mapped in the
+							 * kernel by the content provider
+							 * (a network filesystem, for example)
+							 * and we do not want to write-protect
+							 * that mapping, so we skip this page.
+							 */
+							continue;
+						}
 						if (VM_PAGE_WIRED(p)) {
 							vm_object_unlock(old_copy);
 							vm_object_unlock(src_object);
@@ -3842,6 +4007,7 @@ Retry:
 			} else {
 				vm_object_reference_locked(old_copy);
 			}
+			assert3u(old_copy->copy_strategy, ==, MEMORY_OBJECT_COPY_SYMMETRIC);
 			vm_object_unlock(old_copy);
 			vm_object_unlock(src_object);
 
@@ -3975,6 +4141,7 @@ Retry:
 	vm_object_reference_locked(src_object);
 	VM_OBJECT_COPY_SET(src_object, new_copy);
 	vm_object_unlock(src_object);
+	assert3u(new_copy->copy_strategy, ==, MEMORY_OBJECT_COPY_SYMMETRIC);
 	vm_object_unlock(new_copy);
 
 	return new_copy;
@@ -4074,6 +4241,9 @@ vm_object_copy_strategically(
 		result = vm_object_copy_slowly(src_object,
 		    src_offset, size,
 		    interruptible,
+#if HAS_MTE
+		    forking && vm_object_is_mte_mappable(src_object), /* create_mte_object */
+#endif /* HAS_MTE */
 		    dst_object);
 		if (result == KERN_SUCCESS) {
 			*dst_offset = src_offset - vm_object_trunc_page(src_offset);
@@ -4107,8 +4277,9 @@ vm_object_copy_strategically(
 boolean_t vm_object_shadow_check = TRUE;
 uint64_t vm_object_shadow_forced = 0;
 uint64_t vm_object_shadow_skipped = 0;
+uint64_t vm_object_shadow_set_shadowed = 0;
 
-__private_extern__ boolean_t
+__exported_hidden boolean_t
 vm_object_shadow(
 	vm_object_t             *object,        /* IN/OUT */
 	vm_object_offset_t      *offset,        /* IN/OUT */
@@ -4125,6 +4296,7 @@ vm_object_shadow(
 	}
 
 	assert(source->copy_strategy == MEMORY_OBJECT_COPY_SYMMETRIC);
+	assert(source->shadowed);
 
 	/*
 	 *	Determine if we really need a shadow.
@@ -4206,6 +4378,12 @@ vm_object_shadow(
 	 *	count.
 	 */
 	result->shadow = source;
+	if (!source->shadowed) {
+		vm_object_shadow_set_shadowed++;
+		vm_object_lock(source);
+		VM_OBJECT_SET_SHADOWED(source, TRUE);
+		vm_object_unlock(source);
+	}
 
 	/*
 	 *	Store the offset into the source object,
@@ -4388,7 +4566,7 @@ vm_object_memory_object_associate(
 	}
 
 	VM_OBJECT_SET_PAGER_INITIALIZED(object, TRUE);
-	vm_object_wakeup(object, VM_OBJECT_EVENT_PAGER_INIT);
+	// vm_object_wakeup(object, VM_OBJECT_EVENT_PAGER_INIT);
 
 	vm_object_unlock(object);
 
@@ -4428,9 +4606,9 @@ vm_object_compressor_pager_create(
 		 *	Someone else got to it first...
 		 *	wait for them to finish initializing the ports
 		 */
-		while (!object->pager_initialized) {
+		while (!object->pager_ready) {
 			vm_object_sleep(object,
-			    VM_OBJECT_EVENT_PAGER_INIT,
+			    VM_OBJECT_EVENT_PAGER_READY,
 			    THREAD_UNINT, LCK_SLEEP_EXCLUSIVE);
 		}
 		vm_object_paging_end(object);
@@ -4450,6 +4628,13 @@ vm_object_compressor_pager_create(
 		return;
 	}
 
+#if HAS_MTE /* TODO: remove this when MTE support in the compressor is finalized */
+	if (!vm_object_allow_compressor_pager_for_mte && vm_object_is_mte_mappable(object)) {
+		vm_object_no_compressor_pager_for_mte_count++;
+		vm_object_paging_end(object);
+		return;
+	}
+#endif
 
 	/*
 	 *	Indicate that a memory object has been assigned
@@ -5485,7 +5670,7 @@ vm_object_page_remove(
  */
 static int vm_object_coalesce_count = 0;
 
-__private_extern__ boolean_t
+__exported_hidden __mockable boolean_t
 vm_object_coalesce(
 	vm_object_t                     prev_object,
 	vm_object_t                     next_object,
@@ -5538,6 +5723,18 @@ vm_object_coalesce(
 		vm_object_unlock(prev_object);
 		return FALSE;
 	}
+
+#if HAS_MTE
+	/*
+	 * The new mapping (NULL object) represents untagged memory.
+	 * Coalescing with a tagged object would therefore be incorrect.
+	 */
+	if (vm_object_is_mte_mappable(prev_object)) {
+		vm_object_unlock(prev_object);
+		return FALSE;
+	}
+#endif /* HAS_MTE */
+
 	/* newsize = prev_offset + prev_size + next_size; */
 	if (__improbable(os_add3_overflow(prev_offset, prev_size, next_size,
 	    &newsize))) {
@@ -5678,18 +5875,21 @@ memory_object_create_named(
 		return KERN_INVALID_OBJECT;
 	}
 
+	vm_object_lock(object);
+	/* all named memory objects are considered shared */
+	vm_object_mark_shared(object, VM_SHARE_TYPE_PERMANENT);
+
 	/* wait for object (if any) to be ready */
-	if (object != VM_OBJECT_NULL) {
-		vm_object_lock(object);
-		VM_OBJECT_SET_NAMED(object, TRUE);
-		while (!object->pager_ready) {
-			vm_object_sleep(object,
-			    VM_OBJECT_EVENT_PAGER_READY,
-			    THREAD_UNINT, LCK_SLEEP_EXCLUSIVE);
-		}
-		*control = object->pager_control;
-		vm_object_unlock(object);
+	VM_OBJECT_SET_NAMED(object, TRUE);
+	while (!object->pager_ready) {
+		vm_object_sleep(object,
+		    VM_OBJECT_EVENT_PAGER_READY,
+		    THREAD_UNINT, LCK_SLEEP_EXCLUSIVE);
 	}
+	*control = object->pager_control;
+
+	vm_object_unlock(object);
+
 	return KERN_SUCCESS;
 }
 
@@ -5730,6 +5930,7 @@ vm_object_lock_request(
 	 *	Lock the object, and acquire a paging reference to
 	 *	prevent the memory_object reference from being released.
 	 */
+	vm_page_grab_prime();
 	vm_object_lock(object);
 	vm_object_paging_begin(object);
 
@@ -5792,16 +5993,11 @@ vm_object_purge(vm_object_t object, int flags)
 		delta = (object->resident_page_count -
 		    object->wired_page_count);
 		if (delta != 0) {
-			assert(vm_page_purgeable_count >=
-			    delta);
-			OSAddAtomic(-delta,
-			    (SInt32 *)&vm_page_purgeable_count);
+			counter_add(&vm_page_purgeable_count, -(int64_t)delta);
 		}
 		if (object->wired_page_count != 0) {
-			assert(vm_page_purgeable_wired_count >=
-			    object->wired_page_count);
-			OSAddAtomic(-object->wired_page_count,
-			    (SInt32 *)&vm_page_purgeable_wired_count);
+			counter_add(&vm_page_purgeable_wired_count,
+			    -(int64_t)object->wired_page_count);
 		}
 		VM_OBJECT_SET_PURGABLE(object, VM_PURGABLE_EMPTY);
 	}
@@ -6041,17 +6237,12 @@ vm_object_purgable_control(
 			delta = (object->resident_page_count -
 			    object->wired_page_count);
 
-			assert(vm_page_purgeable_count >= delta);
-
 			if (delta != 0) {
-				OSAddAtomic(-delta,
-				    (SInt32 *)&vm_page_purgeable_count);
+				counter_add(&vm_page_purgeable_count, -(int64_t)delta);
 			}
 			if (object->wired_page_count != 0) {
-				assert(vm_page_purgeable_wired_count >=
-				    object->wired_page_count);
-				OSAddAtomic(-object->wired_page_count,
-				    (SInt32 *)&vm_page_purgeable_wired_count);
+				counter_add(&vm_page_purgeable_wired_count,
+				    -(int64_t)object->wired_page_count);
 			}
 
 			vm_page_lock_queues();
@@ -6151,12 +6342,11 @@ vm_object_purgable_control(
 			    object->wired_page_count);
 
 			if (delta != 0) {
-				OSAddAtomic(delta,
-				    &vm_page_purgeable_count);
+				counter_add(&vm_page_purgeable_count, delta);
 			}
 			if (object->wired_page_count != 0) {
-				OSAddAtomic(object->wired_page_count,
-				    &vm_page_purgeable_wired_count);
+				counter_add(&vm_page_purgeable_wired_count,
+				    object->wired_page_count);
 			}
 
 			VM_OBJECT_SET_PURGABLE(object, new_state);
@@ -6372,28 +6562,6 @@ out:
 	return KERN_SUCCESS;
 }
 
-
-/*
- *	vm_object_reference:
- *
- *	Gets another reference to the given object.
- */
-#ifdef vm_object_reference
-#undef vm_object_reference
-#endif
-__private_extern__ void
-vm_object_reference(
-	vm_object_t     object)
-{
-	if (object == VM_OBJECT_NULL) {
-		return;
-	}
-
-	vm_object_lock(object);
-	vm_object_reference_locked(object);
-	vm_object_unlock(object);
-}
-
 /*
  * vm_object_transpose
  *
@@ -6540,7 +6708,7 @@ vm_object_transpose(
 		while (!vm_page_queue_empty(&object1->memq)) {
 			page = (vm_page_t) vm_page_queue_first(&object1->memq);
 			page_offset = page->vmp_offset;
-			vm_page_remove(page, TRUE);
+			vm_page_remove(page);
 			page->vmp_offset = page_offset;
 			vm_page_queue_enter(&tmp_object->memq, page, vmp_listq);
 		}
@@ -7458,23 +7626,6 @@ vm_object_lock_try(vm_object_t object)
 	return _vm_object_lock_try(object);
 }
 
-/*
- * Lock the object exclusive.
- *
- * Returns true iff the thread had to spin or block before
- * acquiring the lock.
- */
-bool
-vm_object_lock_check_contended(vm_object_t object)
-{
-	if (object == vm_pageout_scan_wants_object) {
-		scan_object_collision++;
-		mutex_pause(2);
-	}
-	DTRACE_VM(vm_object_lock_w);
-	return lck_rw_lock_exclusive_check_contended(&object->Lock);
-}
-
 void
 vm_object_lock_shared(vm_object_t object)
 {
@@ -7537,6 +7688,8 @@ vm_object_unlock(vm_object_t object)
 #if DEVELOPMENT || DEBUG
 	DTRACE_VM(vm_object_unlock);
 #endif
+	/* delayed inserts must be done before unlock */
+	assert(!object->delayed_page_insert);
 	lck_rw_done(&object->Lock);
 }
 
@@ -7547,12 +7700,19 @@ unsigned int vm_object_change_wimg_mode_count = 0;
  * The object must be locked
  */
 void
-vm_object_change_wimg_mode(vm_object_t object, unsigned int wimg_mode)
+vm_object_change_wimg_mode(vm_object_t object, uint8_t wimg_mode)
 {
 	vm_object_lock_assert_exclusive(object);
 
 	vm_object_paging_only_wait(object, THREAD_UNINT);
 
+#if HAS_MTE
+	if (vm_object_is_mte_mappable(object)) {
+		panic("Changing WIMG mode on tagged VM object: %d", wimg_mode);
+	} else if (wimg_mode == VM_WIMG_MTE) {
+		panic("Changing untagged VM object to VM_WIMG_MTE: %d", object->wimg_bits);
+	}
+#endif /* HAS_MTE */
 
 	const unified_page_list_t pmap_batch_list = {
 		.pageq = &object->memq,
@@ -7830,11 +7990,14 @@ vm_object_compressed_freezer_pageout(
 
 #endif /* CONFIG_FREEZE */
 
-
 uint64_t vm_object_pageout_not_on_queue = 0;
 uint64_t vm_object_pageout_not_pageable = 0;
 uint64_t vm_object_pageout_pageable = 0;
 uint64_t vm_object_pageout_active_local = 0;
+uint64_t vm_object_pageout_clean_no_shadowing = 0;
+uint64_t vm_object_pageout_clean_but_shadowing = 0;
+
+#if MACH_ASSERT
 void
 vm_object_pageout(
 	vm_object_t object)
@@ -7974,6 +8137,25 @@ ReScan:
 			}
 		}
 
+		if (!p->vmp_dirty && !p->vmp_precious && object->internal) {
+			if (vm_object_no_shadowing(object, true)) {
+				vm_object_pageout_clean_no_shadowing++;
+			} else {
+				vm_object_pageout_clean_but_shadowing++;
+#if CONFIG_TRACK_UNMODIFIED_ANON_PAGES
+				/*
+				 * XXX
+				 * Also check if pager does not have that page?
+				 * But then what if it was modified and MADV_FREE'd? AARGH!
+				 */
+#error "might need extra work"
+#endif /* CONFIG_TRACK_UNMODIFIED_ANON_PAGES */
+				SET_PAGE_DIRTY(p, FALSE);
+				/* deal with a rogue "reusable" page */
+				vm_pageout_scan_handle_reusable_page(p, object);
+			}
+		}
+
 		if (!p->vmp_dirty && !p->vmp_precious) {
 			vm_page_unlock_queues();
 			VM_PAGE_FREE(p);
@@ -7988,7 +8170,7 @@ ReScan:
 	vm_object_unlock(object);
 }
 
-
+#endif /* MACH_ASSERT */
 #if CONFIG_IOSCHED
 
 void
@@ -8194,8 +8376,8 @@ kdp_vm_object_sleep_find_owner(
 	block_hint_t       wait_type,
 	thread_waitinfo_t *waitinfo)
 {
-	assert(wait_type >= kThreadWaitPagerInit && wait_type <= kThreadWaitPageInThrottle);
-	vm_object_wait_reason_t wait_reason = wait_type - kThreadWaitPagerInit;
+	assert(wait_type >= kThreadWaitPLReqInProgress && wait_type <= kThreadWaitPageInThrottle);
+	vm_object_wait_reason_t wait_reason = wait_type - kThreadWaitPLReqInProgress;
 	vm_object_t object = (vm_object_t)((uintptr_t)wait_event - wait_reason);
 	waitinfo->context = VM_KERNEL_ADDRPERM(object);
 	/*
@@ -8220,8 +8402,8 @@ vm_object_sleep(
 	vm_object_lock_assert_exclusive(object);
 	assert(reason >= 0 && reason <= VM_OBJECT_EVENT_MAX);
 	switch (reason) {
-	case VM_OBJECT_EVENT_PAGER_INIT:
-		block_hint = kThreadWaitPagerInit;
+	case VM_OBJECT_EVENT_PL_REQ_IN_PROGRESS:
+		block_hint = kThreadWaitPLReqInProgress;
 		break;
 	case VM_OBJECT_EVENT_PAGER_READY:
 		block_hint = kThreadWaitPagerReady;
@@ -8256,6 +8438,22 @@ vm_object_sleep(
 	return wr;
 }
 
+wait_result_t
+vm_object_pl_req_wait(vm_object_t object, wait_interrupt_t interruptible)
+{
+	wait_result_t wr = THREAD_NOT_WAITING;
+	vm_object_lock_assert_exclusive(object);
+	while (object->vmo_pl_req_in_progress != 0) {
+		wr = vm_object_sleep(object,
+		    VM_OBJECT_EVENT_PL_REQ_IN_PROGRESS,
+		    interruptible,
+		    LCK_SLEEP_EXCLUSIVE);
+		if (wr != THREAD_AWAKENED) {
+			break;
+		}
+	}
+	return wr;
+}
 
 wait_result_t
 vm_object_paging_wait(vm_object_t object, wait_interrupt_t interruptible)
@@ -8359,7 +8557,11 @@ kdp_vm_page_sleep_find_owner(event64_t wait_event, thread_waitinfo_t *waitinfo)
 }
 
 #if PAGE_SLEEP_WITH_INHERITOR
-static wait_result_t vm_page_sleep_with_inheritor(lck_rw_t *lck, lck_sleep_action_t lck_sleep_action, event_t event, wait_interrupt_t interruptible);
+static wait_result_t vm_page_sleep_with_inheritor(
+	vm_object_t             object,
+	lck_sleep_action_t      lck_sleep_action,
+	event_t                 event,
+	wait_interrupt_t        interruptible);
 #endif /* PAGE_SLEEP_WITH_INHERITOR */
 
 wait_result_t
@@ -8379,7 +8581,7 @@ vm_page_sleep(vm_object_t object, vm_page_t m, wait_interrupt_t interruptible, l
 	m->vmp_wanted = TRUE;
 	thread_set_pending_block_hint(current_thread(), kThreadWaitPageBusy);
 #if PAGE_SLEEP_WITH_INHERITOR
-	ret = vm_page_sleep_with_inheritor(&object->Lock, action, (event_t)m, interruptible);
+	ret = vm_page_sleep_with_inheritor(object, action, (event_t)m, interruptible);
 #else
 	ret = lck_rw_sleep(&object->Lock, LCK_SLEEP_PROMOTED_PRI | action, (event_t)m, interruptible);
 #endif
@@ -8601,22 +8803,28 @@ page_worker_unregister_worker(event_t event, thread_t expect_th __unused, page_w
 }
 
 static wait_result_t
-vm_page_sleep_with_inheritor(lck_rw_t *lck, lck_sleep_action_t action, event_t event, wait_interrupt_t interruptible)
+vm_page_sleep_with_inheritor(
+	vm_object_t             object,
+	lck_sleep_action_t      action,
+	event_t                 event,
+	wait_interrupt_t        interruptible)
 {
 	struct page_worker *entry = page_worker_lookup(event, FALSE);
 	thread_t inheritor = THREAD_NULL;
+	wait_result_t ret;
+
 	if (entry != NULL) {
 		inheritor = entry->pw_current_worker;
 		page_worker_entry_unlock(entry);
 	}
 
-	wait_result_t ret;
 	if (inheritor == THREAD_NULL) {
 		/* no worker was found */
-		ret = lck_rw_sleep(lck, LCK_SLEEP_PROMOTED_PRI | action, event, interruptible);
+		ret = lck_rw_sleep(&object->Lock, LCK_SLEEP_PROMOTED_PRI | action, event, interruptible);
 	} else {
 		counter_inc(&page_worker_inheritor_sleeps);
-		ret = lck_rw_sleep_with_inheritor(lck, action, event, inheritor, interruptible, TIMEOUT_WAIT_FOREVER);
+		ret = lck_rw_sleep_with_inheritor(&object->Lock, action, event,
+		    inheritor, interruptible, TIMEOUT_WAIT_FOREVER);
 	}
 
 	return ret;
@@ -8672,60 +8880,59 @@ vm_object_access_tracking(
 }
 #endif /* VM_OBJECT_ACCESS_TRACKING */
 
-void
-vm_object_ledger_tag_ledgers(
-	vm_object_t     object,
-	int             *ledger_idx_volatile,
-	int             *ledger_idx_nonvolatile,
-	int             *ledger_idx_volatile_compressed,
-	int             *ledger_idx_nonvolatile_compressed,
-	int             *ledger_idx_composite,
-	int             *ledger_idx_external_wired,
-	boolean_t       *do_footprint)
+vmo_ledgers_t
+vm_object_ledger_tag_ledgers(vm_object_t object)
 {
+	vmo_ledgers_t lidx = { };
+	bool do_footprint;
+
 	assert(object->shadow == VM_OBJECT_NULL);
 
-	*ledger_idx_volatile = -1;
-	*ledger_idx_nonvolatile = -1;
-	*ledger_idx_volatile_compressed = -1;
-	*ledger_idx_nonvolatile_compressed = -1;
-	*ledger_idx_composite = -1;
-	*ledger_idx_external_wired = -1;
-	*do_footprint = !object->vo_no_footprint;
+	if (object->vo_ledger_tag == VM_LEDGER_TAG_NETWORK) {
+		do_footprint = false;
+	} else if (object->vo_ledger_tag == VM_LEDGER_TAG_NONE) {
+		do_footprint = true;
+	} else {
+		do_footprint = !object->vo_no_footprint;
+	}
+
+	if (do_footprint) {
+		lidx.vmo_footprint = task_ledgers.phys_footprint;
+	} else if (object->vo_ledger_tag == VM_LEDGER_TAG_NEURAL) {
+		lidx.vmo_footprint = task_ledgers.neural_nofootprint_total;
+	}
 
 	if (!object->internal) {
 		switch (object->vo_ledger_tag) {
 		case VM_LEDGER_TAG_DEFAULT:
-			if (*do_footprint) {
-				*ledger_idx_external_wired = task_ledgers.tagged_footprint;
+			if (do_footprint) {
+				lidx.vmo_external_wired = task_ledgers.tagged_footprint;
 			} else {
-				*ledger_idx_external_wired = task_ledgers.tagged_nofootprint;
+				lidx.vmo_external_wired = task_ledgers.tagged_nofootprint;
 			}
 			break;
 		case VM_LEDGER_TAG_NETWORK:
-			*do_footprint = FALSE;
-			*ledger_idx_external_wired = task_ledgers.network_nonvolatile;
+			lidx.vmo_external_wired = task_ledgers.network_nonvolatile;
 			break;
 		case VM_LEDGER_TAG_MEDIA:
-			if (*do_footprint) {
-				*ledger_idx_external_wired = task_ledgers.media_footprint;
+			if (do_footprint) {
+				lidx.vmo_external_wired = task_ledgers.media_footprint;
 			} else {
-				*ledger_idx_external_wired = task_ledgers.media_nofootprint;
+				lidx.vmo_external_wired = task_ledgers.media_nofootprint;
 			}
 			break;
 		case VM_LEDGER_TAG_GRAPHICS:
-			if (*do_footprint) {
-				*ledger_idx_external_wired = task_ledgers.graphics_footprint;
+			if (do_footprint) {
+				lidx.vmo_external_wired = task_ledgers.graphics_footprint;
 			} else {
-				*ledger_idx_external_wired = task_ledgers.graphics_nofootprint;
+				lidx.vmo_external_wired = task_ledgers.graphics_nofootprint;
 			}
 			break;
 		case VM_LEDGER_TAG_NEURAL:
-			*ledger_idx_composite = task_ledgers.neural_nofootprint_total;
-			if (*do_footprint) {
-				*ledger_idx_external_wired = task_ledgers.neural_footprint;
+			if (do_footprint) {
+				lidx.vmo_external_wired = task_ledgers.neural_footprint;
 			} else {
-				*ledger_idx_external_wired = task_ledgers.neural_nofootprint;
+				lidx.vmo_external_wired = task_ledgers.neural_nofootprint;
 			}
 			break;
 		case VM_LEDGER_TAG_NONE:
@@ -8733,7 +8940,8 @@ vm_object_ledger_tag_ledgers(
 			panic("%s: external object %p has unsupported ledger_tag %d",
 			    __FUNCTION__, object, object->vo_ledger_tag);
 		}
-		return;
+
+		return lidx;
 	}
 
 	assert(object->internal);
@@ -8743,12 +8951,11 @@ vm_object_ledger_tag_ledgers(
 		 * Regular purgeable memory:
 		 * counts in footprint only when nonvolatile.
 		 */
-		*do_footprint = TRUE;
 		assert(object->purgable != VM_PURGABLE_DENY);
-		*ledger_idx_volatile = task_ledgers.purgeable_volatile;
-		*ledger_idx_nonvolatile = task_ledgers.purgeable_nonvolatile;
-		*ledger_idx_volatile_compressed = task_ledgers.purgeable_volatile_compressed;
-		*ledger_idx_nonvolatile_compressed = task_ledgers.purgeable_nonvolatile_compressed;
+		lidx.vmo_volatile = task_ledgers.purgeable_volatile;
+		lidx.vmo_nonvolatile = task_ledgers.purgeable_nonvolatile;
+		lidx.vmo_volatile_compressed = task_ledgers.purgeable_volatile_compress;
+		lidx.vmo_nonvolatile_compressed = task_ledgers.purgeable_nonvolatile_compress;
 		break;
 	case VM_LEDGER_TAG_DEFAULT:
 		/*
@@ -8756,14 +8963,14 @@ vm_object_ledger_tag_ledgers(
 		 * counts in footprint only when nonvolatile and not marked
 		 * as "no_footprint".
 		 */
-		*ledger_idx_volatile = task_ledgers.tagged_nofootprint;
-		*ledger_idx_volatile_compressed = task_ledgers.tagged_nofootprint_compressed;
-		if (*do_footprint) {
-			*ledger_idx_nonvolatile = task_ledgers.tagged_footprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.tagged_footprint_compressed;
+		lidx.vmo_volatile = task_ledgers.tagged_nofootprint;
+		lidx.vmo_volatile_compressed = task_ledgers.tagged_nofootprint_compressed;
+		if (do_footprint) {
+			lidx.vmo_nonvolatile = task_ledgers.tagged_footprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.tagged_footprint_compressed;
 		} else {
-			*ledger_idx_nonvolatile = task_ledgers.tagged_nofootprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.tagged_nofootprint_compressed;
+			lidx.vmo_nonvolatile = task_ledgers.tagged_nofootprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.tagged_nofootprint_compressed;
 		}
 		break;
 	case VM_LEDGER_TAG_NETWORK:
@@ -8771,11 +8978,10 @@ vm_object_ledger_tag_ledgers(
 		 * "network" tagged memory:
 		 * never counts in footprint.
 		 */
-		*do_footprint = FALSE;
-		*ledger_idx_volatile = task_ledgers.network_volatile;
-		*ledger_idx_volatile_compressed = task_ledgers.network_volatile_compressed;
-		*ledger_idx_nonvolatile = task_ledgers.network_nonvolatile;
-		*ledger_idx_nonvolatile_compressed = task_ledgers.network_nonvolatile_compressed;
+		lidx.vmo_volatile = task_ledgers.network_volatile;
+		lidx.vmo_volatile_compressed = task_ledgers.network_volatile_compressed;
+		lidx.vmo_nonvolatile = task_ledgers.network_nonvolatile;
+		lidx.vmo_nonvolatile_compressed = task_ledgers.network_nonvolatile_compressed;
 		break;
 	case VM_LEDGER_TAG_MEDIA:
 		/*
@@ -8783,14 +8989,14 @@ vm_object_ledger_tag_ledgers(
 		 * counts in footprint only when nonvolatile and not marked
 		 * as "no footprint".
 		 */
-		*ledger_idx_volatile = task_ledgers.media_nofootprint;
-		*ledger_idx_volatile_compressed = task_ledgers.media_nofootprint_compressed;
-		if (*do_footprint) {
-			*ledger_idx_nonvolatile = task_ledgers.media_footprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.media_footprint_compressed;
+		lidx.vmo_volatile = task_ledgers.media_nofootprint;
+		lidx.vmo_volatile_compressed = task_ledgers.media_nofootprint_compressed;
+		if (do_footprint) {
+			lidx.vmo_nonvolatile = task_ledgers.media_footprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.media_footprint_compressed;
 		} else {
-			*ledger_idx_nonvolatile = task_ledgers.media_nofootprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.media_nofootprint_compressed;
+			lidx.vmo_nonvolatile = task_ledgers.media_nofootprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.media_nofootprint_compressed;
 		}
 		break;
 	case VM_LEDGER_TAG_GRAPHICS:
@@ -8799,14 +9005,14 @@ vm_object_ledger_tag_ledgers(
 		 * counts in footprint only when nonvolatile and not marked
 		 * as "no footprint".
 		 */
-		*ledger_idx_volatile = task_ledgers.graphics_nofootprint;
-		*ledger_idx_volatile_compressed = task_ledgers.graphics_nofootprint_compressed;
-		if (*do_footprint) {
-			*ledger_idx_nonvolatile = task_ledgers.graphics_footprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.graphics_footprint_compressed;
+		lidx.vmo_volatile = task_ledgers.graphics_nofootprint;
+		lidx.vmo_volatile_compressed = task_ledgers.graphics_nofootprint_compressed;
+		if (do_footprint) {
+			lidx.vmo_nonvolatile = task_ledgers.graphics_footprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.graphics_footprint_compressed;
 		} else {
-			*ledger_idx_nonvolatile = task_ledgers.graphics_nofootprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.graphics_nofootprint_compressed;
+			lidx.vmo_nonvolatile = task_ledgers.graphics_nofootprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.graphics_nofootprint_compressed;
 		}
 		break;
 	case VM_LEDGER_TAG_NEURAL:
@@ -8815,21 +9021,21 @@ vm_object_ledger_tag_ledgers(
 		 * counts in footprint only when nonvolatile and not marked
 		 * as "no footprint".
 		 */
-		*ledger_idx_composite = task_ledgers.neural_nofootprint_total;
-		*ledger_idx_volatile = task_ledgers.neural_nofootprint;
-		*ledger_idx_volatile_compressed = task_ledgers.neural_nofootprint_compressed;
-		if (*do_footprint) {
-			*ledger_idx_nonvolatile = task_ledgers.neural_footprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.neural_footprint_compressed;
+		lidx.vmo_volatile = task_ledgers.neural_nofootprint;
+		lidx.vmo_volatile_compressed = task_ledgers.neural_nofootprint_compressed;
+		if (do_footprint) {
+			lidx.vmo_nonvolatile = task_ledgers.neural_footprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.neural_footprint_compressed;
 		} else {
-			*ledger_idx_nonvolatile = task_ledgers.neural_nofootprint;
-			*ledger_idx_nonvolatile_compressed = task_ledgers.neural_nofootprint_compressed;
+			lidx.vmo_nonvolatile = task_ledgers.neural_nofootprint;
+			lidx.vmo_nonvolatile_compressed = task_ledgers.neural_nofootprint_compressed;
 		}
 		break;
 	default:
 		panic("%s: object %p has unsupported ledger_tag %d",
 		    __FUNCTION__, object, object->vo_ledger_tag);
 	}
+	return lidx;
 }
 
 kern_return_t
@@ -8840,20 +9046,15 @@ vm_object_ownership_change(
 	int             new_ledger_flags,
 	boolean_t       old_task_objq_locked)
 {
-	int             old_ledger_tag;
-	task_t          old_owner;
-	int             resident_count, wired_count;
-	unsigned int    compressed_count;
-	int             ledger_idx_volatile;
-	int             ledger_idx_nonvolatile;
-	int             ledger_idx_volatile_compressed;
-	int             ledger_idx_nonvolatile_compressed;
-	int             ledger_idx;
-	int             ledger_idx_compressed;
-	int             ledger_idx_composite;
-	int             ledger_idx_external_wired;
-	boolean_t       do_footprint, old_no_footprint, new_no_footprint;
-	boolean_t       new_task_objq_locked;
+	int               old_ledger_tag;
+	task_t            old_owner;
+	int               resident_count, wired_count;
+	unsigned int      compressed_count;
+	vmo_ledgers_t     lidx;
+	ledger_entry_id_t ledger_idx;
+	ledger_entry_id_t ledger_idx_compressed;
+	boolean_t         old_no_footprint, new_no_footprint;
+	boolean_t         new_task_objq_locked;
 
 	vm_object_lock_assert_exclusive(object);
 
@@ -8969,98 +9170,66 @@ vm_object_ownership_change(
 		/*
 		 * Take this object off of the old owner's ledgers.
 		 */
-		vm_object_ledger_tag_ledgers(object,
-		    &ledger_idx_volatile,
-		    &ledger_idx_nonvolatile,
-		    &ledger_idx_volatile_compressed,
-		    &ledger_idx_nonvolatile_compressed,
-		    &ledger_idx_composite,
-		    &ledger_idx_external_wired,
-		    &do_footprint);
+		lidx = vm_object_ledger_tag_ledgers(object);
+
+		disable_preemption();
 		if (object->internal) {
 			if (object->purgable == VM_PURGABLE_VOLATILE ||
 			    object->purgable == VM_PURGABLE_EMPTY) {
-				ledger_idx = ledger_idx_volatile;
-				ledger_idx_compressed = ledger_idx_volatile_compressed;
+				ledger_idx = lidx.vmo_volatile;
+				ledger_idx_compressed = lidx.vmo_volatile_compressed;
 			} else {
-				ledger_idx = ledger_idx_nonvolatile;
-				ledger_idx_compressed = ledger_idx_nonvolatile_compressed;
+				ledger_idx = lidx.vmo_nonvolatile;
+				ledger_idx_compressed = lidx.vmo_nonvolatile_compressed;
 			}
 			if (resident_count) {
 				/*
 				 * Adjust the appropriate old owners's ledgers by the
 				 * number of resident pages.
 				 */
-				ledger_debit(old_owner->ledger,
-				    ledger_idx,
-				    ptoa_64(resident_count));
+				ledger_debit_nopreempt(old_owner->ledger,
+				    ledger_idx, ptoa_64(resident_count));
 				/* adjust old owner's footprint */
 				if (object->purgable != VM_PURGABLE_VOLATILE &&
 				    object->purgable != VM_PURGABLE_EMPTY) {
-					if (do_footprint) {
-						ledger_debit(old_owner->ledger,
-						    task_ledgers.phys_footprint,
-						    ptoa_64(resident_count));
-					} else if (ledger_idx_composite != -1) {
-						ledger_debit(old_owner->ledger,
-						    ledger_idx_composite,
-						    ptoa_64(resident_count));
-					}
+					ledger_debit_nopreempt(old_owner->ledger,
+					    lidx.vmo_footprint,
+					    ptoa_64(resident_count));
 				}
 			}
 			if (wired_count) {
 				/* wired pages are always nonvolatile */
-				ledger_debit(old_owner->ledger,
-				    ledger_idx_nonvolatile,
-				    ptoa_64(wired_count));
-				if (do_footprint) {
-					ledger_debit(old_owner->ledger,
-					    task_ledgers.phys_footprint,
-					    ptoa_64(wired_count));
-				} else if (ledger_idx_composite != -1) {
-					ledger_debit(old_owner->ledger,
-					    ledger_idx_composite,
-					    ptoa_64(wired_count));
-				}
+				ledger_debit_nopreempt(old_owner->ledger,
+				    lidx.vmo_nonvolatile, ptoa_64(wired_count));
+				ledger_debit_nopreempt(old_owner->ledger,
+				    lidx.vmo_footprint, ptoa_64(wired_count));
 			}
 			if (compressed_count) {
 				/*
 				 * Adjust the appropriate old owner's ledgers
 				 * by the number of compressed pages.
 				 */
-				ledger_debit(old_owner->ledger,
+				ledger_debit_nopreempt(old_owner->ledger,
 				    ledger_idx_compressed,
 				    ptoa_64(compressed_count));
 				if (object->purgable != VM_PURGABLE_VOLATILE &&
 				    object->purgable != VM_PURGABLE_EMPTY) {
-					if (do_footprint) {
-						ledger_debit(old_owner->ledger,
-						    task_ledgers.phys_footprint,
-						    ptoa_64(compressed_count));
-					} else if (ledger_idx_composite != -1) {
-						ledger_debit(old_owner->ledger,
-						    ledger_idx_composite,
-						    ptoa_64(compressed_count));
-					}
+					ledger_debit_nopreempt(old_owner->ledger,
+					    lidx.vmo_footprint,
+					    ptoa_64(compressed_count));
 				}
 			}
 		} else {
 			/* external but owned object: count wired pages */
 			if (wired_count) {
-				ledger_debit(old_owner->ledger,
-				    ledger_idx_external_wired,
-				    ptoa_64(wired_count));
-				if (do_footprint) {
-					ledger_debit(old_owner->ledger,
-					    task_ledgers.phys_footprint,
-					    ptoa_64(wired_count));
-				} else if (ledger_idx_composite != -1) {
-					ledger_debit(old_owner->ledger,
-					    ledger_idx_composite,
-					    ptoa_64(wired_count));
-				}
+				ledger_debit_nopreempt(old_owner->ledger,
+				    lidx.vmo_external_wired, ptoa_64(wired_count));
+				ledger_debit_nopreempt(old_owner->ledger,
+				    lidx.vmo_footprint, ptoa_64(wired_count));
 			}
 		}
+		enable_preemption();
+
 		if (old_owner != new_owner) {
 			/* remove object from old_owner's list of owned objects */
 			DTRACE_VM2(object_owner_remove,
@@ -9151,98 +9320,66 @@ vm_object_ownership_change(
 		/*
 		 * Add this object to the new owner's ledgers.
 		 */
-		vm_object_ledger_tag_ledgers(object,
-		    &ledger_idx_volatile,
-		    &ledger_idx_nonvolatile,
-		    &ledger_idx_volatile_compressed,
-		    &ledger_idx_nonvolatile_compressed,
-		    &ledger_idx_composite,
-		    &ledger_idx_external_wired,
-		    &do_footprint);
+		lidx = vm_object_ledger_tag_ledgers(object);
+
+		disable_preemption();
 		if (object->internal) {
 			if (object->purgable == VM_PURGABLE_VOLATILE ||
 			    object->purgable == VM_PURGABLE_EMPTY) {
-				ledger_idx = ledger_idx_volatile;
-				ledger_idx_compressed = ledger_idx_volatile_compressed;
+				ledger_idx = lidx.vmo_volatile;
+				ledger_idx_compressed = lidx.vmo_volatile_compressed;
 			} else {
-				ledger_idx = ledger_idx_nonvolatile;
-				ledger_idx_compressed = ledger_idx_nonvolatile_compressed;
+				ledger_idx = lidx.vmo_nonvolatile;
+				ledger_idx_compressed = lidx.vmo_nonvolatile_compressed;
 			}
 			if (resident_count) {
 				/*
 				 * Adjust the appropriate new owners's ledgers by the
 				 * number of resident pages.
 				 */
-				ledger_credit(new_owner->ledger,
-				    ledger_idx,
-				    ptoa_64(resident_count));
+				ledger_credit_nopreempt(new_owner->ledger,
+				    ledger_idx, ptoa_64(resident_count));
 				/* adjust new owner's footprint */
 				if (object->purgable != VM_PURGABLE_VOLATILE &&
 				    object->purgable != VM_PURGABLE_EMPTY) {
-					if (do_footprint) {
-						ledger_credit(new_owner->ledger,
-						    task_ledgers.phys_footprint,
-						    ptoa_64(resident_count));
-					} else if (ledger_idx_composite != -1) {
-						ledger_credit(new_owner->ledger,
-						    ledger_idx_composite,
-						    ptoa_64(resident_count));
-					}
+					ledger_credit_nopreempt(new_owner->ledger,
+					    lidx.vmo_footprint,
+					    ptoa_64(resident_count));
 				}
 			}
 			if (wired_count) {
 				/* wired pages are always nonvolatile */
-				ledger_credit(new_owner->ledger,
-				    ledger_idx_nonvolatile,
-				    ptoa_64(wired_count));
-				if (do_footprint) {
-					ledger_credit(new_owner->ledger,
-					    task_ledgers.phys_footprint,
-					    ptoa_64(wired_count));
-				} else if (ledger_idx_composite != -1) {
-					ledger_credit(new_owner->ledger,
-					    ledger_idx_composite,
-					    ptoa_64(wired_count));
-				}
+				ledger_credit_nopreempt(new_owner->ledger,
+				    lidx.vmo_nonvolatile, ptoa_64(wired_count));
+				ledger_credit_nopreempt(new_owner->ledger,
+				    lidx.vmo_footprint, ptoa_64(wired_count));
 			}
 			if (compressed_count) {
 				/*
 				 * Adjust the new owner's ledgers by the number of
 				 * compressed pages.
 				 */
-				ledger_credit(new_owner->ledger,
+				ledger_credit_nopreempt(new_owner->ledger,
 				    ledger_idx_compressed,
 				    ptoa_64(compressed_count));
 				if (object->purgable != VM_PURGABLE_VOLATILE &&
 				    object->purgable != VM_PURGABLE_EMPTY) {
-					if (do_footprint) {
-						ledger_credit(new_owner->ledger,
-						    task_ledgers.phys_footprint,
-						    ptoa_64(compressed_count));
-					} else if (ledger_idx_composite != -1) {
-						ledger_credit(new_owner->ledger,
-						    ledger_idx_composite,
-						    ptoa_64(compressed_count));
-					}
+					ledger_credit_nopreempt(new_owner->ledger,
+					    lidx.vmo_footprint,
+					    ptoa_64(compressed_count));
 				}
 			}
 		} else {
 			/* external but owned object: count wired pages */
 			if (wired_count) {
-				ledger_credit(new_owner->ledger,
-				    ledger_idx_external_wired,
-				    ptoa_64(wired_count));
-				if (do_footprint) {
-					ledger_credit(new_owner->ledger,
-					    task_ledgers.phys_footprint,
-					    ptoa_64(wired_count));
-				} else if (ledger_idx_composite != -1) {
-					ledger_credit(new_owner->ledger,
-					    ledger_idx_composite,
-					    ptoa_64(wired_count));
-				}
+				ledger_credit_nopreempt(new_owner->ledger,
+				    lidx.vmo_external_wired, ptoa_64(wired_count));
+				ledger_credit_nopreempt(new_owner->ledger,
+				    lidx.vmo_footprint, ptoa_64(wired_count));
 			}
 		}
+		enable_preemption();
+
 		if (new_owner != old_owner) {
 			/* add object to new_owner's list of owned objects */
 			DTRACE_VM2(object_owner_add,
@@ -9362,11 +9499,10 @@ again:
 }
 
 void
-vm_object_wired_page_update_ledgers(
-	vm_object_t object,
-	int64_t wired_delta)
+vm_object_wired_page_update_ledgers(vm_object_t object, int64_t wired_delta)
 {
-	task_t owner;
+	ledger_t      ledger;
+	vmo_ledgers_t lidx;
 
 	vm_object_lock_assert_exclusive(object);
 	if (wired_delta == 0) {
@@ -9386,55 +9522,66 @@ vm_object_wired_page_update_ledgers(
 	 * For an explicitly-owned external VM object, account for
 	 * wired pages in one of the owner's ledgers.
 	 */
-	owner = VM_OBJECT_OWNER(object);
-	if (owner) {
-		int ledger_idx_volatile;
-		int ledger_idx_nonvolatile;
-		int ledger_idx_volatile_compressed;
-		int ledger_idx_nonvolatile_compressed;
-		int ledger_idx_composite;
-		int ledger_idx_external_wired;
-		boolean_t do_footprint;
-
+	ledger = VM_OBJECT_LEDGER(object);
+	if (ledger) {
 		/* ask which ledgers need an update */
-		vm_object_ledger_tag_ledgers(object,
-		    &ledger_idx_volatile,
-		    &ledger_idx_nonvolatile,
-		    &ledger_idx_volatile_compressed,
-		    &ledger_idx_nonvolatile_compressed,
-		    &ledger_idx_composite,
-		    &ledger_idx_external_wired,
-		    &do_footprint);
+		lidx = vm_object_ledger_tag_ledgers(object);
+
+		disable_preemption();
 		if (wired_delta > 0) {
 			/* more external wired bytes */
-			ledger_credit(owner->ledger,
-			    ledger_idx_external_wired,
-			    ptoa(wired_delta));
-			if (do_footprint) {
-				/* more footprint */
-				ledger_credit(owner->ledger,
-				    task_ledgers.phys_footprint,
-				    ptoa(wired_delta));
-			} else if (ledger_idx_composite != -1) {
-				ledger_credit(owner->ledger,
-				    ledger_idx_composite,
-				    ptoa(wired_delta));
-			}
+			ledger_credit_nopreempt(ledger,
+			    lidx.vmo_external_wired, ptoa(wired_delta));
+			ledger_credit_nopreempt(ledger,
+			    lidx.vmo_footprint, ptoa(wired_delta));
 		} else {
 			/* less external wired bytes */
-			ledger_debit(owner->ledger,
-			    ledger_idx_external_wired,
-			    ptoa(-wired_delta));
-			if (do_footprint) {
-				/* more footprint */
-				ledger_debit(owner->ledger,
-				    task_ledgers.phys_footprint,
-				    ptoa(-wired_delta));
-			} else if (ledger_idx_composite != -1) {
-				ledger_debit(owner->ledger,
-				    ledger_idx_composite,
-				    ptoa(-wired_delta));
-			}
+			ledger_debit_nopreempt(ledger,
+			    lidx.vmo_external_wired, ptoa(-wired_delta));
+			ledger_debit_nopreempt(ledger,
+			    lidx.vmo_footprint, ptoa(-wired_delta));
 		}
+		enable_preemption();
 	}
+}
+
+uint64_t vm_object_no_shadowing_extra_refs = 0;
+bool
+vm_object_no_shadowing(
+	vm_object_t object,
+	bool caller_owns_one_ref)
+{
+	int extra_refs;
+	switch (object->copy_strategy) {
+	case MEMORY_OBJECT_COPY_NONE:
+		break;
+	case MEMORY_OBJECT_COPY_DELAY:
+	case MEMORY_OBJECT_COPY_DELAY_FORK:
+		if (object->vo_copy != VM_OBJECT_NULL ||
+		    object->shadow != VM_OBJECT_NULL) {
+			return false;
+		}
+		break;
+	case MEMORY_OBJECT_COPY_SYMMETRIC:
+		if (object->shadow != VM_OBJECT_NULL ||
+		    object->shadowed) {
+			return false;
+		}
+		extra_refs = os_ref_get_count_raw(&object->ref_count);
+		if (caller_owns_one_ref) {
+			assert(extra_refs > 0);
+			extra_refs--;
+		}
+		if (extra_refs) {
+			vm_object_no_shadowing_extra_refs++;
+//			return false;
+		}
+		break;
+	default:
+		panic("object %p with unsupported copy strategy %d\n", object, object->copy_strategy);
+	}
+	assert(object->vo_copy == VM_OBJECT_NULL);
+	assert(object->shadow == VM_OBJECT_NULL);
+	assert(!object->shadowed);
+	return true;
 }

@@ -207,7 +207,7 @@ shmid_ds_64to32(struct user_shmid_ds *in, struct user32_shmid_ds *out)
 	out->shm_atime = in->shm_atime;
 	out->shm_dtime = in->shm_dtime;
 	out->shm_ctime = in->shm_ctime;
-	out->shm_internal = CAST_DOWN_EXPLICIT(int, in->shm_internal);
+	out->shm_internal = (user32_addr_t)VM_KERNEL_ADDRHASH(in->shm_internal);
 }
 
 /*
@@ -218,7 +218,7 @@ shmid_ds_64to32(struct user_shmid_ds *in, struct user32_shmid_ds *out)
 static void
 shmid_ds_32to64(struct user32_shmid_ds *in, struct user_shmid_ds *out)
 {
-	out->shm_internal = in->shm_internal;
+	out->shm_internal = VM_KERNEL_ADDRHASH(in->shm_internal);
 	out->shm_ctime = in->shm_ctime;
 	out->shm_dtime = in->shm_dtime;
 	out->shm_atime = in->shm_atime;
@@ -301,7 +301,7 @@ shm_delete_mapping(__unused struct proc *p, struct shmmap_state *shmmap_s,
 	size = vm_map_round_page(shmseg->u.shm_segsz,
 	    vm_map_page_mask(current_map())); /* XXX done for us? */
 	if (deallocate) {
-		result = mach_vm_deallocate(current_map(), shmmap_s->va, size);
+		result = mach_vm_deallocate_kernel(current_map(), shmmap_s->va, size);
 		if (result != KERN_SUCCESS) {
 			return EINVAL;
 		}
@@ -551,7 +551,7 @@ shmat(struct proc *p, struct shmat_args *uap, user_addr_t *retval)
 	goto shmat_out;
 out:
 	if (mapped_size > 0) {
-		(void) mach_vm_deallocate(current_map(),
+		(void) mach_vm_deallocate_kernel(current_map(),
 		    shmmap_s->va,
 		    mapped_size);
 	}
@@ -808,7 +808,7 @@ shmget_allocate_segment(struct proc *p, struct shmget_args *uap, int mode,
 	 */
 	shmseg->u.shm_perm.mode = SHMSEG_ALLOCATED | SHMSEG_REMOVED;
 	shmseg->u.shm_perm._key = uap->key;
-	shmseg->u.shm_perm._seq = (shmseg->u.shm_perm._seq + 1) & 0x7fff;
+	shmseg->u.shm_perm._seq = ipc_perm_seq_inc(shmseg->u.shm_perm._seq);
 
 	shm_handle_next_p = NULL;
 	for (alloc_size = 0;

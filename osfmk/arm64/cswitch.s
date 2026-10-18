@@ -69,6 +69,11 @@
 	strb	w$1, [$0, SS64_KERNEL_SSBS]
 1:
 #endif // HAS_ARM_FEAT_SSBS2
+#if HAS_MTE
+	mrs		x$1, TCO
+	lsr     x$1, x$1, #0 + PSR64_TCO_SHIFT
+	strb	w$1, [$0, SS64_KERNEL_TCO]
+#endif //HAS_MTE
 #if __ARM_ARCH_8_4__
 	mrs		x$1, DIT
 	lsr     x$1, x$1, #0 + PSR64_DIT_SHIFT
@@ -131,6 +136,11 @@
 	msr		SSBS, x$1
 1:
 #endif // HAS_ARM_FEAT_SSBS2
+#if HAS_MTE
+	ldrb	w$1, [$0, SS64_KERNEL_TCO]
+	lsl     x$1, x$1, #0 + PSR64_TCO_SHIFT
+	msr		TCO, x$1
+#endif //HAS_MTE
 #if __ARM_ARCH_8_2__
 	ldrb	w$1, [$0, SS64_KERNEL_UAO]
 	lsl     x$1, x$1, #0 + PSR64_UAO_SHIFT
@@ -179,8 +189,33 @@
 	ldr		$1, [$0, ACT_CPUDATAP]
 	str		$0, [$1, CPU_ACTIVE_THREAD]
 
-	ldr	    $2, [$1, CPU_TPIDR_EL0]             // Write encoded CPU info to TPIDR_EL0
-	msr		TPIDR_EL0, $2
+	/*
+	 * This code *only* sets the lower TPIDR_EL0 bits that indicate
+	 * what core and cluster we are now running on. It does not touch
+	 * any higher bits, e.g. the bit that indicates whether x18 should
+	 * be preserved on context switch in user space.
+	 *
+	 * There are only three cases why we are here:
+	 *
+	 * 1. During bootstrap, loading the initial bootstrap thread.
+	 * 2. Coming back from sleep/wfi, loading the idle thread that we were in before.
+	 * 3. In a regular context switch, going from any thread to any other.
+	 *
+	 * For case 1 and 2, the bootstrap and idle thread respectively
+	 * never care about any of the higher bits right now. The early bootstrap path
+	 * will have zeroed them.
+	 *
+	 * For case 3, we will already have passed through
+	 * machine_switch_pmap_and_extended_context(), which will have
+	 * restored TPIDR_EL0 in its entirety.
+	 *
+	 * Note that if any bits are added to TPIDR_EL0 that the bootstrap
+	 * or idle thread may care about, this will need to change.
+	 */
+	ldr		$2, [$1, CPU_TPIDR_EL0]             // Load encoded CPU info ...
+	mrs		$1, TPIDR_EL0
+	bfi		$1, $2, #0, #MACHDEP_TPIDR_CPU_DATA_COUNT
+	msr		TPIDR_EL0, $1                       // ... into the lower bits.
 
 	ldr		$1, [$0, TH_CTH_SELF]				// Get cthread pointer
 	msr		TPIDRRO_EL0, $1
@@ -241,7 +276,19 @@ Lskip_jop_keys_\@:
 #endif /* CSWITCH_JOP_KEYS */
 
 	cbnz	\wsync, Lsync_now_\@
+#if !HAS_MTE
 	b		1f
+#else
+	/*
+	 * The HAS_MTE case:
+	 * If the new thread is inside an unprivileged access region and there is
+	 * a sync pending, we can't wait until an eret so synchronize it now.
+	 */
+	ldrb	\wsync, [\thread, IN_UNPRIVILEGED_ACCESS]
+	cbz		\wsync, 1f
+	ldrb	\wsync, [\cpudatap, CPU_SYNC_ON_CSWITCH]
+	cbz		\wsync, 1f
+#endif /* !HAS_MTE */
 
 Lsync_now_\@:
 	isb		sy

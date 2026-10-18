@@ -97,6 +97,7 @@
 #include <sys/codesign.h>
 #include <sys/kernel_types.h>
 #include <sys/ubc.h>
+#include <kern/assert.h>
 #include <kern/clock.h>
 #include <kern/debug.h>
 #include <kern/kalloc.h>
@@ -122,6 +123,7 @@
 #include <sys/proc_require.h>
 #include <sys/kern_debug.h>
 #include <sys/kern_memorystatus_xnu.h>
+#include <sys/kdebug_triage.h>
 #include <IOKit/IOBSD.h>        /* IOTaskHasEntitlement() */
 #include <kern/kern_memorystatus_internal.h>
 #include <kern/ipc_kobject.h>   /* ipc_kobject_set_kobjidx() */
@@ -129,6 +131,7 @@
 #include <libkern/amfi/amfi.h>
 #include <mach-o/loader.h>
 #include <os/base.h>            /* OS_STRINGIFY */
+#include <os/overflow.h>
 
 #if CONFIG_CSR
 #include <sys/csr.h>
@@ -286,64 +289,142 @@ procinit(void)
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, procinit);
 
-/*
- * Change the count associated with number of processes
- * a given user is using. This routine protects the uihash
- * with the list lock
- */
-size_t
-chgproccnt(uid_t uid, int diff)
+static struct uidinfo *
+uidinfo_find_locked(uid_t uid)
 {
 	struct uidinfo *uip;
-	struct uidinfo *newuip = NULL;
 	struct uihashhead *uipp;
-	size_t retval;
-
-again:
-	proc_list_lock();
 	uipp = UIHASH(uid);
 	for (uip = uipp->lh_first; uip != 0; uip = uip->ui_hash.le_next) {
 		if (uip->ui_uid == uid) {
 			break;
 		}
 	}
+	return uip;
+}
+
+/* sysctl for debug kernels only */
+#if DEBUG || DEVELOPMENT
+
+static int
+_debug_test_read_proccnt_for_uid(int64_t in, int64_t *out)
+{
+	uid_t uid = (uid_t)in;
+
+	proc_list_lock();
+	struct uidinfo * uip = uidinfo_find_locked(uid);
 	if (uip) {
-		uip->ui_proccnt += diff;
-		if (uip->ui_proccnt > 0) {
-			retval = uip->ui_proccnt;
-			proc_list_unlock();
-			goto out;
-		}
-		LIST_REMOVE(uip, ui_hash);
-		retval = 0;
-		proc_list_unlock();
-		kfree_type(struct uidinfo, uip);
-		goto out;
-	}
-	if (diff <= 0) {
-		if (diff == 0) {
-			retval = 0;
-			proc_list_unlock();
-			goto out;
-		}
-		panic("chgproccnt: lost user");
-	}
-	if (newuip != NULL) {
-		uip = newuip;
-		newuip = NULL;
-		LIST_INSERT_HEAD(uipp, uip, ui_hash);
-		uip->ui_uid = uid;
-		uip->ui_proccnt = diff;
-		retval = diff;
-		proc_list_unlock();
-		goto out;
+		*out = uip->ui_proccnt;
+	} else {
+		*out = 0;
 	}
 	proc_list_unlock();
-	newuip = kalloc_type(struct uidinfo, Z_WAITOK | Z_NOFAIL);
-	goto again;
+
+	return 0;
+}
+
+/* For tests */
+SYSCTL_TEST_REGISTER(proccnt_uid, _debug_test_read_proccnt_for_uid);
+
+#endif /* DEBUG || DEVELOPMENT */
+
+
+/* See declaration in header file for details */
+size_t
+chgproccnt(uid_t uid, int diff)
+{
+	struct uidinfo *uip, *newuip = NULL;
+	size_t ret = 0;
+	proc_list_lock();
+	uip = uidinfo_find_locked(uid);
+	if (!uip) {
+		if (diff == 0) {
+			goto out;
+		}
+
+		if (diff < 0) {
+			panic("chgproccnt: lost user");
+		}
+
+		if (diff > 0) {
+			/* need to allocate */
+			proc_list_unlock();
+			newuip = kalloc_type(struct uidinfo, Z_WAITOK | Z_NOFAIL);
+			proc_list_lock();
+		}
+	}
+
+	if (diff == 0) {
+		ret = uip->ui_proccnt;
+		uip = NULL;
+		goto out;
+	}
+
+	uip = chgproccnt_locked(uid, diff, newuip, &ret);
+
 out:
-	kfree_type(struct uidinfo, newuip);
-	return retval;
+	proc_list_unlock();
+
+	if (uip) {
+		/* despite if diff > 0 or diff < 0 - returned val points to element to be freed */
+		kfree_type(struct uidinfo, uip);
+	}
+
+	return ret;
+}
+
+/* See declaration in header file for details */
+struct uidinfo *
+chgproccnt_locked(uid_t uid, int diff, struct uidinfo *newuip, size_t *out)
+{
+	struct uidinfo *uip;
+	struct uihashhead *uipp;
+
+	assert(newuip == NULL || diff > 0); // new uip can be passed only with positive diff
+	if (diff == 0) {
+		panic("chgproccnt_locked: diff == 0");
+	}
+
+	proc_list_lock_held();
+
+	uipp = UIHASH(uid);
+	uip = uidinfo_find_locked(uid);
+
+	/* if element is missing - we expect new one to be provided */
+	if (!uip) {
+		/* this should never be reachable, we must've taken care of this case in caller */
+		assert(newuip != NULL); // chgproccnt_locked: missing new uidinfo element
+		LIST_INSERT_HEAD(uipp, newuip, ui_hash);
+		uip = newuip;
+		newuip->ui_uid = uid;
+		newuip->ui_proccnt = 0;
+		newuip = NULL;
+	}
+	if (os_add_overflow((long long)uip->ui_proccnt, (long long)diff, &uip->ui_proccnt)) {
+		panic("chgproccnt_locked: overflow");
+	}
+
+	if (uip->ui_proccnt > 0) {
+		if (out) {
+			*out = uip->ui_proccnt;
+		}
+		/* no need to deallocate the uip */
+		uip = NULL;
+	} else {
+		assert(diff < 0);
+		/* ui_proccnt == 0 */
+		LIST_REMOVE(uip, ui_hash);
+		if (out) {
+			*out = 0;
+		}
+		/* implicitly leaving uip intact - it will be returned and deallocated */
+	}
+
+	if (diff < 0) {
+		return uip;
+	} else { /* diff > 0 */
+		return newuip;
+	}
 }
 
 /*
@@ -974,8 +1055,8 @@ proc_self(void)
 	return proc_ref_try_fast(p) ? p : PROC_NULL;
 }
 
-proc_t
-proc_ref(proc_t p, int locked)
+static proc_t
+proc_ref_impl(proc_t p, bool wait, bool locked)
 {
 	uint32_t bits;
 
@@ -985,10 +1066,26 @@ proc_ref(proc_t p, int locked)
 	}
 
 	if (__improbable(proc_ref_needs_wait_for_exec(bits))) {
-		return proc_ref_wait_for_exec(p, bits, locked);
+		if (wait) {
+			return proc_ref_wait_for_exec(p, bits, locked);
+		} else {
+			/* can't wait - just return null */
+			return PROC_NULL;
+		}
 	}
-
 	return p;
+}
+
+proc_t
+proc_ref(proc_t p, int locked)
+{
+	return proc_ref_impl(p, true, (bool)locked);
+}
+
+proc_t
+proc_ref_nowait(proc_t p)
+{
+	return proc_ref_impl(p, false, false /* doesn't matter */);
 }
 
 static void
@@ -1396,6 +1493,7 @@ proc_is_simulated(const proc_t p)
 		case PLATFORM_IOSSIMULATOR:
 		case PLATFORM_TVOSSIMULATOR:
 		case PLATFORM_WATCHOSSIMULATOR:
+		case PLATFORM_XROSSIMULATOR:
 			return TRUE;
 		default:
 			return FALSE;
@@ -1432,6 +1530,31 @@ proc_sdk(proc_t p)
 		return proc_get_ro(p)->p_platform_data.p_sdk;
 	}
 	return (uint32_t)-1;
+}
+
+bool
+proc_sdk_26_4_or_later(proc_t proc)
+{
+	const uint32_t sdk_vers = proc_sdk(proc);
+
+	switch (proc_platform(proc)) {
+	case PLATFORM_IOS:
+	case PLATFORM_IOSSIMULATOR:
+	case PLATFORM_MACOS:
+	case PLATFORM_TVOS:
+	case PLATFORM_TVOSSIMULATOR:
+	case PLATFORM_WATCHOS:
+	case PLATFORM_WATCHOSSIMULATOR:
+	case PLATFORM_XROS:
+	case PLATFORM_XROSSIMULATOR:
+		return sdk_vers >= 0x001a0400; // DYLD_*_VERSION_26_4
+	case PLATFORM_BRIDGEOS:
+		return sdk_vers >= 0x000a0400; // DYLD_BRIDGEOS_VERSION_10_4
+	case PLATFORM_DRIVERKIT:
+		return sdk_vers >= 0x00190400; // DYLD_DRIVERKIT_VERSION_25_4
+	default:
+		return true;
+	}
 }
 
 void
@@ -1839,6 +1962,41 @@ proc_suser(proc_t p)
 	error = suser(proc_ucred_smr(p), &p->p_acflag);
 	smr_proc_task_leave();
 	return error;
+}
+
+void
+proc_set_ptraced_during_soft_mode(proc_t p)
+{
+	/* Hack: we would like to surface in crash reports when we've disabled,
+	 * but we don't know which thread will crash when we attach, so we store
+	 * it in a flag and add the ktriage record during proc_prepareexit.
+	 */
+	p->p_lflag |= P_LWASSOFT;
+}
+
+bool
+proc_was_ptraced_during_soft_mode(proc_t p)
+{
+	return p->p_lflag & P_LWASSOFT;
+}
+
+void
+proc_disable_sec_soft_mode_locked(proc_t p)
+{
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	/*
+	 * Clear MTE soft-mode when process becomes traced (rdar://156025403)
+	 * Note that this will miss the case where a process takes a TCF
+	 * in soft mode prior to becoming debugged.
+	 */
+	task_t task = proc_task(p);
+	if (task_has_sec(task) && task_has_sec_soft_mode(task)) {
+		task_clear_sec_soft_mode(task);
+		proc_set_ptraced_during_soft_mode(p);
+	}
+#else
+	(void)p;
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 }
 
 task_t
@@ -3983,6 +4141,25 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 	}
 
 	case CS_OPS_CLEARINSTALLER:
+		/*
+		 * Only allow clearing CS_INSTALLER if:
+		 * 1. The caller is clearing its own CS_INSTALLER flag, OR
+		 * 2. The caller itself has CS_INSTALLER privilege
+		 *
+		 * This prevents a non-CS_INSTALLER process from removing
+		 * CS_INSTALLER from another process, which could lead to
+		 * confused deputy vulnerabilities (rdar://128685712).
+		 */
+		if (!forself) {
+			/*
+			 * Check if current process has CS_INSTALLER.
+			 */
+			proc_t curproc = current_proc();
+			if ((proc_getcsflags(curproc) & CS_INSTALLER) == 0) {
+				error = EPERM;
+				goto out;
+			}
+		}
 		proc_lock(pt);
 		proc_csflags_clear(pt, CS_INSTALLER | CS_DATAVAULT_CONTROLLER | CS_EXEC_INHERIT_SIP);
 		proc_unlock(pt);
@@ -5208,6 +5385,25 @@ proc_set_syscall_filter_index(int which, int num, int index)
 
 	return 0;
 }
+
+SECURITY_READ_ONLY_LATE(sandbox_profile_cbfunc_t) mac_proc_get_sandbox_profile = NULL;
+
+int
+proc_set_sandbox_info_callbacks(sandbox_info_cbs_t cbs)
+{
+	if (cbs->version != SANDBOX_INFO_CALLBACK_VERSION) {
+		return EINVAL;
+	}
+
+	if (cbs->sandbox_profile_cbfunc) {
+		if (mac_proc_get_sandbox_profile != NULL) {
+			return EPERM;
+		}
+		mac_proc_get_sandbox_profile = cbs->sandbox_profile_cbfunc;
+	}
+
+	return 0;
+}
 #endif /* CONFIG_MACF */
 
 int
@@ -5232,19 +5428,6 @@ proc_get_filter_message_flag(proc_t p, boolean_t *flag)
 	*flag = task_get_filter_msg_flag(proc_task(p));
 
 	return 0;
-}
-
-bool
-proc_is_traced(proc_t p)
-{
-	bool ret = FALSE;
-	assert(p != PROC_NULL);
-	proc_lock(p);
-	if (p->p_lflag & P_LTRACED) {
-		ret = TRUE;
-	}
-	proc_unlock(p);
-	return ret;
 }
 
 #if CONFIG_PROC_RESOURCE_LIMITS
@@ -5464,19 +5647,6 @@ proc_get_ro(proc_t p)
 
 	return ro;
 }
-
-#ifdef __BUILDING_XNU_LIB_UNITTEST__
-/* this is here since unittest Makefile can't build BSD sources yet */
-void mock_init_proc(proc_t p, void* (*calloc_call)(size_t, size_t));
-void
-mock_init_proc(proc_t p, void* (*calloc_call)(size_t, size_t))
-{
-	proc_ro_t ro = calloc_call(1, sizeof(struct proc_ro));
-	ro->pr_proc = p;
-	p->p_proc_ro = ro;
-}
-#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
-
 
 task_t
 proc_ro_task(proc_ro_t pr)
@@ -6045,7 +6215,7 @@ task_inspect_for_pid(struct proc *p __unused, struct task_inspect_for_pid_args *
 	/* could be IP_NULL, consumes a ref */
 	sright = (void*) convert_task_inspect_to_port(task_insp);
 	task_insp = TASK_INSPECT_NULL;
-	tret = ipc_port_copyout_send(sright, get_task_ipcspace(current_task()));
+	tret = ipc_port_copyout_send_allow_immovable(sright, get_task_ipcspace(current_task()));
 
 tifpout:
 	task_deallocate(t1);
@@ -6167,7 +6337,7 @@ task_read_for_pid(struct proc *p __unused, struct task_read_for_pid_args *args, 
 	/* could be IP_NULL, consumes a ref */
 	sright = (void*) convert_task_read_to_port(task_read);
 	task_read = TASK_READ_NULL;
-	tret = ipc_port_copyout_send(sright, get_task_ipcspace(current_task()));
+	tret = ipc_port_copyout_send_allow_immovable(sright, get_task_ipcspace(current_task()));
 
 trfpout:
 	task_deallocate(t1);

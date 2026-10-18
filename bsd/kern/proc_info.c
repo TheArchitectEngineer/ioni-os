@@ -762,8 +762,24 @@ proc_pidbsdinfo(proc_t p, struct proc_bsdinfo * pbsd, int zombie)
 			pbsd->pbi_flags |= PROC_FLAG_HARDENED_HEAP_ENABLED;
 		}
 
+		if (task_has_script_restrictions(task)) {
+			pbsd->pbi_flags |= PROC_FLAG_SCRIPT_RESTRICTIONS_ENABLED;
+		}
+
 		if (task_has_tpro(task)) {
 			pbsd->pbi_flags |= PROC_FLAG_TPRO_ENABLED;
+		}
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+		if (task_has_sec(task)) {
+			pbsd->pbi_flags |= PROC_FLAG_SEC_ENABLED;
+			if (task_has_sec_soft_mode(task)) {
+				pbsd->pbi_flags |= PROC_FLAG_SEC_BYPASS_ENABLED;
+			}
+		}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
+
+		if (task_has_guard_objects(task)) {
+			pbsd->pbi_flags |= PROC_FLAG_GUARD_OBJECTS_ENABLED;
 		}
 	}
 
@@ -871,8 +887,24 @@ proc_pidshortbsdinfo(proc_t p, struct proc_bsdshortinfo * pbsd_shortp, int zombi
 			pbsd_shortp->pbsi_flags |= PROC_FLAG_HARDENED_HEAP_ENABLED;
 		}
 
+		if (task_has_script_restrictions(task)) {
+			pbsd_shortp->pbsi_flags |= PROC_FLAG_SCRIPT_RESTRICTIONS_ENABLED;
+		}
+
 		if (task_has_tpro(task)) {
 			pbsd_shortp->pbsi_flags |= PROC_FLAG_TPRO_ENABLED;
+		}
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+		if (task_has_sec(task)) {
+			pbsd_shortp->pbsi_flags |= PROC_FLAG_SEC_ENABLED;
+			if (task_has_sec_soft_mode(task)) {
+				pbsd_shortp->pbsi_flags |= PROC_FLAG_SEC_BYPASS_ENABLED;
+			}
+		}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
+
+		if (task_has_guard_objects(task)) {
+			pbsd_shortp->pbsi_flags |= PROC_FLAG_GUARD_OBJECTS_ENABLED;
 		}
 	}
 

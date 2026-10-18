@@ -77,6 +77,7 @@
 #include <mach/host_priv_server.h>
 #include <mach/vm_map.h>
 #include <mach/task_info.h>
+#include <mach/resource_monitors.h>
 
 #include <machine/commpage.h>
 #include <machine/cpu_capabilities.h>
@@ -94,10 +95,17 @@
 #include <kern/sched.h>
 #include <kern/processor.h>
 
+#include <sys/variant_internal.h>
+
+#include <vm/vm_compressor_xnu.h>
 #include <vm/vm_map_xnu.h>
+#if HAS_MTE
+#include <vm/vm_mteinfo_internal.h>
+#endif
 #include <vm/vm_purgeable_xnu.h>
 #include <vm/vm_pageout.h>
 #include <vm/vm_kern_xnu.h>
+#include <vm/vm_log.h>
 
 #include <IOKit/IOBSD.h> // IOTaskHasEntitlement
 #include <IOKit/IOKitKeys.h> // DriverKit entitlement strings
@@ -116,9 +124,13 @@
 
 #include <pexpert/pexpert.h>
 
+extern bool proc_sdk_26_4_or_later(proc_t);
+
 SCALABLE_COUNTER_DEFINE(vm_statistics_zero_fill_count);        /* # of zero fill pages */
 SCALABLE_COUNTER_DEFINE(vm_statistics_reactivations);          /* # of pages reactivated */
 SCALABLE_COUNTER_DEFINE(vm_statistics_pageins);                /* # of pageins */
+SCALABLE_COUNTER_DEFINE(vm_statistics_pageins_aborted);        /* # of pageins aborted */
+SCALABLE_COUNTER_DEFINE(vm_statistics_pageins_requested);      /* # of pageins requested */
 SCALABLE_COUNTER_DEFINE(vm_statistics_pageouts);               /* # of pageouts */
 SCALABLE_COUNTER_DEFINE(vm_statistics_faults);                 /* # of faults */
 SCALABLE_COUNTER_DEFINE(vm_statistics_cow_faults);             /* # of copy-on-writes */
@@ -168,7 +180,7 @@ host_processors(host_priv_t host_priv, processor_array_t * out_array, mach_msg_t
 	static_assert(sizeof(mach_port_t) == sizeof(processor_t));
 
 	mach_port_array_t ports = mach_port_array_alloc(count, Z_WAITOK);
-	if (!ports) {
+	if (ports == NULL) {
 		return KERN_RESOURCE_SHORTAGE;
 	}
 
@@ -484,7 +496,8 @@ host_statistics(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_ty
 		*count = HOST_VM_INFO_REV0_COUNT; /* rev0 already filled in */
 		if (original_count >= HOST_VM_INFO_REV1_COUNT) {
 			/* rev1 added "purgeable" info */
-			stat32->purgeable_count = VM_STATISTICS_TRUNCATE_TO_32_BIT(vm_page_purgeable_count);
+			stat32->purgeable_count =
+			    VM_STATISTICS_TRUNCATE_TO_32_BIT(counter_load(&vm_page_purgeable_count));
 			stat32->purges = VM_STATISTICS_TRUNCATE_TO_32_BIT(vm_page_purged_count);
 			*count = HOST_VM_INFO_REV1_COUNT;
 		}
@@ -520,8 +533,6 @@ host_statistics(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_ty
 		cpu_load_info->cpu_ticks[CPU_STATE_IDLE] = 0;
 		cpu_load_info->cpu_ticks[CPU_STATE_NICE] = 0;
 
-		simple_lock(&processor_list_lock, LCK_GRP_NULL);
-
 		unsigned int pcount = processor_count;
 
 		for (unsigned int i = 0; i < pcount; i++) {
@@ -529,7 +540,6 @@ host_statistics(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_ty
 			assert(processor != PROCESSOR_NULL);
 			processor_cpu_load_info(processor, cpu_load_info->cpu_ticks);
 		}
-		simple_unlock(&processor_list_lock);
 
 		*count = HOST_CPU_LOAD_INFO_COUNT;
 
@@ -594,11 +604,13 @@ static LCK_MTX_DECLARE(host_statistics_lck, &host_statistics_lck_grp);
 #define HOST_EXPIRED_TASK_INFO_REV1     9
 #define HOST_VM_COMPRESSOR_Q_LEN_REV0   10
 #define HOST_VM_INFO64_REV2             11
-#define NUM_HOST_INFO_DATA_TYPES        12
+#define HOST_VM_INFO64_REV3             12
+#define NUM_HOST_INFO_DATA_TYPES        13
 
 static vm_statistics64_data_t host_vm_info64_rev0 = {};
 static vm_statistics64_data_t host_vm_info64_rev1 = {};
 static vm_statistics64_data_t host_vm_info64_rev2 = {};
+static vm_statistics64_data_t host_vm_info64_rev3 = {};
 static vm_extmod_statistics_data_t host_extmod_info64 = {};
 static host_load_info_data_t host_load_info = {};
 static vm_statistics_data_t host_vm_info_rev0 = {};
@@ -630,6 +642,7 @@ static struct host_stats_cache g_host_stats_cache[NUM_HOST_INFO_DATA_TYPES] = {
 	[HOST_EXPIRED_TASK_INFO_REV1] = { .last_access = 0, .current_requests = 0, .max_requests = 0, .data = (uintptr_t)&host_expired_task_info2, .count = TASK_POWER_INFO_V2_COUNT},
 	[HOST_VM_COMPRESSOR_Q_LEN_REV0] = { .last_access = 0, .current_requests = 0, .max_requests = 0, .data = (uintptr_t)&host_vm_compressor_q_lens, .count = VM_COMPRESSOR_Q_LENS_COUNT},
 	[HOST_VM_INFO64_REV2] = { .last_access = 0, .current_requests = 0, .max_requests = 0, .data = (uintptr_t)&host_vm_info64_rev2, .count = HOST_VM_INFO64_REV2_COUNT },
+	[HOST_VM_INFO64_REV3] = { .last_access = 0, .current_requests = 0, .max_requests = 0, .data = (uintptr_t)&host_vm_info64_rev3, .count = HOST_VM_INFO64_REV3_COUNT },
 };
 
 
@@ -678,6 +691,10 @@ get_host_info_data_index(bool is_stat64, host_flavor_t flavor, mach_msg_type_num
 		if (*count < HOST_VM_INFO64_REV0_COUNT) {
 			*ret = KERN_FAILURE;
 			return -1;
+		}
+
+		if (*count >= HOST_VM_INFO64_REV3_COUNT) {
+			return HOST_VM_INFO64_REV3;
 		}
 		if (*count >= HOST_VM_INFO64_REV2_COUNT) {
 			return HOST_VM_INFO64_REV2;
@@ -798,6 +815,9 @@ out:
 	return rate_limited;
 }
 
+_Static_assert(HOST_VM_INFO64_COUNT <= HOST_INFO_MAX,
+    "vm_statistics64_data_t exceeds maximum host_info size");
+
 kern_return_t
 vm_stats(void *info, unsigned int *count)
 {
@@ -807,6 +827,19 @@ vm_stats(void *info, unsigned int *count)
 	unsigned int local_q_external_count;
 	natural_t speculative_count = vm_page_speculative_count;
 	natural_t throttled_count = vm_page_throttled_count;
+
+	if (*count > HOST_VM_INFO64_COUNT) {
+		vm_log_error("host_statistics64() count is larger than expected "
+		    "(actual:%u > HOST_VM_INFO64_COUNT:%u). This is most likely a bug in "
+		    "%s [%d] and is likely to result in memory corruption. The buffer count "
+		    "must be passed in units of integer_t's. HOST_VM_INFO64_COUNT may be "
+		    "used as shorthand.\n",
+		    *count, HOST_VM_INFO64_COUNT,
+		    task_best_name(current_task()), task_pid(current_task()));
+		DTRACE_VM2(vm_stats_bad_count,
+		    uint, *count,
+		    uint, HOST_VM_INFO64_COUNT);
+	}
 
 	if (*count < HOST_VM_INFO64_REV0_COUNT) {
 		return KERN_FAILURE;
@@ -833,6 +866,17 @@ vm_stats(void *info, unsigned int *count)
 #else /* !XNU_TARGET_OS_OSX */
 	stat->wire_count = vm_page_wire_count + throttled_count + vm_lopage_free_count;
 #endif /* !XNU_TARGET_OS_OSX */
+#if HAS_MTE
+	/*
+	 * Don't include KERN_MEMORY_MTAG pages which do not hold any tags in the
+	 * wired count for vm_stat. Though these pages are technically wired, they
+	 * are more fundamentally "free" and need not be reported separately from
+	 * the other "free" tag storage pages. Reporting them as wired here would
+	 * necessitate also reporting them as "tag-storing" in the MTE statistics
+	 * and would give an inaccurate view of tag storage fragmentation.
+	 */
+	stat->wire_count -= mteinfo_tag_storage_active_zero_locked();
+#endif /* HAS_MTE */
 	stat->zero_fill_count = host_vm_stat.zero_fill_count;
 	stat->reactivations = host_vm_stat.reactivations;
 	stat->pageins = host_vm_stat.pageins;
@@ -842,7 +886,8 @@ vm_stats(void *info, unsigned int *count)
 	stat->lookups = host_vm_stat.lookups;
 	stat->hits = host_vm_stat.hits;
 
-	stat->purgeable_count = vm_page_purgeable_count;
+	stat->purgeable_count =
+	    VM_STATISTICS_TRUNCATE_TO_32_BIT(counter_load(&vm_page_purgeable_count));
 	stat->purges = vm_page_purged_count;
 
 	stat->speculative_count = speculative_count;
@@ -853,31 +898,73 @@ vm_stats(void *info, unsigned int *count)
 	 * in the data structure the caller gave us !
 	 */
 	original_count = *count;
-	*count = HOST_VM_INFO64_REV0_COUNT; /* rev0 already filled in */
-	if (original_count >= HOST_VM_INFO64_REV1_COUNT) {
-		/* rev1 added "throttled count" */
-		stat->throttled_count = throttled_count;
-		/* rev1 added "compression" info */
-		stat->compressor_page_count = VM_PAGE_COMPRESSOR_COUNT;
-		stat->compressions = host_vm_stat.compressions;
-		stat->decompressions = host_vm_stat.decompressions;
-		stat->swapins = host_vm_stat.swapins;
-		stat->swapouts = host_vm_stat.swapouts;
-		/* rev1 added:
-		 * "external page count"
-		 * "anonymous page count"
-		 * "total # of pages (uncompressed) held in the compressor"
-		 */
-		stat->external_page_count = (vm_page_pageable_external_count + local_q_external_count);
-		stat->internal_page_count = (vm_page_pageable_internal_count + local_q_internal_count);
-		stat->total_uncompressed_pages_in_compressor = c_segment_pages_compressed;
-		*count = HOST_VM_INFO64_REV1_COUNT;
-	}
-	if (original_count >= HOST_VM_INFO64_REV2_COUNT) {
-		stat->swapped_count = os_atomic_load(&vm_page_swapped_count, relaxed);
-		*count = HOST_VM_INFO64_REV2_COUNT;
+
+	if (original_count < HOST_VM_INFO64_REV1_COUNT) {
+		*count = HOST_VM_INFO64_REV0_COUNT;
+		return KERN_SUCCESS;
 	}
 
+	/* rev1 added "throttled count" */
+	stat->throttled_count = throttled_count;
+	/* rev1 added "compression" info */
+	stat->compressor_page_count = VM_PAGE_COMPRESSOR_COUNT;
+	stat->compressions = host_vm_stat.compressions;
+	stat->decompressions = host_vm_stat.decompressions;
+	stat->swapins = host_vm_stat.swapins;
+	stat->swapouts = host_vm_stat.swapouts;
+	/* rev1 added:
+	 * "external page count"
+	 * "anonymous page count"
+	 * "total # of pages (uncompressed) held in the compressor"
+	 */
+	stat->external_page_count = (vm_page_pageable_external_count + local_q_external_count);
+	stat->internal_page_count = (vm_page_pageable_internal_count + local_q_internal_count);
+	stat->total_uncompressed_pages_in_compressor = c_segment_pages_compressed;
+
+	if (original_count < HOST_VM_INFO64_REV2_COUNT) {
+		*count = HOST_VM_INFO64_REV1_COUNT;
+		return KERN_SUCCESS;
+	}
+
+	stat->swapped_count = os_atomic_load(&vm_page_swapped_count, relaxed);
+
+	if (original_count < HOST_VM_INFO64_REV3_COUNT) {
+		*count = HOST_VM_INFO64_REV2_COUNT;
+		return KERN_SUCCESS;
+	}
+#if HAS_MTE
+	/*
+	 * Don't actually take the free page queues lock -- at worst we fib.
+	 */
+	stat->resident_tagged_pages = vm_page_tagged_count;
+	stat->tag_storing_tag_storage_pages = mteinfo_tag_storage_active_locked();
+	stat->free_tag_storage_pages = mteinfo_tag_storage_free_locked();
+	stat->nontag_pageable_tag_storage_pages = mteinfo_tag_storage_nontags_pageable_locked();
+	stat->nontag_wired_tag_storage_pages = mteinfo_tag_storage_nontags_wired_locked();
+	stat->total_tag_storage_pages = mte_tag_storage_count;
+
+	stat->compressed_tagged_pages = counter_load(&compressor_tagged_pages);
+	stat->tagged_compressions = counter_load(&compressor_tagged_pages_compressed);
+	stat->tagged_decompressions = counter_load(&compressor_tagged_pages_decompressed);
+	stat->compressed_tag_storage_bytes = counter_load(&compressor_tags_overhead_bytes);
+
+	stat->total_tagged_pages = stat->resident_tagged_pages +
+	    stat->compressed_tagged_pages;
+#else /* HAS_MTE */
+	stat->resident_tagged_pages = 0;
+	stat->tag_storing_tag_storage_pages = 0;
+	stat->free_tag_storage_pages = 0;
+	stat->nontag_pageable_tag_storage_pages = 0;
+	stat->nontag_wired_tag_storage_pages = 0;
+	stat->total_tag_storage_pages = 0;
+	stat->compressed_tagged_pages = 0;
+	stat->tagged_compressions = 0;
+	stat->tagged_decompressions = 0;
+	stat->compressed_tag_storage_bytes = 0;
+	stat->total_tagged_pages = 0;
+#endif /* HAS_MTE */
+
+	*count = HOST_VM_INFO64_REV3_COUNT;
 	return KERN_SUCCESS;
 }
 
@@ -1146,7 +1233,7 @@ host_processor_sets(host_priv_t host_priv, processor_set_name_array_t * pset_lis
 	ports = mach_port_array_alloc(1, Z_WAITOK | Z_NOFAIL);
 
 	/* do the conversion that Mig should handle */
-	ports[0].port = convert_pset_name_to_port(&pset0);
+	ports[0].port = convert_pset_name_to_port(sched_boot_pset);
 
 	*pset_list = ports;
 	*count = 1;
@@ -1210,7 +1297,7 @@ host_processor_info(host_t host,
 
 	needed = pcount * icount * sizeof(natural_t);
 	size = vm_map_round_page(needed, VM_MAP_PAGE_MASK(ipc_kernel_map));
-	result = kmem_alloc(ipc_kernel_map, &addr, size, KMA_DATA, VM_KERN_MEMORY_IPC);
+	result = kmem_alloc(ipc_kernel_map, &addr, size, KMA_DATA_SHARED, VM_KERN_MEMORY_IPC);
 	if (result != KERN_SUCCESS) {
 		return KERN_RESOURCE_SHORTAGE;
 	}

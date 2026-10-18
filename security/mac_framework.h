@@ -482,6 +482,8 @@ int     mac_vnode_check_lookup(vfs_context_t ctx, struct vnode *dvp,
     struct componentname *cnp) __result_use_check;
 int     mac_vnode_check_lookup_preflight(vfs_context_t ctx, struct vnode *dvp,
     const char *path, size_t pathlen) __result_use_check;
+int     mac_vnode_check_lookup_postflight(vfs_context_t ctx, struct vnode *vp,
+    uint32_t resolve_flags) __result_use_check;
 #ifdef KERNEL_PRIVATE
 int     mac_vnode_check_open(vfs_context_t ctx, struct vnode *vp,
     int acc_mode) __result_use_check;
@@ -573,6 +575,8 @@ void    mac_vnode_notify_rename(vfs_context_t ctx, struct vnode *fvp,
 void    mac_vnode_notify_rename_swap(vfs_context_t ctx, struct vnode *fvp,
     struct vnode *fdvp, struct componentname *fcnp, struct vnode *tvp,
     struct vnode *tdvp, struct componentname *tcnp);
+void    mac_vnode_notify_will_rename_swap(vfs_context_t ctx,
+    struct vnode *fvp, struct vnode *tvp);
 void    mac_vnode_notify_setacl(vfs_context_t ctx, struct vnode *vp, struct kauth_acl *acl);
 void    mac_vnode_notify_setattrlist(vfs_context_t ctx, struct vnode *vp, struct attrlist *alist);
 void    mac_vnode_notify_setextattr(vfs_context_t ctx, struct vnode *vp, const char *name, struct uio *uio);

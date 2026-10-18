@@ -597,6 +597,7 @@ shared_region_pager_data_request(
 		 * We already hold a reference on the src_top_object.
 		 */
 retry_src_fault:
+		vm_page_grab_prime();
 		vm_object_lock(src_top_object);
 		vm_object_paging_begin(src_top_object);
 		error_code = 0;
@@ -613,7 +614,8 @@ retry_src_fault:
 		    NULL,
 		    &error_code,
 		    FALSE,
-		    &fault_info);
+		    &fault_info,
+		    NULL);
 		switch (vmfr) {
 		case VM_FAULT_SUCCESS:
 			break;
@@ -1176,6 +1178,7 @@ shared_region_pager_create(
 	pager->srp_header.mo_ikot = IKOT_MEMORY_OBJECT;
 	pager->srp_header.mo_pager_ops = &shared_region_pager_ops;
 	pager->srp_header.mo_control = MEMORY_OBJECT_CONTROL_NULL;
+	pager->srp_header.mo_last_unmap_ctid = 0;
 
 	pager->srp_is_ready = FALSE;/* not ready until it has a "name" */
 	/* existence reference (for the cache) + 1 for the caller */
@@ -1430,7 +1433,7 @@ shared_region_pager_purge(
 	assert(object != VM_OBJECT_NULL);
 	vm_object_lock(object);
 	pages_purged = object->resident_page_count;
-	vm_object_reap_pages(object, REAP_DATA_FLUSH);
+	vm_object_reap_pages(object, REAP_DATA_FLUSH_CLEAN);
 	pages_purged -= object->resident_page_count;
 //	printf("     %s:%d pager %p object %p purged %llu left %d\n", __FUNCTION__, __LINE__, pager, object, pages_purged, object->resident_page_count);
 	vm_object_unlock(object);

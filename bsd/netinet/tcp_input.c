@@ -237,7 +237,7 @@ SYSCTL_SKMEM_TCP_INT(OID_AUTO, awdl_rtobase,
     CTLFLAG_RW | CTLFLAG_LOCKED, int, tcp_awdl_rtobase, 100,
     "Initial RTO for AWDL interface");
 
-int tcp_syncookie = 1;
+int tcp_syncookie = 0;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, syncookie,
     CTLFLAG_RW | CTLFLAG_LOCKED, &tcp_syncookie, 1,
     "0: disable, 1: Use SYN cookies when backlog is full, 2: Always use SYN cookies");
@@ -618,6 +618,42 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
 	 * Find a segment which begins after this one does.
 	 */
 	LIST_FOREACH(q, &tp->t_segq, tqe_q) {
+		/*
+		 * Check for FIN-related constraints in the reassembly queue:
+		 * 1. If the incoming segment has TH_FIN set and there's already
+		 *    a segment with TH_FIN in the reassembly queue at a different
+		 *    sequence number, reject the incoming segment.
+		 * 2. If there's already a FIN segment in the reassembly queue,
+		 *    reject any incoming segment with data after the FIN.
+		 */
+		if (q->tqe_th->th_flags & TH_FIN) {
+			tcp_seq fin_seq = q->tqe_th->th_seq + q->tqe_len;
+
+			/* Check for duplicate FIN at different sequence */
+			if ((th->th_flags & TH_FIN) &&
+			    (fin_seq != th->th_seq + *tlenp)) {
+				/*
+				 * Found a FIN at a different sequence number.
+				 * Drop the incoming segment.
+				 */
+				tcp_destroy_reass_qent(tp, te);
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_TCP_REASS_DUP_FIN, NULL, 0);
+				*tlenp = 0;
+				return 0;
+			}
+
+			/* Check for data after existing FIN */
+			if (*tlenp > 0 && SEQ_GT(th->th_seq + *tlenp, fin_seq)) {
+				/*
+				 * Incoming segment has data after an existing
+				 * FIN segment. Drop it.
+				 */
+				tcp_destroy_reass_qent(tp, te);
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_TCP_REASS_DATA_AFTER_FIN, NULL, 0);
+				*tlenp = 0;
+				return 0;
+			}
+		}
 		if (SEQ_GT(q->tqe_th->th_seq, th->th_seq)) {
 			break;
 		}
@@ -1777,6 +1813,7 @@ tcp_input_process_accecn_syn(struct tcpcb *tp, int ace_flags, uint8_t ip_ecn)
 			 */
 			tp->ecn_flags |= (TE_SETUPRECEIVED | TE_SENDIPECT);
 		}
+		OS_FALLTHROUGH;
 	default:
 		/* Forward Compatibility */
 		/* Accurate ECN */
@@ -2112,14 +2149,14 @@ tcp_process_accecn_options(struct tcpcb *tp, struct tcpopt *to)
 			delta = (delta + TCP_ACO_DIV -
 			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
 			if (delta < 0) {
-				os_log_error(OS_LOG_DEFAULT, "delta for AccECN0 options (ECT0 bytes) can't be zero");
+				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT0 bytes) can't be zero");
 			}
 			tp->t_aecn.t_snd_ect0_bytes += delta;
 		} else {
 			delta = (delta + TCP_ACO_DIV -
 			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
 			if (delta < 0) {
-				os_log_error(OS_LOG_DEFAULT, "delta for AccECN1 options (ECT1 bytes) can't be zero");
+				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT1 bytes) can't be zero");
 			}
 			tp->t_aecn.t_snd_ect1_bytes += delta;
 		}
@@ -2129,7 +2166,7 @@ tcp_process_accecn_options(struct tcpcb *tp, struct tcpopt *to)
 		delta = (delta + TCP_ACO_DIV -
 		    (tp->t_aecn.t_snd_ce_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
 		if (delta < 0) {
-			os_log_error(OS_LOG_DEFAULT, "delta for AccECN options (CE bytes) can't be zero");
+			os_log_error(tcp_log_handle, "delta for AccECN options (CE bytes) can't be zero");
 		}
 		tp->t_aecn.t_snd_ce_bytes += delta;
 		ce_bytes = delta;
@@ -2140,14 +2177,14 @@ tcp_process_accecn_options(struct tcpcb *tp, struct tcpopt *to)
 			delta = (delta + TCP_ACO_DIV -
 			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
 			if (delta < 0) {
-				os_log_error(OS_LOG_DEFAULT, "delta for AccECN0 options (ECT1 bytes) can't be zero");
+				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT1 bytes) can't be zero");
 			}
 			tp->t_aecn.t_snd_ect1_bytes += delta;
 		} else {
 			delta = (delta + TCP_ACO_DIV -
 			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
 			if (delta < 0) {
-				os_log_error(OS_LOG_DEFAULT, "delta for AccECN1 options (ECT0 bytes) can't be zero");
+				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT0 bytes) can't be zero");
 			}
 			tp->t_aecn.t_snd_ect0_bytes += delta;
 		}
@@ -2161,7 +2198,7 @@ tcp_process_accecn(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th,
     uint32_t pkts_acked, uint8_t ace)
 {
 	if (tp->t_aecn.accecn_processed) {
-		os_log(OS_LOG_DEFAULT, "already processed AccECN field/options for this ACK");
+		os_log(tcp_log_handle, "already processed AccECN field/options for this ACK");
 		return;
 	}
 
@@ -2730,21 +2767,20 @@ pcbconnect_done:
 }
 
 static void
-tcp_input_process_wake_packet(__unused struct mbuf *m, __unused protocol_family_t protocol_family, struct inpcb *inp)
+tcp_proto_process_lpw_packet(struct mbuf *m, struct inpcb *inp)
 {
 	struct ifnet *ifp = m->m_pkthdr.rcvif;
+	struct tcpcb *tp = intotcpcb(inp);
 
-	/*
-	 * Note: we will stay in LPW if the TCP packet is invalid or have not found a PCB
-	 */
-	if (__improbable(if_is_lpw_enabled(ifp))) {
-		if (inp->inp_flags2 & INP2_CONNECTION_IDLE) {
-			struct tcpcb *tp = intotcpcb(inp);
-			TCP_LOG(tp, "LPW drop TCP connection idle");
-			tcp_drop(tp, 0);
-		} else {
-			if_exit_lpw(ifp, "TCP connection not idle ");
-		}
+	if (inp->inp_flags2 & INP2_CONNECTION_IDLE) {
+		TCP_LOG(tp, "LPW drop TCP connection idle");
+
+		tcp_drop(tp, 0);
+	} else {
+		TCP_LOG(tp, "LPW TCP connection not idle");
+
+		if_ports_used_match_mbuf(ifp, PF_INET, m);
+		if_exit_lpw(ifp, "TCP connection not idle ");
 	}
 }
 
@@ -3146,7 +3182,7 @@ findpcb:
 		    inp->inp_laddr.s_addr != ip->ip_dst.s_addr ||
 		    inp->inp_fport != th->th_sport ||
 		    inp->inp_lport != th->th_dport) {
-			os_log_error(OS_LOG_DEFAULT, "%s 5-tuple does not match: %u:%u %u:%u\n",
+			os_log_error(tcp_log_handle, "%s 5-tuple does not match: %u:%u %u:%u\n",
 			    __func__,
 			    ntohs(inp->inp_fport), ntohs(th->th_sport),
 			    ntohs(inp->inp_lport), ntohs(th->th_dport));
@@ -3164,7 +3200,7 @@ findpcb:
 		    !in6_are_addr_equal_scoped(&inp->in6p_laddr, &ip6->ip6_dst, inp->inp_lifscope, ip6_input_getdstifscope(m)) ||
 		    inp->inp_fport != th->th_sport ||
 		    inp->inp_lport != th->th_dport) {
-			os_log_error(OS_LOG_DEFAULT, "%s 5-tuple does not match: %u:%u %u:%u\n",
+			os_log_error(tcp_log_handle, "%s 5-tuple does not match: %u:%u %u:%u\n",
 			    __func__,
 			    ntohs(inp->inp_fport), ntohs(th->th_sport),
 			    ntohs(inp->inp_lport), ntohs(th->th_dport));
@@ -3201,8 +3237,8 @@ findpcb:
 	/*
 	 * Note: we will stay in LPW if the TCP packet is invalid or have not found a PCB
 	 */
-	if (__improbable((m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT) != 0)) {
-		tcp_input_process_wake_packet(m, isipv6 ? PF_INET6 : PF_INET, inp);
+	if (__improbable(if_is_lpw_enabled(ifp))) {
+		tcp_proto_process_lpw_packet(m, inp);
 	}
 
 #if NECP
@@ -3309,11 +3345,12 @@ findpcb:
 			tpi.ip_ecn = ip_ecn;
 			ret = tcp_syncookie_ack(&tpi, &so2, &dropsocket);
 			if (so2 == NULL) {
-				/* Either cookie validation failed or we could not allocate a socket */
+				/* Either ACK was sent to listener after connection was closed or cookie validation failed or we could not allocate a socket */
 				tcpstat.tcps_listendrop++;
-				TCP_LOG_DROP_PCB(TCP_LOG_HDR, th, tp, false, " listen drop with SYN cookies");
+				TCP_LOG_DROP_PCB(TCP_LOG_HDR, th, tp, false, " listener dropped ACK while SYN cookies were enabled");
+				tp = NULL; /* This is mandatory due to how RST is send from tcp_respond */
 				drop_reason = DROP_REASON_TCP_LISTENER_DROP;
-				goto drop;
+				goto dropwithreset;
 			}
 			/* Set so to newly connected socket */
 			so = so2;
@@ -5039,7 +5076,15 @@ close:
 	case TCPS_LAST_ACK:
 	case TCPS_TIME_WAIT:
 	{
-		const uint64_t byte_limit = MIN(tp->t_stat.bytes_acked, tp->max_sndwnd);
+		/*
+		 * TODO: The MAX(..., 100) is a temporary workaround for redirection issues with certain captive portals
+		 * in the wild.
+		 * After a successful TCP handshake, these portals send an incorrect ACK number in the data packet containing
+		 * the HTTP redirect response, that is 19 bytes behind the ISS. The security mitigation below caused these
+		 * packets to be dropped. Making the minimum byte_limit 100 works around this issue.
+		 * This workaround will be removed once the operators of these portals patch the issue on their end.
+		 */
+		const uint64_t byte_limit = MAX(MIN(tp->t_stat.bytes_acked, tp->max_sndwnd), 100);
 
 		if (SEQ_GT(th->th_ack, tp->snd_max)) {
 			tcpstat.tcps_rcvacktoomuch++;

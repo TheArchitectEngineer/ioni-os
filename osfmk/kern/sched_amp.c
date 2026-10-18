@@ -40,6 +40,7 @@
 #include <kern/processor.h>
 #include <kern/queue.h>
 #include <kern/sched.h>
+#include <kern/sched_common.h>
 #include <kern/sched_prim.h>
 #include <kern/sched_rt.h>
 #include <kern/task.h>
@@ -96,7 +97,7 @@ static thread_t
 sched_amp_choose_thread(processor_t processor, int priority, __unused thread_t prev, ast_t reason);
 
 static void
-sched_amp_processor_queue_shutdown(processor_t processor);
+sched_amp_processor_queue_shutdown(processor_t processor, struct pulled_thread_queue * threadq);
 
 static sched_mode_t
 sched_amp_initial_thread_sched_mode(task_t parent_task);
@@ -172,6 +173,8 @@ const struct sched_dispatch_table sched_amp_dispatch = {
 	.thread_group_recommendation_change             = sched_amp_thread_group_recommendation_change,
 	.cpu_init_completed                             = sched_amp_cpu_init_completed,
 	.thread_eligible_for_pset                       = sched_amp_thread_eligible_for_pset,
+	.update_pset_load_average                       = sched_amp_update_pset_load_average,
+	.update_pset_avg_execution_time                 = sched_update_pset_avg_execution_time,
 };
 
 extern processor_set_t ecore_set;
@@ -222,12 +225,10 @@ sched_amp_processor_init(processor_t processor)
 static void
 sched_amp_pset_init(processor_set_t pset)
 {
-	if (pset->pset_cluster_type == PSET_AMP_P) {
-		pset->pset_type = CLUSTER_TYPE_P;
+	if (pset->pset_type == PSET_AMP_P) {
 		pcore_set = pset;
 	} else {
-		assert(pset->pset_cluster_type == PSET_AMP_E);
-		pset->pset_type = CLUSTER_TYPE_E;
+		assert(pset->pset_type == PSET_AMP_E);
 		ecore_set = pset;
 	}
 	run_queue_init(&pset->pset_runq);
@@ -311,7 +312,7 @@ sched_amp_thread_should_yield(processor_t processor, thread_t thread)
 		return true;
 	}
 
-	if ((processor->processor_set->pset_cluster_type == PSET_AMP_E) && (recommended_pset_type(thread) == PSET_AMP_P)) {
+	if ((processor->processor_set->pset_type == PSET_AMP_E) && (recommended_pset_type(thread) == PSET_AMP_P)) {
 		return pcore_set && pcore_set->pset_runq.count > 0;
 	}
 
@@ -422,37 +423,20 @@ sched_amp_processor_bound_count(processor_t processor)
 }
 
 static void
-sched_amp_processor_queue_shutdown(processor_t processor)
+sched_amp_processor_queue_shutdown(processor_t processor, struct pulled_thread_queue * threadq)
 {
 	processor_set_t pset = processor->processor_set;
 	run_queue_t     rq   = amp_main_runq(processor);
-	thread_t        thread;
-	queue_head_t    tqueue;
 
 	/* We only need to migrate threads if this is the last active or last recommended processor in the pset */
-	if ((pset->online_processor_count > 0) && pset_is_recommended(pset)) {
-		pset_unlock(pset);
-		return;
-	}
-
-	queue_init(&tqueue);
-
-	while (rq->count > 0) {
-		thread = run_queue_dequeue(rq, SCHED_HEADQ);
-		enqueue_tail(&tqueue, &thread->runq_links);
+	if (pset->online_processor_count == 0 || !pset_is_recommended(pset)) {
+		while (rq->count > 0) {
+			thread_t thread = run_queue_dequeue(rq, SCHED_HEADQ);
+			pulled_thread_queue_enqueue(threadq, thread);
+		}
 	}
 
 	pset_unlock(pset);
-
-	qe_foreach_element_safe(thread, &tqueue, runq_links) {
-		remqueue(&thread->runq_links);
-
-		thread_lock(thread);
-
-		thread_setrun(thread, SCHED_TAILQ);
-
-		thread_unlock(thread);
-	}
 }
 
 static boolean_t
@@ -495,7 +479,7 @@ sched_amp_steal_thread(processor_set_t pset)
 	thread_t thread = THREAD_NULL;
 	processor_set_t nset = pset;
 
-	assert(pset->pset_cluster_type != PSET_AMP_P);
+	assert(pset->pset_type != PSET_AMP_P);
 
 	processor_t processor = current_processor();
 	assert(pset == processor->processor_set);
@@ -511,7 +495,7 @@ sched_amp_steal_thread(processor_set_t pset)
 
 	assert(nset != pset);
 
-	if (sched_get_pset_load_average(nset, 0) >= sched_amp_steal_threshold(nset, spill_pending)) {
+	if (sched_amp_get_pset_load_average(nset, 0) >= sched_amp_steal_threshold(nset, spill_pending)) {
 		pset_unlock(pset);
 
 		pset = nset;
@@ -519,12 +503,12 @@ sched_amp_steal_thread(processor_set_t pset)
 		pset_lock(pset);
 
 		/* Allow steal if load average still OK, no idle cores, and more threads on runq than active cores DISPATCHING */
-		if ((sched_get_pset_load_average(pset, 0) >= sched_amp_steal_threshold(pset, spill_pending)) &&
+		if ((sched_amp_get_pset_load_average(pset, 0) >= sched_amp_steal_threshold(pset, spill_pending)) &&
 		    (pset->pset_runq.count > bit_count(pset->cpu_state_map[PROCESSOR_DISPATCHING])) &&
 		    (bit_count(pset->recommended_bitmask & pset->cpu_state_map[PROCESSOR_IDLE]) == 0)) {
 			thread = run_queue_dequeue(&pset->pset_runq, SCHED_HEADQ);
 			KDBG(MACHDBG_CODE(DBG_MACH_SCHED, MACH_AMP_STEAL) | DBG_FUNC_NONE, spill_pending, 0, 0, 0);
-			sched_update_pset_load_average(pset, 0);
+			SCHED(update_pset_load_average)(pset, 0);
 		}
 	}
 
@@ -582,7 +566,7 @@ sched_amp_thread_update_scan(sched_update_scan_context_t scan_context)
 		thread_update_process_threads();
 	} while (restart_needed);
 
-	pset_node_t node = &pset_node0;
+	pset_node_t node = sched_boot_pset_node;
 	pset = node->psets;
 
 	do {
@@ -642,11 +626,11 @@ pcores_recommended(thread_t thread)
 static bool
 sched_amp_thread_avoid_processor(processor_t processor, thread_t thread, __unused ast_t reason)
 {
-	if (processor->processor_set->pset_cluster_type == PSET_AMP_E) {
+	if (processor->processor_set->pset_type == PSET_AMP_E) {
 		if (pcores_recommended(thread)) {
 			return true;
 		}
-	} else if (processor->processor_set->pset_cluster_type == PSET_AMP_P) {
+	} else if (processor->processor_set->pset_type == PSET_AMP_P) {
 		if (!pcores_recommended(thread)) {
 			return true;
 		}
@@ -666,10 +650,10 @@ sched_amp_choose_processor(processor_set_t pset, processor_t processor, thread_t
 
 	choose_pcores = pcores_recommended(thread);
 
-	if (choose_pcores && (pset->pset_cluster_type != PSET_AMP_P)) {
+	if (choose_pcores && (pset->pset_type != PSET_AMP_P)) {
 		nset = pcore_set;
 		assert(nset != NULL);
-	} else if (!choose_pcores && (pset->pset_cluster_type != PSET_AMP_E)) {
+	} else if (!choose_pcores && (pset->pset_type != PSET_AMP_E)) {
 		nset = ecore_set;
 		assert(nset != NULL);
 	}
@@ -712,12 +696,11 @@ sched_amp_thread_eligible_for_pset(thread_t thread, processor_set_t pset)
 		return true;
 	} else {
 		/* E-recommended threads are eligible to execute on E clusters only */
-		return pset->pset_cluster_type == PSET_AMP_E;
+		return pset->pset_type == PSET_AMP_E;
 	}
 }
 
-static char *pct_name[] = {
-	"PSET_SMP",
+static char *pct_name[MAX_PSET_TYPES] = {
 	"PSET_AMP_E",
 	"PSET_AMP_P"
 };
@@ -725,7 +708,7 @@ static char *pct_name[] = {
 static void
 sched_amp_cpu_init_completed(void)
 {
-	if (PE_parse_boot_argn("cpus", NULL, 0) || PE_parse_boot_argn("cpumask", NULL, 0)) {
+	if (!sched_is_standard_topology()) {
 		/* If number of cpus booted is restricted, these asserts may not be true */
 		return;
 	}
@@ -746,16 +729,14 @@ sched_amp_cpu_init_completed(void)
 	for (processor_t p = processor_list; p != NULL; p = p->processor_list) {
 		processor_set_t pset = p->processor_set;
 		kprintf("%s>cpu_id %02d in pset_id %02d type %s\n", __FUNCTION__, p->cpu_id, pset->pset_id,
-		    pct_name[pset->pset_cluster_type]);
+		    pct_name[pset->pset_type]);
 
 		assert(p == processor_array[p->cpu_id]);
-		assert(pset->pset_cluster_type != PSET_SMP);
-		if (pset->pset_cluster_type == PSET_AMP_E) {
-			assert(pset->pset_type == CLUSTER_TYPE_E);
+		assert(pset->pset_type != MAX_PSET_TYPES);
+		if (pset->pset_type == PSET_AMP_E) {
 			assert(pset == ecore_set);
 		} else {
-			assert(pset->pset_cluster_type == PSET_AMP_P);
-			assert(pset->pset_type == CLUSTER_TYPE_P);
+			assert(pset->pset_type == PSET_AMP_P);
 			assert(pset == pcore_set);
 		}
 	}

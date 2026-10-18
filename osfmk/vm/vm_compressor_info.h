@@ -30,6 +30,7 @@
 
 #if PRIVATE
 
+#include <stdint.h>
 #include <sys/cdefs.h>
 #include <mach/machine/kern_return.h>
 
@@ -41,7 +42,12 @@
  */
 struct c_slot_info {
 	uint16_t       csi_size;
+#if HAS_MTE
+	uint16_t       csi_mte_size:15,
+	    csi_mte_has_data:1;
+#else /* HAS_MTE */
 	uint16_t       csi_unused;
+#endif /* HAS_MTE */
 } __attribute__((packed));
 
 struct c_segment_info {
@@ -65,29 +71,26 @@ struct c_segment_info {
 } __attribute__((packed));
 
 #define VM_C_SEGMENT_INFO_MAGIC 'C002'
+#if HAS_MTE
+#define VM_C_SEGMENT_INFO_MAGIC_WITH_TAGS 'C103'
+#endif /* HAS_MTE */
 
 /*
- * vm_map_info_hdr and vm_map_entry_info are used for output of ###
- * a starting header gives the number of entries that follow, the every entry in the vm_map
- * is represented by a vm_map_entry_info
+ * vm_map_entry_info is used for output of compressor and slot info per entry in the map
  */
-struct vm_map_info_hdr {
-	int vmi_nentries;
-} __attribute__((packed));
-
 struct vm_map_entry_info {
-	vm_map_offset_t         vmei_start;          /* start address */
-	vm_map_offset_t         vmei_end;            /* end address */
-	unsigned long long
+	uint64_t         vmei_start;          /* start address */
+	uint64_t         vmei_end;            /* end address */
+	uint64_t
 	/* vm_tag_t          */ vmei_alias:12,   /* entry VM tag */
 	/* vm_object_offset_t*/ vmei_offset:(64 - 12); /* offset into object */
 	uint32_t vmei_is_sub_map: 1,
 	    vmei_is_compressor_pager: 1,
 	    vmei_protection: 3;
 	uint32_t vmei_slot_mapping_count;
-	int slot_mappings[0];
+	int slot_mappings[0];                 /* place-holder for binary data that follows */
 } __attribute__((packed));
 
-#define VM_MAP_ENTRY_INFO_MAGIC 'S001'
+#define VM_MAP_ENTRY_INFO_MAGIC 'S002'
 
 #endif /* PRIVATE */

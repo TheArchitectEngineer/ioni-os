@@ -136,7 +136,7 @@ struct __kern_buflet_ext {
 /* initialize struct __user_buflet from struct __kern_buflet */
 #define UBUF_INIT(_kbuf, _ubuf) do {                                    \
 	BUF_CTOR(_ubuf, 0, (_kbuf)->buf_idx, (_kbuf)->buf_dlim,         \
-	    (_kbuf)->buf_dlen, (_kbuf)->buf_doff, (_kbuf)->buf_nbft_addr,\
+	    (_kbuf)->buf_dlen, (_kbuf)->buf_doff, 0,                    \
 	    (_kbuf)->buf_nbft_idx, (_kbuf)->buf_flag);                  \
 	BUF_BFT_IDX_REG(_ubuf, (_kbuf)->buf_bft_idx_reg);              \
 } while (0)
@@ -810,7 +810,7 @@ SYSCTL_DECL(_kern_skywalk_packet);
 extern int pkt_trailers;
 #endif /* !DEVELOPMENT && !DEBUG */
 
-typedef void (pkt_copy_from_pkt_t)(const enum txrx, kern_packet_t,
+typedef int (pkt_copy_from_pkt_t)(const enum txrx, kern_packet_t,
     const uint16_t, kern_packet_t, const uint16_t, const uint32_t,
     const boolean_t, const uint16_t, const uint16_t, const boolean_t);
 
@@ -818,7 +818,7 @@ typedef void (pkt_copy_from_mbuf_t)(const enum txrx, kern_packet_t,
     const uint16_t, struct mbuf *, const uint16_t, const uint32_t,
     const boolean_t, const uint16_t);
 
-typedef void (pkt_copy_to_mbuf_t)(const enum txrx, kern_packet_t,
+typedef int (pkt_copy_to_mbuf_t)(const enum txrx, kern_packet_t,
     const uint16_t, struct mbuf *, const uint16_t, const uint32_t,
     const boolean_t, const uint16_t);
 

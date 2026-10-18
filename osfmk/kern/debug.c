@@ -116,6 +116,7 @@
 #include <mach/resource_monitors.h>
 #include <machine/machine_routines.h>
 #include <sys/proc_require.h>
+#include <vm/vm_compressor_internal.h>
 
 #include <os/log_private.h>
 
@@ -129,11 +130,13 @@ extern volatile struct xnu_hw_shmem_dbg_command_info *hwsd_info;
 #endif
 
 #include <san/kcov.h>
+#include <san/kcov_ksancov.h>
 
 #if CONFIG_XNUPOST
 #include <tests/xnupost.h>
-extern int vsnprintf(char *, size_t, const char *, va_list);
 #endif
+
+extern int vsnprintf(char *, size_t, const char *, va_list);
 
 #if CONFIG_CSR
 #include <sys/csr.h>
@@ -184,15 +187,14 @@ struct additional_panic_data_buffer *panic_data_buffers = NULL;
 #define panic_stop()    pmCPUHalt(PM_HALT_PANIC)
 #else
 #define panic_stop()    panic_spin_forever()
+_Atomic(unsigned int)   panic_stop_count;
 #endif
 
-#if defined(__arm64__) && (DEVELOPMENT || DEBUG)
 /*
  * More than enough for any typical format string passed to panic();
  * anything longer will be truncated but that's better than nothing.
  */
 #define EARLY_PANIC_BUFLEN 256
-#endif
 
 struct debugger_state {
 	uint64_t        db_panic_options;
@@ -325,7 +327,9 @@ boolean_t extended_debug_log_enabled = FALSE;
 #define KDBG_TRACE_PANIC_FILENAME "/var/log/panic.trace"
 #endif
 
+#if defined(__arm64__)
 static inline boolean_t debug_fatal_panic_begin(void);
+#endif
 
 /* Debugger state */
 atomic_int     debugger_cpu = DEBUGGER_NO_CPU;
@@ -385,6 +389,11 @@ SECURITY_READ_ONLY_LATE(vm_offset_t) phys_carveout = 0;
 SECURITY_READ_ONLY_LATE(uintptr_t) phys_carveout_pa = 0;
 SECURITY_READ_ONLY_LATE(size_t) phys_carveout_size = 0;
 
+#if DEVELOPMENT || DEBUG
+SECURITY_READ_ONLY_LATE(vm_offset_t) cputrace_carveout = 0;
+SECURITY_READ_ONLY_LATE(uintptr_t) cputrace_carveout_pa = 0;
+SECURITY_READ_ONLY_LATE(size_t) cputrace_carveout_size = 0;
+#endif /* DEVELOPMENT || DEBUG */
 
 #if CONFIG_SPTM && (DEVELOPMENT || DEBUG)
 /**
@@ -568,6 +577,8 @@ phys_carveout_init(void)
 			&phys_carveout_pa,
 			&phys_carveout_size,
 			phys_carveout_mb != 0,
+
+			/* Before Donan, XNU allocates the panic-trace carveout. */
 		}
 	};
 
@@ -805,6 +816,23 @@ debug_is_current_cpu_in_panic_state(void)
 	return current_debugger_state()->db_entry_count > 0;
 }
 
+#if defined(__arm64__)
+/*
+ * Helper function to compute kernel text exec slide and base values
+ */
+static void
+get_kernel_text_exec_slide_and_base(unsigned long *exec_slide, unsigned long *exec_base)
+{
+	extern vm_offset_t segTEXTEXECB, vm_kernel_slide;
+	void *kch = PE_get_kc_header(KCKindPrimary);
+
+	if (kch && exec_slide && exec_base) {
+		*exec_slide = (unsigned long)segTEXTEXECB - (unsigned long)kch + vm_kernel_slide;
+		*exec_base = (unsigned long)segTEXTEXECB;
+	}
+}
+#endif /* defined(__arm64__) */
+
 /*
  * check if we are in a nested panic, report findings, take evasive action where necessary
  *
@@ -820,6 +848,14 @@ check_and_handle_nested_panic(uint64_t panic_options_mask, unsigned long panic_c
 		// if we panic *after* the log is finalized then we will only see it in the serial log
 		//
 		paniclog_append_noflush("Nested panic detected - entry count: %d panic_caller: 0x%016lx\n", CPUDEBUGGERCOUNT, panic_caller);
+
+#if defined(__arm64__)
+		// Print kernel slide and base information for nested panics in order to enable symbolication
+		unsigned long kernel_text_exec_slide = 0, kernel_text_exec_base = 0;
+		get_kernel_text_exec_slide_and_base(&kernel_text_exec_slide, &kernel_text_exec_base);
+		paniclog_append_noflush("Kernel text exec slide: 0x%016lx\n", kernel_text_exec_slide);
+		paniclog_append_noflush("Kernel text exec base: 0x%016lx\n", kernel_text_exec_base);
+#endif /* defined(__arm64__) */
 		print_curr_backtrace();
 		paniclog_flush();
 
@@ -1221,6 +1257,15 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
 	read_lbr();
 #endif
 
+	/* For very early panics before XNU serial initialization. */
+	if (PE_kputc == NULL) {
+		char buf[EARLY_PANIC_BUFLEN];
+		vsnprintf(buf, EARLY_PANIC_BUFLEN, panic_format_str, *panic_args);
+		paniclog_append_noflush("panic: %s\n", buf);
+		paniclog_append_noflush("Kernel panicked very early before serial init, spinning forever...\n");
+		panic_spin_forever();
+	}
+
 	/* optionally call sync, to reduce lost logs on restart, avoid on recursive panic. Unsafe due to unbounded sync() duration */
 	if ((panic_options_mask & DEBUGGER_OPTION_SYNC_ON_PANIC_UNSAFE) && (CPUDEBUGGERCOUNT == 0)) {
 		sync_internal();
@@ -1275,15 +1320,16 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
 	ml_set_interrupts_enabled(FALSE);
 	disable_preemption();
 
+#if defined(__arm64__)
 	if (!debug_fatal_panic_begin()) {
 		/*
-		 * This CPU lost the race to be the first to panic. Re-enable
-		 * interrupts and dead loop here awaiting the debugger xcall from
-		 * the CPU that first panicked.
+		 * This CPU lost the race to be the first to panic. Mark our CPU
+		 * as quiesced and dead loop here.
 		 */
-		ml_set_interrupts_enabled(TRUE);
+		os_atomic_add(&panic_stop_count, 1, release);
 		panic_stop();
 	}
+#endif /* __arm64__ */
 
 #if defined (__x86_64__)
 	pmSafeMode(x86_lcpu(), PM_SAFE_FL_SAFE);
@@ -1412,6 +1458,8 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
 	/* Try not to break core dump path by sanitizer. */
 	kcov_panic_disable();
 #endif
+
+	ksancov_on_panic_log();
 
 	if ((debugger_current_op == DBOP_PANIC) ||
 	    ((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
@@ -1760,15 +1808,16 @@ handle_debugger_trap(unsigned int exception, unsigned int code, unsigned int sub
 #endif
 	} else {
 		/* note: this is the panic path...  */
+#if defined(__arm64__)
 		if (!debug_fatal_panic_begin()) {
 			/*
-			 * This CPU lost the race to be the first to panic. Re-enable
-			 * interrupts and dead loop here awaiting the debugger xcall from
-			 * the CPU that first panicked.
+			 * This CPU lost the race to be the first to panic. Mark our CPU
+			 * as quiesced and dead loop here.
 			 */
-			ml_set_interrupts_enabled(TRUE);
+			os_atomic_add(&panic_stop_count, 1, release);
 			panic_stop();
 		}
+#endif /* __arm64__ */
 #if defined(__arm64__) && (DEBUG || DEVELOPMENT)
 		if (!PE_arm_debug_and_trace_initialized()) {
 			paniclog_append_noflush("kernel panicked before debug and trace infrastructure initialized!\n"
@@ -2093,9 +2142,10 @@ panic_display_kernel_aslr(void)
 		paniclog_append_noflush("Kernel slide:      0x%016lx\n", vm_kernel_stext - (unsigned long)kch + vm_kernel_slide);
 		paniclog_append_noflush("Kernel text base:  %p\n", (void *) vm_kernel_stext);
 #if defined(__arm64__)
-		extern vm_offset_t segTEXTEXECB;
-		paniclog_append_noflush("Kernel text exec slide: 0x%016lx\n", (unsigned long)segTEXTEXECB - (unsigned long)kch + vm_kernel_slide);
-		paniclog_append_noflush("Kernel text exec base:  0x%016lx\n", (unsigned long)segTEXTEXECB);
+		unsigned long kernel_text_exec_slide = 0, kernel_text_exec_base = 0;
+		get_kernel_text_exec_slide_and_base(&kernel_text_exec_slide, &kernel_text_exec_base);
+		paniclog_append_noflush("Kernel text exec slide: 0x%016lx\n", kernel_text_exec_slide);
+		paniclog_append_noflush("Kernel text exec base:  0x%016lx\n", kernel_text_exec_base);
 #endif /* defined(__arm64__) */
 	} else if (vm_kernel_slide) {
 		paniclog_append_noflush("Kernel slide:      0x%016lx\n", (unsigned long) vm_kernel_slide);
@@ -2125,17 +2175,6 @@ panic_display_ecc_errors(void)
 }
 #endif /* CONFIG_ECC_LOGGING */
 
-#if CONFIG_FREEZE
-extern bool freezer_incore_cseg_acct;
-extern int32_t c_segment_pages_compressed_incore;
-#endif
-
-extern uint32_t c_segment_pages_compressed;
-extern uint32_t c_segment_count;
-extern uint32_t c_segments_limit;
-extern uint32_t c_segment_pages_compressed_limit;
-extern uint32_t c_segment_pages_compressed_nearing_limit;
-extern uint32_t c_segments_nearing_limit;
 extern int vm_num_swap_files;
 
 void
@@ -2202,6 +2241,7 @@ STARTUP(TUNABLES, STARTUP_RANK_LAST, kern_feature_override_init);
 
 #if MACH_ASSERT
 STATIC_IF_KEY_DEFINE_TRUE(mach_assert);
+STATIC_IF_KEY_DEFINE_TRUE(lck_rw_debug);
 #endif
 
 #if SCHED_HYGIENE_DEBUG
@@ -2214,6 +2254,7 @@ __static_if_init_func
 static void
 kern_feature_override_apply(const char *args)
 {
+	bool lck_rw_assert_disable = false;
 	uint64_t kf_ovrd;
 
 	/*
@@ -2225,10 +2266,20 @@ kern_feature_override_apply(const char *args)
 		kf_ovrd |= KF_SERVER_PERF_MODE_OVRD;
 	}
 
-#if DEBUG_RW
-	lck_rw_assert_init(args, kf_ovrd);
-#endif /* DEBUG_RW */
+	if (kf_ovrd & KF_MACH_ASSERT_OVRD) {
+		lck_rw_assert_disable = true;
+	}
+
 #if MACH_ASSERT
+	if (static_if_boot_arg_uint64(args, "lcks", 0) &
+	    LCK_OPTION_DISABLE_RW_DEBUG) {
+		lck_rw_assert_disable = true;
+	}
+
+	if (lck_rw_assert_disable) {
+		static_if_key_disable(lck_rw_debug);
+	}
+
 	if (kf_ovrd & KF_MACH_ASSERT_OVRD) {
 		static_if_key_disable(mach_assert);
 	}
@@ -2486,6 +2537,7 @@ set_awl_scratch_exists_flag_and_subscribe_for_pm(void)
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, set_awl_scratch_exists_flag_and_subscribe_for_pm);
 
+#if defined(__arm64__)
 /**
  * Signal that the system is going down for a panic. Returns true if it is safe to
  * proceed with the panic flow, false if we should re-enable interrupts and spin
@@ -2524,3 +2576,4 @@ debug_fatal_panic_begin(void)
 #endif /* CONFIG_SPTM */
 	return true;
 }
+#endif /* __arm64__ */

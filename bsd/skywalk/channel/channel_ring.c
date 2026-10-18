@@ -1746,15 +1746,21 @@ kr_internalize_metadata(struct kern_channel *ch,
 		kbuf->buf_doff = ubuf->buf_doff;
 
 		/*
-		 * kernel and user metadata use the same object index
-		 * also checks the sanity of buflet data offset and length
+		 * Check:
+		 * - sanity of buflet data offset and length
+		 * - kernel and user metadata use the same object index
+		 * - User hasn't modified nbft_idx: we don't allow user
+		 *   to construct multi buflet packets for tx.
 		 */
 		if (__improbable(!BUF_IN_RANGE(kbuf) ||
-		    ubuf->buf_idx != kbuf->buf_idx)) {
+		    ubuf->buf_idx != kbuf->buf_idx ||
+		    ubuf->buf_nbft_idx != kbuf->buf_nbft_idx)) {
 			kbuf->buf_dlen = kbuf->buf_doff = 0;
-			SK_ERR("%s(%d) kring %p bad bufidx 0x%x, 0x%x",
+			SK_ERR("%s(%d) kring %p bad bufidx 0x%x, 0x%x"
+			    " 0x%x, 0x%x",
 			    sk_proc_name(p), sk_proc_pid(p),
-			    SK_KVA(kring), kbuf->buf_idx, ubuf->buf_idx);
+			    SK_KVA(kring), kbuf->buf_idx, ubuf->buf_idx,
+			    kbuf->buf_nbft_idx, ubuf->buf_nbft_idx);
 			err = ERANGE;
 			goto done;
 		}
@@ -1765,7 +1771,12 @@ kr_internalize_metadata(struct kern_channel *ch,
 		}
 
 		/* all good to go */
-		len += kbuf->buf_dlen;
+		if (os_add_overflow(kbuf->buf_dlen, len, &len)) {
+			SK_ERR("%s(%d) buflet overflow",
+			    sk_proc_name(p), sk_proc_pid(p));
+			err = ERANGE;
+			goto done;
+		}
 		pubuf = ubuf;
 		pkbuf = kbuf;
 	}
@@ -1950,6 +1961,7 @@ kr_externalize_metadata(struct __kern_channel_ring *kring,
 	kr_externalize_metadata_internal(kring, maxfrags, kqum, p);
 }
 
+#if SK_LOG
 SK_NO_INLINE_ATTRIBUTE
 char *
 kr2str(const struct __kern_channel_ring *kr, char *__counted_by(dsz)dst,
@@ -1961,3 +1973,4 @@ kr2str(const struct __kern_channel_ring *kr, char *__counted_by(dsz)dst,
 
 	return dst;
 }
+#endif

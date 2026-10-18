@@ -63,6 +63,9 @@
 #include <pexpert/arm64/apt_msg.h>
 #endif
 
+#if HAS_MTE
+#include <arm64/mte_xnu.h>
+#endif /* HAS_MTE */
 
 /**
  * Functions defined elsewhere that are required by this source file.
@@ -193,7 +196,21 @@ extern boolean_t force_immediate_debug_halt;
 SECURITY_READ_ONLY_LATE(boolean_t) diversify_user_jop = TRUE;
 #endif
 
+#if HAS_MTE
+#if DEVELOPMENT || DEBUG || KASAN
+/* mte_config= */
+STATIC_IF_KEY_DEFINE_TRUE(mte_config_kern_enabled);
+STATIC_IF_KEY_DEFINE_TRUE(mte_config_kern_data_enabled);
+STATIC_IF_KEY_DEFINE_TRUE(mte_config_user_enabled);
+STATIC_IF_KEY_DEFINE_TRUE(mte_config_user_data_enabled);
 
+/* mte_debug= */
+STATIC_IF_KEY_DEFINE_FALSE(mte_config_force_all_enabled);
+STATIC_IF_KEY_DEFINE_FALSE(mte_debug_tco_state);
+STATIC_IF_KEY_DEFINE_FALSE(mte_panic_on_non_canonical);
+STATIC_IF_KEY_DEFINE_FALSE(mte_panic_on_async_fault);
+#endif /* DEVELOPMENT || DEBUG || KASAN */
+#endif /* HAS_MTE */
 
 SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
 SECURITY_READ_ONLY_LATE(uint64_t) gDramSize;
@@ -250,6 +267,63 @@ extern vm_offset_t segLOWESTKC, segHIGHESTKC, segLOWESTROKC, segHIGHESTROKC;
 extern vm_offset_t segLOWESTAuxKC, segHIGHESTAuxKC, segLOWESTROAuxKC, segHIGHESTROAuxKC;
 extern vm_offset_t segLOWESTRXAuxKC, segHIGHESTRXAuxKC, segHIGHESTNLEAuxKC;
 
+#if HAS_MTE
+#if DEVELOPMENT || DEBUG || KASAN
+
+#define MTE_EVAL_BOOTARG(setting, config, key) do {     \
+	if ((config) & (setting)) {                         \
+	        static_if_key_enable(key);                  \
+	} else {                                            \
+	        static_if_key_disable(key);                 \
+	}                                                   \
+} while (0)
+
+__static_if_init_func
+static void
+mte_config_setup(const char *args)
+{
+	mte_config_t mte_config;
+	mte_debug_config_t mte_debug_config;
+
+	/* On debug kernels, honor mte_config and mte_debug boot-args. */
+	mte_config = (mte_config_t)static_if_boot_arg_uint64(args, "mte_config", MTE_CONFIG_DEFAULT);
+	mte_debug_config = (mte_debug_config_t)static_if_boot_arg_uint64(args, "mte_debug", MTE_DEBUG_DEFAULT);
+
+	/* -disable_mte is the legacy big hammer that switches off all of MTE */
+	if (static_if_boot_arg_uint64(args, "-disable_mte", 0)) {
+		mte_config = MTE_CONFIG_DISABLE_ALL;
+		mte_debug_config = MTE_DEBUG_DISABLE_ALL;
+	}
+#if KASAN
+	/* Until KASAN supports MTE, force disable. */
+	mte_config = MTE_CONFIG_DISABLE_ALL;
+	mte_debug_config = MTE_DEBUG_DISABLE_ALL;
+#endif /* KASAN */
+
+	MTE_EVAL_BOOTARG(MTE_ENABLE_KERNEL, mte_config, mte_config_kern_enabled);
+	MTE_EVAL_BOOTARG(MTE_ENABLE_KERNEL_PURE_DATA, mte_config, mte_config_kern_data_enabled);
+	MTE_EVAL_BOOTARG(MTE_ENABLE_USER, mte_config, mte_config_user_enabled);
+	MTE_EVAL_BOOTARG(MTE_ENABLE_USER_PURE_DATA, mte_config, mte_config_user_data_enabled);
+
+	/* Panic on invalid configurations. */
+	if (mte_kern_data_enabled() && !mte_kern_enabled()) {
+		panic("Kernel DATA tagging requires kernel tagging");
+	}
+
+	if (mte_user_data_enabled() && !mte_user_enabled()) {
+		panic("User DATA tagging requires user tagging");
+	}
+
+	MTE_EVAL_BOOTARG(MTE_USER_FORCE_ENABLE_ALL, mte_debug_config, mte_config_force_all_enabled);
+	MTE_EVAL_BOOTARG(MTE_DEBUG_TCO_STATE, mte_debug_config, mte_debug_tco_state);
+	MTE_EVAL_BOOTARG(MTE_PANIC_ON_NON_CANONICAL_PARAM, mte_debug_config, mte_panic_on_non_canonical);
+	MTE_EVAL_BOOTARG(MTE_PANIC_ON_ASYNC_FAULT, mte_debug_config, mte_panic_on_async_fault);
+
+}
+
+STATIC_IF_INIT(mte_config_setup);
+#endif /* DEVELOPMENT || DEBUG || KASAN */
+#endif /* HAS_MTE */
 
 void arm_slide_rebase_and_sign_image(void);
 MARK_AS_FIXUP_TEXT void
@@ -818,16 +892,16 @@ arm_init(boot_args *args, sptm_bootstrap_args_xnu_t *sptm_boot_args)
 
 	siq_init();
 
-	master_cpu = ml_get_boot_cpu_number();
-	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
+	boot_cpu_id = ml_get_boot_cpu_number();
+	assert(boot_cpu_id >= 0 && boot_cpu_id <= ml_get_max_cpu_number());
 
-	BootCpuData.cpu_number = (unsigned short)master_cpu;
+	BootCpuData.cpu_number = (unsigned short)boot_cpu_id;
 	BootCpuData.intstack_top = (vm_offset_t) &intstack_top;
 	BootCpuData.istackptr = &intstack_top;
 	BootCpuData.excepstack_top = (vm_offset_t) &excepstack_top;
 	BootCpuData.excepstackptr = &excepstack_top;
-	CpuDataEntries[master_cpu].cpu_data_vaddr = &BootCpuData;
-	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
+	CpuDataEntries[boot_cpu_id].cpu_data_vaddr = &BootCpuData;
+	CpuDataEntries[boot_cpu_id].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
 	    + ((uintptr_t)&BootCpuData
 	    - (uintptr_t)(args->virtBase)));
 
@@ -896,6 +970,9 @@ arm_init(boot_args *args, sptm_bootstrap_args_xnu_t *sptm_boot_args)
 	__builtin_arm_wsr("pan", 1);
 #endif  /* __ARM_PAN_AVAILABLE__ */
 
+#if HAS_MTE
+	arm_mte_tag_generator_init(true);
+#endif
 
 	/**
 	 * Check SPTM feature flag for ARM_LARGE_MEMORY irrespective of XNU
@@ -964,6 +1041,14 @@ arm_init(boot_args *args, sptm_bootstrap_args_xnu_t *sptm_boot_args)
 	const unsigned int serial_exists = serial_init();
 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
 	kprintf("kprintf initialized\n");
+
+	/**
+	 * Disable SPTM serial output just after XNU serial initialization
+	 * since serial_init() can itself panic in various cases. Most commonly
+	 * seen hard to debug issue being user error with bad setting of serial
+	 * boot-args such as serial-device/serial-device-name.
+	 */
+	sptm_serial_disable();
 
 	serialmode = 0;
 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
@@ -1103,15 +1188,48 @@ arm_init_cpu(
 
 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
 
+#if HAS_MTE
+	arm_mte_tag_generator_init(false);
+#endif
 
 #if HIBERNATION
 	if (hibargs != 0 && hibargs->hib_header_phys != 0) {
 		gIOHibernateState = kIOHibernateStateWakingFromHibernate;
 		uart_hibernation = true;
 
+#if HAS_MTE
+		/*
+		 * On hibernation exit, the hibtext had copied the hibernation
+		 * header into a "borrowed" free physical page, by simply
+		 * picking a physical page that was not covered by the
+		 * hibernation image (meaning that xnu does not care about its
+		 * content). This was done to make sure the hibernation header
+		 * itself would not be overwritten by hibernation restore.
+		 *
+		 * MTE however keeps some nominally "free" pages in so called
+		 * "freepage queues". Just like regular free pages, their content
+		 * does not matter and they are not hibernated, but they are kept
+		 * for easier MTE page hand-out, and as such have MAIR=0x4 set.
+		 * I.e., they are effetively MTE-tagged.
+		 *
+		 * If the hibtext, who has no idea what MAIR a "free" page
+		 * has, happens to pick such a page, then the code below will
+		 * effectively try to access an MTE tagged page using an
+		 * untagged physical aperture pointer, originally resulting in
+		 * a tag check exception.
+		 *
+		 * At this still early point in hibernation, this is easily
+		 * circumenvented by temporarily turning off MTE tag checking
+		 * altogether.
+		 */
+		vm_memtag_disable_checking();
+#endif /* HAS_MTE */
 
 		__nosan_memcpy(gIOHibernateCurrentHeader, (void*)phystokv(hibargs->hib_header_phys), sizeof(IOHibernateImageHeader));
 
+#if HAS_MTE
+		vm_memtag_enable_checking();
+#endif /* HAS_MTE */
 	}
 	if ((cpu_data_ptr == &BootCpuData) && (gIOHibernateState == kIOHibernateStateWakingFromHibernate) && ml_is_quiescing()) {
 		// the "normal" S2R code captures wake_abstime too early, so on a hibernation resume we fix it up here
@@ -1681,11 +1799,19 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 	 */
 	gPhysSize = mem_size = ((gPhysBase + memSize) & ~PAGE_MASK) - gPhysBase;
 
-
-
 	/* Obtain total memory size, including non-managed memory */
 	mem_actual = args->memSizeActual ? args->memSizeActual : mem_size;
 	if ((memory_size_override != 0) && (mem_size > memory_size_override)) {
+#if HAS_MTE
+		/*
+		 * When MTE is enabled, we cannot just override the size of the memory
+		 * because the tag storage region is usually at the end of memory
+		 * and tag storage pages need to be in the VM array.
+		 * Instead, initialize_ram_ranges will adjust the number of available
+		 * memory and tag storage pages to the VM
+		 */
+		if (!mte_enabled())
+#endif /* HAS_MTE */
 		{
 			mem_size = memory_size_override;
 		}
@@ -1783,8 +1909,21 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 
 		assert(segKCTEXTEXECB <= segLASTB);                                    // KC TEXT_EXEC must contain kernel LAST
 		assert(segKCTEXTEXECB + segSizeKCTEXTEXEC >= segLASTB + segSizeLAST);
-		segPLKTEXTEXECB = segLASTB + segSizeLAST;
-		segSizePLKTEXTEXEC = segSizeKCTEXTEXEC - (segPLKTEXTEXECB - segKCTEXTEXECB);
+
+		if (segTEXTEXECB == segKCTEXTEXECB) {
+			segPLKTEXTEXECB = segLASTB + segSizeLAST;
+			segSizePLKTEXTEXEC = segSizeKCTEXTEXEC - (segPLKTEXTEXECB - segKCTEXTEXECB);
+		} else {
+			/**
+			 * In the KC's __TEXT_EXEC segment, the __TEXT_EXEC segments of the kexts are placed before the kernel's
+			 * __TEXT_EXEC segment. This is because the KC's __TEXT_BOOT_EXEC segment is placed after its __TEXT_EXEC
+			 * segment, and there are branch instructions between it and the kernel's __TEXT_EXEC segment. With this
+			 * arrangement, the __TEXT_EXEC segments of the kexts cannot be placed in between them because it can get
+			 * arbitrarily large and the branch distance can go beyond the +-128M limit.
+			 */
+			segPLKTEXTEXECB = segKCTEXTEXECB;
+			segSizePLKTEXTEXEC = segTEXTEXECB - segKCTEXTEXECB;
+		}
 
 		// fileset has kext PLK_DATA_CONST under kernel collection DATA_CONST following kernel's LASTDATA_CONST
 		segKCDATACONSTB = (vm_offset_t) getsegdatafromheader(kc_mh, "__DATA_CONST", &segSizeKCDATACONST);
@@ -1825,13 +1964,26 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 	vm_kernel_base = segTEXTB;
 	vm_kernel_top = (vm_offset_t) &last_kernel_symbol;
 	vm_kext_base = segPRELINKTEXTB;
-	vm_kext_top = vm_kext_base + segSizePRELINKTEXT;
+	if (!segSizePLKTEXTEXEC && !segSizePLKDATACONST) {
+		vm_kext_top = vm_kext_base + segSizePRELINKTEXT;
+	} else {
+		/**
+		 * When the PLK (i.e. kext) __TEXT_EXEC and __DATA_CONST ranges are
+		 * present, the top of the kext text is the end of the PLK __TEXT_EXEC
+		 * range computed above.
+		 */
+		vm_kext_top = segPLKTEXTEXECB + segSizePLKTEXTEXEC;
+	}
 
 	vm_prelink_stext = segPRELINKTEXTB;
 	if (!segSizePLKTEXTEXEC && !segSizePLKDATACONST) {
 		vm_prelink_etext = segPRELINKTEXTB + segSizePRELINKTEXT;
 	} else {
-		vm_prelink_etext = segPRELINKTEXTB + segSizePRELINKTEXT + segSizePLKDATACONST + segSizePLKTEXTEXEC;
+		/**
+		 * Same as vm_kext_top, the end of the kext text in this case is the end
+		 * of the PLK __TEXT_EXEC range.
+		 */
+		vm_prelink_etext = segPLKTEXTEXECB + segSizePLKTEXTEXEC;
 	}
 	vm_prelink_sinfo = segPRELINKINFOB;
 	vm_prelink_einfo = segPRELINKINFOB + segSizePRELINKINFO;
@@ -1857,10 +2009,6 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 	physmap_vtop = physmap_end;
 	kasan_init();
 #endif /* KASAN */
-
-#if CONFIG_CPU_COUNTERS
-	mt_early_init();
-#endif /* CONFIG_CPU_COUNTERS */
 
 	kva_active = TRUE;
 
@@ -1965,8 +2113,7 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 		while (va_l2 < va_l2_end) {
 			/* Obtain pre-allocated page and setup L3 Table TTE in L2 */
 			tt_entry_t *ttp = pmap_tt2e(kernel_pmap, va_l2);
-			pt_entry_t *ptp = (pt_entry_t *)phystokv(tte_to_pa(*ttp));
-			pmap_init_pte_page(kernel_pmap, ptp, va_l2, 3, TRUE);
+			pmap_init_pte_page(kernel_pmap, tte_to_pa(*ttp), va_l2, 3, TRUE);
 
 			va_l2 += ARM_TT_L2_SIZE;
 			cpu_l2_tte++;
@@ -2006,8 +2153,7 @@ arm_vm_init(uint64_t memory_size_override, boot_args * args)
 		while (va_l2 < va_l2_end) {
 			/* Obtain pre-allocated page and setup L3 Table TTE in L2 */
 			tt_entry_t *ttp = pmap_tt2e(kernel_pmap, va_l2);
-			pt_entry_t *ptp = (pt_entry_t *)phystokv(tte_to_pa(*ttp));
-			pmap_init_pte_page(kernel_pmap, ptp, va_l2, 3, TRUE);
+			pmap_init_pte_page(kernel_pmap, tte_to_pa(*ttp), va_l2, 3, TRUE);
 
 			va_l2 += ARM_TT_L2_SIZE;
 			cpu_l2_tte++;

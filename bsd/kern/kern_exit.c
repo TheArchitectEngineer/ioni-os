@@ -141,6 +141,10 @@
 
 #include <kdp/kdp_dyld.h>
 
+#include <kern/telemetry.h>
+
+#include <libkern/coreanalytics/coreanalytics.h>
+
 #if SYSV_SHM
 #include <sys/shm_internal.h>   /* shmexit */
 #endif /* SYSV_SHM */
@@ -180,7 +184,7 @@ __private_extern__ void munge_user32_rusage(struct rusage *a_rusage_p, struct us
 static void populate_corpse_crashinfo(proc_t p, task_t corpse_task,
     struct rusage_superset *rup, mach_exception_data_type_t code,
     mach_exception_data_type_t subcode, uint64_t *udata_buffer,
-    int num_udata, os_reason_t reason, exception_type_t etype);
+    int num_udata, os_reason_t reason, exception_type_t etype, mach_exception_data_type_t saved_code);
 static void proc_update_corpse_exception_codes(proc_t p, mach_exception_data_type_t *code, mach_exception_data_type_t *subcode);
 extern int proc_pidpathinfo_internal(proc_t p, uint64_t arg, char *buffer, uint32_t buffersize, int32_t *retval);
 extern void proc_piduniqidentifierinfo(proc_t p, struct proc_uniqidentifierinfo *p_uniqidinfo);
@@ -188,9 +192,9 @@ extern void task_coalition_ids(task_t task, uint64_t ids[COALITION_NUM_TYPES]);
 extern uint64_t get_task_phys_footprint_limit(task_t);
 int proc_list_uptrs(void *p, uint64_t *udata_buffer, int size);
 extern uint64_t task_corpse_get_crashed_thread_id(task_t corpse_task);
-
+extern void get_task_crashinfo_voucher(task_t corpse_task, void *crash_info_ptr);
 extern unsigned int exception_log_max_pid;
-
+extern sandbox_profile_cbfunc_t mac_proc_get_sandbox_profile;
 extern void IOUserServerRecordExitReason(task_t task, os_reason_t reason);
 
 /*
@@ -425,7 +429,7 @@ gather_populate_corpse_crashinfo(proc_t p, task_t corpse_task,
 	gather_rusage_info(p, &rup.ri, RUSAGE_INFO_CURRENT);
 	rup.ri.ri_phys_footprint = 0;
 	populate_corpse_crashinfo(p, corpse_task, &rup, code, subcode,
-	    udata_buffer, num_udata, reason, etype);
+	    udata_buffer, num_udata, reason, etype, code);
 }
 
 static void
@@ -436,6 +440,7 @@ proc_update_corpse_exception_codes(proc_t p, mach_exception_data_type_t *code, m
 	if (p->p_exit_reason == OS_REASON_NULL) {
 		return;
 	}
+	uint64_t encoded_limit = (get_task_phys_footprint_limit(proc_task(p))) >> 20;
 
 	switch (p->p_exit_reason->osr_namespace) {
 	case OS_REASON_JETSAM:
@@ -443,9 +448,14 @@ proc_update_corpse_exception_codes(proc_t p, mach_exception_data_type_t *code, m
 			/* Update the code with EXC_RESOURCE code for high memory watermark */
 			EXC_RESOURCE_ENCODE_TYPE(code_update, RESOURCE_TYPE_MEMORY);
 			EXC_RESOURCE_ENCODE_FLAVOR(code_update, FLAVOR_HIGH_WATERMARK);
-			EXC_RESOURCE_HWM_ENCODE_LIMIT(code_update, ((get_task_phys_footprint_limit(proc_task(p))) >> 20));
+			EXC_RESOURCE_HWM_ENCODE_LIMIT(code_update, encoded_limit);
 			subcode_update = 0;
-			break;
+		} else if (p->p_exit_reason->osr_code == JETSAM_REASON_MEMORY_CONCLAVELIMIT) {
+			/* Update the code with EXC_RESOURCE code for conclave limit */
+			EXC_RESOURCE_ENCODE_TYPE(code_update, RESOURCE_TYPE_MEMORY);
+			EXC_RESOURCE_ENCODE_FLAVOR(code_update, FLAVOR_CONCLAVE_LIMIT);
+			EXC_RESOURCE_HWM_ENCODE_LIMIT(code_update, encoded_limit);
+			subcode_update = 0;
 		}
 
 		break;
@@ -476,7 +486,8 @@ proc_encode_exit_exception_code(proc_t p)
 static void
 populate_corpse_crashinfo(proc_t p, task_t corpse_task, struct rusage_superset *rup,
     mach_exception_data_type_t code, mach_exception_data_type_t subcode,
-    uint64_t *udata_buffer, int num_udata, os_reason_t reason, exception_type_t etype)
+    uint64_t *udata_buffer, int num_udata, os_reason_t reason, exception_type_t etype,
+    __unused mach_exception_data_type_t saved_code)
 {
 	mach_vm_address_t uaddr = 0;
 	mach_exception_data_type_t exc_codes[EXCEPTION_CODE_MAX];
@@ -855,7 +866,7 @@ populate_corpse_crashinfo(proc_t p, task_t corpse_task, struct rusage_superset *
 #if CONFIG_UCOREDUMP
 	if (do_ucoredump && !task_is_driver(proc_task(p)) &&
 	    KERN_SUCCESS == kcdata_get_memory_addr(crash_info_ptr, TASK_CRASHINFO_CORE_ALLOWED, sizeof(uint8_t), &uaddr)) {
-		const uint8_t allow = is_coredump_eligible(p) == 0;
+		const uint8_t allow = p == current_proc() && is_coredump_eligible(p) == 0;
 		kcdata_memcpy(crash_info_ptr, uaddr, &allow, sizeof(allow));
 	}
 #endif /* CONFIG_UCOREDUMP */
@@ -864,6 +875,34 @@ populate_corpse_crashinfo(proc_t p, task_t corpse_task, struct rusage_superset *
 		reason = p->p_exit_reason;
 	}
 
+#if HAS_MTE
+	/* For MTE-related failures, we add the tag data for the whole faulting address's page */
+	uint32_t guard_type = EXC_GUARD_DECODE_GUARD_TYPE(saved_code);
+	uint32_t guard_flavor = EXC_GUARD_DECODE_GUARD_FLAVOR(saved_code);
+
+	/*
+	 * Extract tag data information for any possible synchronous or asynchronous MTE
+	 * failure (both in hard and soft mode).
+	 */
+	if ((reason != OS_REASON_NULL && reason->osr_namespace == OS_REASON_MTE_FAIL) ||
+	    (etype == EXC_GUARD && guard_type == GUARD_TYPE_VIRT_MEMORY && vm_guard_is_mte_fault(guard_flavor))) {
+		vm_map_t task_map = get_task_map(corpse_task);
+		if (task_map != kernel_map) {
+			/* subcode is the faulting address, see propagation from  handle_user_abort */
+			vm_address_t page_addr = vm_map_trunc_page_mask(subcode, PAGE_MASK);
+			vm_address_t canonicalized_page_addr = vm_memtag_canonicalize(task_map, page_addr);
+			struct crashinfo_mb tag_info = {
+				.start_address = canonicalized_page_addr,
+				.data = {0},
+			};
+			kern_return_t res = vm_map_page_tags_get(task_map, canonicalized_page_addr, tag_info.data, (sizeof(tag_info.data)));
+			if (KERN_SUCCESS == res &&
+			    KERN_SUCCESS == kcdata_get_memory_addr(crash_info_ptr, TASK_CRASHINFO_MB, sizeof(struct crashinfo_mb), &uaddr)) {
+				kcdata_memcpy(crash_info_ptr, uaddr, &tag_info, sizeof(tag_info));
+			}
+		}
+	}
+#endif /* HAS_MTE */
 
 	if (reason != OS_REASON_NULL) {
 		if (KERN_SUCCESS == kcdata_get_memory_addr(crash_info_ptr, EXIT_REASON_SNAPSHOT, sizeof(struct exit_reason_snapshot), &uaddr)) {
@@ -896,6 +935,27 @@ populate_corpse_crashinfo(proc_t p, task_t corpse_task, struct rusage_superset *
 #if CONFIG_EXCLAVES
 	task_add_conclave_crash_info(corpse_task, crash_info_ptr);
 #endif /* CONFIG_EXCLAVES */
+
+	get_task_crashinfo_voucher(corpse_task, crash_info_ptr);
+
+#if CONFIG_MACF && !XNU_TARGET_OS_OSX
+	/* The profile name is almost always unset on macOS, so we don't try to get it there. */
+	char sandbox_profile[MAX_CRASHINFO_SANDBOX_PROFILE_LEN] = {};
+	if (KERN_SUCCESS == kcdata_get_memory_addr(crash_info_ptr, TASK_CRASHINFO_SANDBOX_PROFILE, sizeof(sandbox_profile), &uaddr)) {
+		if (mac_proc_get_sandbox_profile) {
+			ret = mac_proc_get_sandbox_profile(p, sandbox_profile, sizeof(sandbox_profile));
+			if (ret == KERN_SUCCESS) {
+				kcdata_memcpy(crash_info_ptr, uaddr, &sandbox_profile, sizeof(sandbox_profile));
+			} else if (ret == KERN_NOT_FOUND) {
+				strlcpy(sandbox_profile, "no profile", sizeof(sandbox_profile));
+				kcdata_memcpy(crash_info_ptr, uaddr, &sandbox_profile, sizeof(sandbox_profile));
+			} else if (ret == KERN_INVALID_NAME) {
+				strlcpy(sandbox_profile, "no name", sizeof(sandbox_profile));
+				kcdata_memcpy(crash_info_ptr, uaddr, &sandbox_profile, sizeof(sandbox_profile));
+			}
+		}
+	}
+#endif // CONFIG_MACF && !XNU_TARGET_OS_OSX
 }
 
 exception_type_t
@@ -1374,7 +1434,82 @@ static TUNABLE(bool, bootarg_disable_user_faults, "-disable_user_faults", false)
 
 #define OS_REASON_IFLAG_USER_FAULT 0x1
 
-#define OS_REASON_TOTAL_USER_FAULTS_PER_PROC  5
+#define OS_REASON_GLOBAL_USER_FAULTS_PER_PROC  5
+#define OS_REASON_SECURITY_USER_FAULTS_PER_PROC  3
+
+/*
+ * Brief: This function contains logic
+ * that decides whether fault must be throttled.
+ * Decision is maded based on :
+ * @params:
+ * @p p - process to fault;
+ * @p reason_namespace - Currently, we support one global
+ * per process limit of faults as well as separate per namespace
+ * limit (for special namespaces only, which is only `OS_REASON_SECURITY_SOFT_TRAPS` atm
+ * due to <rdar://162804858> and "DEP-162804858")
+ * @p internal_flags - Only OS_REASON_IFLAG_USER_FAULT is throttled
+ *
+ * Returns:
+ * true - if fault must be throttled, false otherwise (increments fault counter)
+ */
+__static_testable __inline_testable bool
+abort_should_be_throttled(proc_t p,
+    uint32_t reason_namespace, uint32_t internal_flags)
+{
+	int faults_idx = PROC_P_USER_FAULTS_GLOBAL_IDX;
+	size_t total_limit = OS_REASON_GLOBAL_USER_FAULTS_PER_PROC;
+	if (reason_namespace == OS_REASON_SECURITY_SOFT_TRAPS) {
+		faults_idx = PROC_P_USER_FAULTS_SOFT_TRAPS_IDX;
+		total_limit = OS_REASON_SECURITY_USER_FAULTS_PER_PROC;
+	}
+	if (!(internal_flags & OS_REASON_IFLAG_USER_FAULT)) {
+		/* non user fault must not be throttled */
+		return false;
+	}
+
+#if DEVELOPMENT || DEBUG
+	if (bootarg_disable_user_faults) {
+		return true;
+	}
+#endif /* DEVELOPMENT || DEBUG */
+
+	uint16_t old_value = atomic_load_explicit(&p->p_user_faults[faults_idx],
+	    memory_order_relaxed);
+
+	for (;;) {
+		if (old_value >= total_limit) {
+			return true;
+		}
+		// this reloads the value in old_value
+		if (atomic_compare_exchange_strong_explicit(&p->p_user_faults[faults_idx],
+		    &old_value, old_value + 1, memory_order_relaxed,
+		    memory_order_relaxed)) {
+			break;
+		}
+	}
+	return false;
+}
+
+__static_testable __inline_testable bool
+user_fault_prefers_backtrace(uint64_t __unused reason_flags,
+    bool platform_is_macosx)
+{
+	/*
+	 * For backward compatibility for now we have the following policy:
+	 *      - For MacOSX - full corpse is used by default;
+	 *      - For for everything else - LW corpse is used by default;
+	 *
+	 * TODO: For the radar below we will have to change this policy to generate LW corpses by default
+	 * rdar://155468353 (Consider using Lightweight Corpses for all 1st party crashes)
+	 *
+	 */
+	if (platform_is_macosx) {
+		return false; // Always full corpse for now
+	}
+
+	return true;
+}
+
 
 static int
 abort_with_payload_internal(proc_t p,
@@ -1386,27 +1521,8 @@ abort_with_payload_internal(proc_t p,
 	os_reason_t exit_reason = OS_REASON_NULL;
 	kern_return_t kr = KERN_SUCCESS;
 
-	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
-		uint32_t old_value = atomic_load_explicit(&p->p_user_faults,
-		    memory_order_relaxed);
-
-#if DEVELOPMENT || DEBUG
-		if (bootarg_disable_user_faults) {
-			return EQFULL;
-		}
-#endif /* DEVELOPMENT || DEBUG */
-
-		for (;;) {
-			if (old_value >= OS_REASON_TOTAL_USER_FAULTS_PER_PROC) {
-				return EQFULL;
-			}
-			// this reloads the value in old_value
-			if (atomic_compare_exchange_strong_explicit(&p->p_user_faults,
-			    &old_value, old_value + 1, memory_order_relaxed,
-			    memory_order_relaxed)) {
-				break;
-			}
-		}
+	if (abort_should_be_throttled(p, reason_namespace, internal_flags)) {
+		return EQFULL;
 	}
 
 	KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
@@ -1417,16 +1533,26 @@ abort_with_payload_internal(proc_t p,
 	    payload, payload_size, reason_string, reason_flags | OS_REASON_FLAG_ABORT);
 
 	if (internal_flags & OS_REASON_IFLAG_USER_FAULT) {
-		mach_exception_code_t code = 0;
-
-		EXC_GUARD_ENCODE_TYPE(code, GUARD_TYPE_USER); /* simulated EXC_GUARD */
-		EXC_GUARD_ENCODE_FLAVOR(code, 0);
-		EXC_GUARD_ENCODE_TARGET(code, reason_namespace);
-
-		if (exit_reason == OS_REASON_NULL) {
-			kr = KERN_RESOURCE_SHORTAGE;
+		if (reason_namespace == OS_REASON_SECURITY_SOFT_TRAPS) {
+			os_user_fault_send_ca_event(reason_namespace, reason_code);
 		} else {
-			kr = task_violated_guard(code, reason_code, exit_reason, TRUE);
+			mach_exception_code_t code = 0;
+
+			EXC_GUARD_ENCODE_TYPE(code, GUARD_TYPE_USER); /* simulated EXC_GUARD */
+			EXC_GUARD_ENCODE_FLAVOR(code, 0);
+			EXC_GUARD_ENCODE_TARGET(code, reason_namespace);
+
+			if (exit_reason == OS_REASON_NULL) {
+				kr = KERN_RESOURCE_SHORTAGE;
+			} else {
+#if XNU_TARGET_OS_OSX
+				bool is_macosx = true;
+#else
+				bool is_macosx = false;
+#endif
+				bool backtrace_only = user_fault_prefers_backtrace(reason_flags, is_macosx);
+				kr = task_violated_guard(code, reason_code, exit_reason, backtrace_only);
+			}
 		}
 		os_reason_free(exit_reason);
 	} else {
@@ -1898,7 +2024,7 @@ proc_handle_critical_exit(proc_t p, int rv)
 void
 proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
 {
-	mach_exception_data_type_t code = 0, subcode = 0;
+	mach_exception_data_type_t code = 0, subcode = 0, saved_code = 0;
 	exception_type_t etype;
 
 	struct uthread *ut;
@@ -1947,15 +2073,19 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
 		 * Crash Reporter looks for the signal value, original exception
 		 * type, and low 20 bits of the original code in code[0]
 		 * (8, 4, and 20 bits respectively). code[1] is unmodified.
+		 * We still pass down to populate_corpse_crashinfo() the original
+		 * code, to parse flavor/type in case of a EXC_GUARD.
 		 */
 		code = ((WTERMSIG(rv) & 0xff) << 24) |
 		    ((ut->uu_exception & 0x0f) << 20) |
 		    ((int)ut->uu_code & 0xfffff);
+
+		saved_code = ut->uu_code;
 		subcode = ut->uu_subcode;
 		etype = ut->uu_exception;
 
 		/* Defualt to EXC_CRASH if the exception is not an EXC_RESOURCE or EXC_GUARD */
-		if (etype != EXC_RESOURCE || etype != EXC_GUARD) {
+		if (etype != EXC_RESOURCE && etype != EXC_GUARD) {
 			etype = EXC_CRASH;
 		}
 
@@ -1974,8 +2104,7 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
 			}
 		}
 #endif
-		const bool fatal = false;
-		kr = task_exception_notify(EXC_CRASH, code, subcode, fatal);
+		kr = task_exception_notify(EXC_CRASH, code, subcode, /* fatal */ false);
 		/* Nobody handled EXC_CRASH?? remember to make corpse */
 		if ((kr != 0 || corpse_source) && p == current_proc()) {
 			/*
@@ -2104,10 +2233,21 @@ skipcheck:
 			}
 		}
 
+		/*
+		 * Hack: propogate ktriage information from p_lflag. This should be
+		 * removed in favor of something with proper ReportCrash integration.
+		 * rdar://163281838 (Remove P_LWASSOFT)
+		 */
+		if (proc_was_ptraced_during_soft_mode(p)) {
+			ktriage_record(thread_tid(current_thread()),
+			    KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED,
+			    KDBG_TRIAGE_VM_SOFT_MODE_DISABLE_TRACED), 0);
+		}
+
 		/* Update the code, subcode based on exit reason */
 		proc_update_corpse_exception_codes(p, &code, &subcode);
 		populate_corpse_crashinfo(p, task, rup,
-		    code, subcode, buffer, num_knotes, NULL, etype);
+		    code, subcode, buffer, num_knotes, NULL, etype, saved_code);
 		kfree_data(buffer, buf_size);
 	}
 	/*
@@ -2497,6 +2637,8 @@ proc_exit(proc_t p)
 	if (tvp != NULLVP) {
 		vnode_rele(tvp);
 	}
+
+	kfree_data(p->p_execpath, MAXPATHLEN);
 
 	/*
 	 * Save exit status and final rusage info, adding in child rusage
@@ -3541,8 +3683,29 @@ kdp_wait4_find_process(thread_t thread, __unused event64_t wait_event, thread_wa
 	waitinfo->owner = args->pid;
 }
 
-static int
-exit_with_exception_internal(
+/*
+ * Terminates execution of a task with a Mach exception, fatally.
+ *
+ * Note: this function does NOT handle debugging or other non-fatal cases.
+ * It's the responsibility of the caller to maintain debuggability
+ * and deliver the exception to userspace if necessary. Calling this
+ * function while the address space is debugged is a violation of
+ * the contract.
+ *
+ * The purpose of this function is to serve as a generic interface to
+ * exit fatally, and, if needed, collect and store info for crash
+ * reports. We want to collect crash reports ONLY if userspace did
+ * not handle the exception; if it did handle the exception, there is
+ * no need to generate a crash report.
+ *
+ * The recommended way is to use exit_with_fatal_exception_and_notify,
+ * which first calls task_exception_notify -- it first checks the fatal
+ * exception conditions and then delivers the exception to userspace if
+ * needed. Then, based on the return value, it knows how we should exit
+ * (with or without crash report) and calls this function.
+ */
+int
+exit_with_mach_exception(
 	struct proc *p,
 	exception_info_t exception,
 	uint32_t flags)
@@ -3555,12 +3718,7 @@ exit_with_exception_internal(
 		    exception.os_reason);
 	}
 
-	if (!(flags & PX_DEBUG_NO_HONOR)
-	    && is_address_space_debugged(p)) {
-		return 0;
-	}
-
-	if ((flags & PX_KTRIAGE)) {
+	if (flags & PX_KTRIAGE) {
 		/* Leave a ktriage record */
 		ktriage_record(
 			thread_tid(current_thread()),
@@ -3571,61 +3729,114 @@ exit_with_exception_internal(
 			0);
 	}
 
-	if ((flags & PX_PSIGNAL)) {
-		int signal = (exception.signal > 0) ? exception.signal : SIGKILL;
+	assert(exception.exception_type > 0);
+	reason = os_reason_create(
+		exception.os_reason,
+		(uint64_t)exception.mx_code);
+	assert(reason != OS_REASON_NULL);
 
-		printf("[%s%s] sending signal %d to process\n", proc_best_name(p),
-		    (signal == SIGKILL) ? ": killed" : "", signal);
-		psignal(p, signal);
-		return 0;
-	} else {
-		assert(exception.exception_type > 0);
+	if (flags & PX_NO_CRASH_REPORT) {
+		/*
+		 * This is used by the callers in case userspace handled a fatal
+		 * exception successfully. We still kill the task, but without
+		 * generating a crash report.
+		 */
+		printf("[%s: killed] exiting with signal %d to process\n",
+		    proc_best_name(p), SIGKILL);
 
-		reason = os_reason_create(
-			exception.os_reason,
-			(uint64_t)exception.mx_code);
-		assert(reason != OS_REASON_NULL);
-		reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
-
-		if (!(flags & PX_NO_EXCEPTION_UTHREAD)) {
-			ut = get_bsdthread_info(current_thread());
-			ut->uu_exception = exception.exception_type;
-			ut->uu_code = exception.mx_code;
-			ut->uu_subcode = exception.mx_subcode;
+		if (p == current_proc()) {
+			/* consumes reason */
+			psignal_try_thread_with_reason(p, current_thread(), SIGKILL, reason);
+		} else {
+			/* consumes reason */
+			psignal_with_reason(p, SIGKILL, reason);
 		}
 
-		printf("[%s: killed] sending signal %d and force exiting process\n",
-		    proc_best_name(p), SIGKILL);
-		return exit_with_reason(p, W_EXITCODE(0, SIGKILL), NULL,
-		           FALSE, FALSE, 0, reason);
+		return 0;
 	}
+
+	/*
+	 * PX_NO_CRASH_REPORT is not set; we should exit
+	 * and generate a crash report.
+	 */
+	reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+
+	ut = get_bsdthread_info(current_thread());
+	ut->uu_exception = exception.exception_type;
+	ut->uu_code = exception.mx_code;
+	ut->uu_subcode = exception.mx_subcode;
+
+	printf("[%s: killed] exiting with signal %d, force exiting the process\n",
+	    proc_best_name(p), SIGKILL);
+
+	/* consumes reason */
+	return exit_with_reason(p, W_EXITCODE(0, SIGKILL), NULL,
+	           FALSE, FALSE, 0, reason);
 }
-
-/*
- * Use a separate function call for mach and exclave exceptions so that we
- * see the exception's origin show up clearly in the backtrace on dev kernels.
- */
-
-int
-exit_with_mach_exception(
-	struct proc *p,
-	exception_info_t exception,
-	uint32_t flags)
-{
-	return exit_with_exception_internal(p, exception, flags);
-}
-
 
 #if CONFIG_EXCLAVES
 int
 exit_with_exclave_exception(
 	struct proc *p,
-	exception_info_t exception,
-	uint32_t flags)
+	exception_info_t exception)
 {
-	return exit_with_exception_internal(p, exception, flags);
+	os_reason_t reason = OS_REASON_NULL;
+
+	if (p == PROC_NULL) {
+		panic("exception type %d without a valid proc",
+		    exception.os_reason);
+	}
+
+	assert(exception.exception_type > 0);
+
+	reason = os_reason_create(
+		exception.os_reason,
+		(uint64_t)exception.mx_code);
+	assert(reason != OS_REASON_NULL);
+	reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+
+	printf("[%s: killed] exiting with signal %d due to exclaves exception\n",
+	    proc_best_name(p), SIGKILL);
+	return exit_with_reason(p, W_EXITCODE(0, SIGKILL), NULL, FALSE, FALSE, 0, reason);
 }
 #endif /* CONFIG_EXCLAVES */
+
+int
+exit_with_fatal_exception_and_notify(
+	struct proc *p,
+	int os_reason,
+	exception_type_t exception_type,
+	mach_exception_data_type_t mx_code,
+	mach_exception_data_type_t mx_subcode,
+	uint32_t flags)
+{
+	/* Log fatal exception details for early boot debugging */
+	os_log_error_with_startup_serial(OS_LOG_DEFAULT,
+	    "ERROR: [%s:%d] FATAL exception: type=0x%x reason=0x%x code=0x%llx subcode=0x%llx\n",
+	    proc_best_name(p), proc_pid(p),
+	    exception_type, os_reason,
+	    mx_code, mx_subcode);
+
+	if ((p == current_proc()) &&
+	    (task_exception_notify(EXC_GUARD, mx_code, mx_subcode, /* fatal */ true) == KERN_SUCCESS)) {
+		flags |= PX_NO_CRASH_REPORT;
+	}
+
+	/*
+	 * Now, on all cases, kill the task unconditionally and fatally.
+	 *
+	 * Use the accurate codes and reason. We decide if we should collect
+	 * crash report or not based on how userspace responded.
+	 */
+	exception_info_t info = {
+		.os_reason = os_reason,
+		.exception_type = exception_type,
+		.mx_code = mx_code,
+		.mx_subcode = mx_subcode
+	};
+
+	return exit_with_mach_exception(p, info, flags);
+}
 
 /**
  * Causes the current process to exit with a Mach exception.

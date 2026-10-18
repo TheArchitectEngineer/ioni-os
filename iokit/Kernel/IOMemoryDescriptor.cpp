@@ -72,14 +72,17 @@ __BEGIN_DECLS
 #include <mach/mach_host.h>
 #include <vm/vm_fault_xnu.h>
 #include <vm/vm_protos.h>
-#include <vm/vm_memory_entry.h>
+#include <vm/vm_memory_entry_xnu.h>
 #include <vm/vm_kern_xnu.h>
 #include <vm/vm_iokit.h>
 #include <vm/vm_map_xnu.h>
 #include <kern/thread.h>
+#if HAS_MTE
+#include <vm/vm_memtag.h>
+#endif /* HAS_MTE */
+#include <sys/vnode.h>
 
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-extern void ipc_port_release_send(ipc_port_t port);
 
 __END_DECLS
 
@@ -261,7 +264,7 @@ getAddrLenForInd(
 	UInt32                            ind,
 	task_t                            task __unused)
 {
-	assert(kIOMemoryTypeUIO == type
+	assert(kIOMemoryTypeUIO == type || kIOMemoryTypeVnode == type
 	    || kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type
 	    || kIOMemoryTypePhysical == type || kIOMemoryTypePhysical64 == type);
 	if (kIOMemoryTypeUIO == type) {
@@ -468,7 +471,7 @@ IOGeneralMemoryDescriptor::memoryReferenceFree(IOMemoryReference * ref)
 	entries = ref->entries + ref->count;
 	while (entries > &ref->entries[0]) {
 		entries--;
-		ipc_port_release_send(entries->entry);
+		mach_memory_entry_port_release(entries->entry);
 	}
 	kfree_type(IOMemoryReference, IOMemoryEntry, ref->capacity, ref);
 
@@ -483,6 +486,63 @@ IOGeneralMemoryDescriptor::memoryReferenceRelease(IOMemoryReference * ref)
 	}
 }
 
+vm_prot_t
+IOGeneralMemoryDescriptor::memoryReferenceProt(IOOptionBits options)
+{
+	vm_prot_t    prot;
+	IOOptionBits cacheMode;
+
+	// cache mode & vm_prot
+	prot = VM_PROT_READ;
+	cacheMode = ((_flags & kIOMemoryBufferCacheMask) >> kIOMemoryBufferCacheShift);
+	prot |= vmProtForCacheMode(cacheMode);
+	// VM system requires write access to change cache mode
+	if (kIODefaultCache != cacheMode) {
+		prot |= VM_PROT_WRITE;
+	}
+	if (kIODirectionOut != (kIODirectionOutIn & _flags)) {
+		prot |= VM_PROT_WRITE;
+	}
+	if (kIOMemoryReferenceWrite & options) {
+		prot |= VM_PROT_WRITE;
+	}
+	if (kIOMemoryReferenceCOW   & options) {
+		prot |= MAP_MEM_VM_COPY;
+	}
+	if (kIOMemoryUseReserve & _flags) {
+		prot |= MAP_MEM_GRAB_SECLUDED;
+	}
+	return prot;
+}
+
+IOReturn
+IOGeneralMemoryDescriptor::memoryReferenceCreate(
+	IOOptionBits         options,
+	ipc_port_t           entry,
+	uint64_t             offset,
+	uint64_t             size,
+	IOMemoryReference ** reference)
+{
+	IOMemoryReference     * ref;
+	vm_prot_t               prot;
+	memory_object_offset_ut mo_offset;
+
+	prot = memoryReferenceProt(options);
+	mo_offset = trunc_page(offset);
+	ref = memoryReferenceAlloc(1, NULL);
+	if (!ref) {
+		return kIOReturnNoMemory;
+	}
+	ref->entries[0].entry  = entry;
+	ref->prot              = prot | MAP_MEM_USE_DATA_ADDR;
+	ref->count             = 1;
+	ref->entries[0].size   = size + offset - mo_offset;             // entry starts at trunc_page
+	ref->entries[0].offset = mo_offset - offset;                    // so reference begins before offset zero
+
+	*reference = ref;
+
+	return kIOReturnSuccess;
+}
 
 IOReturn
 IOGeneralMemoryDescriptor::memoryReferenceCreate(
@@ -509,7 +569,6 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 	int                  misaligned_start = 0, misaligned_end = 0;
 	IOByteCount          physLen;
 	IOOptionBits         type = (_flags & kIOMemoryTypeMask);
-	IOOptionBits         cacheMode;
 	unsigned int         pagerFlags;
 	vm_tag_t             tag;
 	vm_named_entry_kernel_flags_t vmne_kflags;
@@ -549,26 +608,7 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 	}
 
 	// cache mode & vm_prot
-	prot = VM_PROT_READ;
-	cacheMode = ((_flags & kIOMemoryBufferCacheMask) >> kIOMemoryBufferCacheShift);
-	prot |= vmProtForCacheMode(cacheMode);
-	// VM system requires write access to change cache mode
-	if (kIODefaultCache != cacheMode) {
-		prot |= VM_PROT_WRITE;
-	}
-	if (kIODirectionOut != (kIODirectionOutIn & _flags)) {
-		prot |= VM_PROT_WRITE;
-	}
-	if (kIOMemoryReferenceWrite & options) {
-		prot |= VM_PROT_WRITE;
-	}
-	if (kIOMemoryReferenceCOW   & options) {
-		prot |= MAP_MEM_VM_COPY;
-	}
-
-	if (kIOMemoryUseReserve & _flags) {
-		prot |= MAP_MEM_GRAB_SECLUDED;
-	}
+	prot = memoryReferenceProt(options);
 
 	if ((kIOMemoryReferenceReuse & options) && _memRef) {
 		cloneEntries = &_memRef->entries[0];
@@ -663,6 +703,15 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 				}
 
 				mach_vm_offset_t entryAddrForVm = entryAddr;
+#if HAS_MTE
+				vmne_kflags.vmnekf_is_iokit = TRUE;
+				/* If we're holding a specific address and map, canonicalize the
+				 * address before passing it through to the VM.
+				 */
+				if (entryAddr != 0 && map != NULL) {
+					entryAddrForVm = vm_memtag_canonicalize(map, entryAddr);
+				}
+#endif /* HAS_MTE */
 				err = mach_make_memory_entry_internal(map,
 				    &actualSize, entryAddrForVm, prot, vmne_kflags, &entry, cloneEntry);
 
@@ -702,7 +751,7 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 					/* Middle entries */
 					if (misaligned_start || misaligned_end) {
 						DEBUG4K_IOKIT("stopped at entryAddr 0x%llx\n", entryAddr);
-						ipc_port_release_send(entry);
+						mach_memory_entry_port_release(entry);
 						err = KERN_NOT_SUPPORTED;
 						break;
 					}
@@ -744,6 +793,8 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 		reserved->dp.pagerContig = (1 == _rangesCount);
 		reserved->dp.memory      = this;
 
+		IOOptionBits cacheMode;
+		cacheMode = ((_flags & kIOMemoryBufferCacheMask) >> kIOMemoryBufferCacheShift);
 		pagerFlags = pagerFlagsForCacheMode(cacheMode);
 		if (-1U == pagerFlags) {
 			panic("phys is kIODefaultCache");
@@ -870,17 +921,19 @@ IOMemoryDescriptorMapAlloc(vm_map_t map, void * _ref)
 	vmk_flags.vm_tag = ref->tag;
 
 	/*
-	 * Mapping memory into the kernel_map using IOMDs use the data range.
+	 * Mapping memory into the kernel_map using IOMDs
+	 * use the shared data range.
+	 *
 	 * Memory being mapped should not contain kernel pointers.
 	 */
 	if (map == kernel_map) {
-		vmk_flags.vmkf_range_id = KMEM_RANGE_ID_DATA;
+		vmk_flags.vmkf_range_id = KMEM_RANGE_ID_DATA_SHARED;
 	}
 
 	err = mach_vm_map_kernel(map, &addr, size,
 #if __ARM_MIXED_PAGE_SIZE__
 	    // TODO4K this should not be necessary...
-	    (vm_map_offset_t)((ref->options & kIOMapAnywhere) ? max(PAGE_MASK, vm_map_page_mask(map)) : 0),
+	    (vm_map_offset_t)((ref->options & kIOMapAnywhere) ? IOMax(PAGE_MASK, vm_map_page_mask(map)) : 0),
 #else /* __ARM_MIXED_PAGE_SIZE__ */
 	    (vm_map_offset_t) 0,
 #endif /* __ARM_MIXED_PAGE_SIZE__ */
@@ -1124,7 +1177,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 
 	while (remain && (KERN_SUCCESS == err)) {
 		entryOffset = offset - entry->offset;
-		if ((min(vm_map_page_mask(map), page_mask) & entryOffset) != pageOffset) {
+		if ((IOMin(vm_map_page_mask(map), page_mask) & entryOffset) != pageOffset) {
 			err = kIOReturnNotAligned;
 			DEBUG4K_ERROR("map %p inoffset 0x%llx size 0x%llx options 0x%x inaddr 0x%llx entryOffset 0x%llx pageOffset 0x%llx\n", map, inoffset, size, (uint32_t)options, *inaddr, (uint64_t)entryOffset, (uint64_t)pageOffset);
 			break;
@@ -1486,6 +1539,13 @@ IOGeneralMemoryDescriptor::memoryReferenceMapNew(
 #if LOGUNALIGN
 				printf("mapAddr i %qx chunk %qx\n", mapAddr, chunk);
 #endif
+#if HAS_MTE
+				/* The memory that originated this IOMD might've been MTE-enabled,
+				 * so we need to inform the VM that MTE policies apply.
+				 */
+				vmk_flags.vmf_mte = true;
+				vmk_flags.vmkf_is_iokit = true;
+#endif /* HAS_MTE */
 				err = mach_vm_map_kernel(map,
 				    &mapAddrOut,
 				    chunk, 0 /* mask */,
@@ -1773,6 +1833,41 @@ IOMemoryDescriptor::withAddressRanges(IOAddressRange *   ranges,
 	return nullptr;
 }
 
+struct IOMemoryDescriptorWithVNodeInit {
+	ipc_port_t entry;
+	uint64_t   offset;
+	uint64_t   size;
+};
+
+OSPtr<IOMemoryDescriptor>
+IOMemoryDescriptor::withVNode(
+	struct vnode    *vnode,
+	uint64_t         offset,
+	uint64_t         size,
+	IOOptionBits     options)
+{
+	OSSharedPtr<IOMemoryDescriptor> self;
+	if (kIOMemoryTypeMask & options) {
+		return NULL;
+	}
+	ipc_port_t entry = vnode_memoryentry(vnode, offset, &size);
+	if (NULL == entry) {
+		return NULL;
+	}
+
+	IOMemoryDescriptorWithVNodeInit init = {
+		.entry = entry,
+		.offset = offset,
+		.size   = size };
+	self = IOMemoryDescriptor::withOptions(&init,
+	    1, 0, TASK_NULL, kIOMemoryTypeVnode | options, NULL);
+
+	if (NULL == self) {
+		mach_memory_entry_port_release(entry);
+	}
+
+	return self;
+}
 
 /*
  * withOptions:
@@ -2039,6 +2134,20 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 	case kIOMemoryTypeUPL:
 		assert(!task);
 		break;
+
+	case kIOMemoryTypeVnode:
+		if (task) {
+			return false; /* bad argument */
+		}
+		if (_initialized
+		    || (options & kIOMemoryAsReference)) {
+			return false; /* bad argument */
+		}
+		if (task) {
+			return false; /* bad argument */
+		}
+		break;
+
 	default:
 		return false; /* bad argument */
 	}
@@ -2181,7 +2290,7 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 		_memoryEntries->appendBytes(&iopl, sizeof(iopl));
 	} else {
 		// kIOMemoryTypeVirtual  | kIOMemoryTypeVirtual64 | kIOMemoryTypeUIO
-		// kIOMemoryTypePhysical | kIOMemoryTypePhysical64
+		// kIOMemoryTypePhysical | kIOMemoryTypePhysical64 | kIOMemoryTypeVnode
 
 		// Initialize the memory descriptor
 		if (options & kIOMemoryAsReference) {
@@ -2246,6 +2355,23 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 				}
 				bcopy(buffers, _ranges.v, count * sizeof(IOVirtualRange));
 				break;
+
+			case kIOMemoryTypeVnode:
+				_flags |= kIOMemoryAsReference | kIOMemoryBufferPageable;
+				_task = kernel_task;
+#ifndef __LP64__
+				_rangesIsAllocated = false;
+#endif /* !__LP64__ */
+
+				const IOMemoryDescriptorWithVNodeInit * init = (typeof(init))buffers;
+				IOReturn
+				    err = memoryReferenceCreate(0, init->entry, init->offset, init->size, &_memRef);
+				if (kIOReturnSuccess != err) {
+					return false;
+				}
+				_ranges.v = &_singleRange.v;
+				_singleRange.v.address = 0;
+				_singleRange.v.length  = init->size;
 			}
 		}
 		_rangesCount = count;
@@ -2305,7 +2431,7 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 
 		if ((kIOMemoryTypePhysical == type) || (kIOMemoryTypePhysical64 == type)) {
 			_wireCount++; // Physical MDs are, by definition, wired
-		} else { /* kIOMemoryTypeVirtual | kIOMemoryTypeVirtual64 | kIOMemoryTypeUIO */
+		} else { /* kIOMemoryTypeVirtual | kIOMemoryTypeVirtual64 | kIOMemoryTypeUIO | kIOMemoryTypeVNode */
 			ioGMDData *dataP;
 			unsigned dataSize;
 
@@ -2593,6 +2719,30 @@ IOMemoryDescriptor::getSourceSegment( IOByteCount   offset, IOByteCount * length
 
 #endif /* !__LP64__ */
 
+#if HAS_MTE
+/* Ideally this would be a method on IOMD that's overridden by IOGMD, but there's
+ * ABI considerations with extending the vtable so just make it a free function for now.
+ */
+static void
+handleCopyAbortedTCF(void)
+{
+	/*
+	 * Only calls passing through an IOGMD will have a faultable provider, so we check
+	 * for one here, as we might have recovered from a tag check fault through e.g.
+	 * an IOSubMD that cannot provide one.
+	 */
+	task_t task_providing_faultable_buffer = current_thread_get_iomd_faultable_access_buffer_provider();
+	if (task_providing_faultable_buffer) {
+		/*
+		 * Register an AST over the victim task so that a proper MTE exception
+		 * will be generated when it gets scheduled. The fault handler already
+		 * recorded the necessary data that the exception-synthesizing code
+		 * will require to create the exception.
+		 */
+		task_set_ast_synthesize_async_fault_mach_exception(task_providing_faultable_buffer);
+	}
+}
+#endif /* HAS_MTE */
 
 IOByteCount
 IOMemoryDescriptor::readBytes
@@ -2622,7 +2772,7 @@ IOMemoryDescriptor::readBytes
 		LOCK;
 	}
 
-	remaining = length = min(length, _length - offset);
+	remaining = length = IOMin(length, _length - offset);
 	while (remaining) { // (process another target segment?)
 		addr64_t        srcAddr64;
 		IOByteCount     srcLen;
@@ -2643,9 +2793,59 @@ IOMemoryDescriptor::readBytes
 			srcLen = (UINT_MAX - PAGE_SIZE + 1);
 		}
 
+#if HAS_MTE
+		if (pmap_is_tagged_page((ppnum_t)atop(srcAddr64))) {
+			if (current_thread_get_iomd_faultable_access_buffer_provider() != NULL) {
+				/*
+				 * We're going to wind up accessing the memory via peeking into the
+				 * physical aperture. Our physical aperture access will naturally be
+				 * canonically tagged, which will mismatch the correct tag. This option
+				 * tells bcopy_phys to actually fixup via LDG the tag. We won't catch
+				 * UaFs with this, but any OOB will fault therefore...
+				 */
+				options |= cppvFixupPhysmapTag;
+
+				/*
+				 * ...this flag sets up machinery such that fault on this access will be
+				 * recoverable (i.e. this thread will continue execution). We can do that
+				 * only when coming through an IOGMD and having a faultable task to blame.
+				 */
+				options |= cppvDenoteAccessMayFault;
+
+				/*
+				 * And if we do fault during the access, it also means we don't have
+				 * recourse to read the memory contents.
+				 * Unfortunately, consumers of this API expect it to always work, so
+				 * in an attempt to minimize risk we'll zero the buffer upfront,
+				 * so if we failed to read it'll look as though we just read zeroes.
+				 */
+				memset((void*)dstAddr, 0, srcLen);
+			} else {
+				/*
+				 * We don't have a task to blame, resort to the unsafe TCO copy.
+				 * We could just return EFAULT here, but that would require callers to
+				 * actively check for it, which unfortunately may not be the case as
+				 * these operations never failed before.
+				 *
+				 * Defer a proper support to buffered creation of IOMDs.
+				 */
+				options |= cppvDisableTagCheck;
+			}
+		}
+#endif /* HAS_MTE */
 
 		kern_return_t copy_ret = copypv(srcAddr64, dstAddr, (unsigned int) srcLen, options);
+#if HAS_MTE
+		/*
+		 * copypv recovery handler will only fire in case of a tag check fault. Let's handle
+		 * the special case here.
+		 */
+		if (copy_ret == KERN_ABORTED) {
+			handleCopyAbortedTCF();
+		}
+#else /* HAS_MTE */
 #pragma unused(copy_ret)
+#endif /* HAS_MTE */
 
 		dstAddr   += srcLen;
 		offset    += srcLen;
@@ -2695,7 +2895,7 @@ IOMemoryDescriptor::writeBytes
 		LOCK;
 	}
 
-	remaining = length = min(length, _length - offset);
+	remaining = length = IOMin(length, _length - offset);
 	while (remaining) { // (process another target segment?)
 		addr64_t    dstAddr64;
 		IOByteCount dstLen;
@@ -2716,12 +2916,33 @@ IOMemoryDescriptor::writeBytes
 			dstLen = (UINT_MAX - PAGE_SIZE + 1);
 		}
 
+#if HAS_MTE
+		if (pmap_is_tagged_page((ppnum_t)atop(dstAddr64))) {
+			/* Same drill as readBytes(), please check the comment there for details. */
+			if (current_thread_get_iomd_faultable_access_buffer_provider() != NULL) {
+				options |= cppvFixupPhysmapTag;
+				options |= cppvDenoteAccessMayFault;
+			} else {
+				options |= cppvDisableTagCheck;
+			}
+		}
+#endif /* HAS_MTE */
 
 		if (!srcAddr) {
 			bzero_phys(dstAddr64, (unsigned int) dstLen);
 		} else {
 			kern_return_t copy_ret = copypv(srcAddr, (addr64_t) dstAddr64, (unsigned int) dstLen, options);
+#if HAS_MTE
+			/*
+			 * copypv recovery handler will only fire in case of a tag check fault. Let's handle
+			 * the special case here.
+			 */
+			if (copy_ret == KERN_ABORTED) {
+				handleCopyAbortedTCF();
+			}
+#else /* HAS_MTE */
 #pragma unused(copy_ret)
+#endif /* HAS_MTE */
 			srcAddr   += dstLen;
 		}
 		offset    += dstLen;
@@ -3521,7 +3742,28 @@ IOByteCount
 IOGeneralMemoryDescriptor::readBytes
 (IOByteCount offset, void *bytes, IOByteCount length)
 {
+#if HAS_MTE
+	/* We might fault while accessing the wired memory if the underlying memory
+	 * is tagged and someone else has since changed the tag.
+	 * We need to set up context on the current thread so that we can keep track
+	 * of who caused us to fault within the fault handler.
+	 * Here, 'who caused us to fault' would be the other end of the true
+	 * share (i.e. the task which handed us the memory in the first place).
+	 * Ideally we'd only set up this context just surrounding the potentially
+	 * faulting access, but the access happens deeper within IOMD machinery
+	 * by which point we've lost this _task ivar. So, just hold onto it here.
+	 * (Note that it's possible for the culprit who changed the tag to be
+	 * another party holding a true share to the mapping, separate from the task
+	 * which handed us the memory that backs the IOMD, but we're not going to
+	 * worry too much about this case for now.)
+	 */
+	/* Note that we don't need any special handling for when _task is NULL. */
+	current_thread_enter_iomd_faultable_access_with_buffer_provider(_task);
+#endif /* HAS_MTE */
 	IOByteCount count = super::readBytes(offset, bytes, length);
+#if HAS_MTE
+	current_thread_exit_iomd_faultable_access();
+#endif /* HAS_MTE */
 	return count;
 }
 
@@ -3529,7 +3771,28 @@ IOByteCount
 IOGeneralMemoryDescriptor::writeBytes
 (IOByteCount offset, const void* bytes, IOByteCount withLength)
 {
+#if HAS_MTE
+	/* We might fault while accessing the wired memory if the underlying memory
+	 * is tagged and someone else has since changed the tag.
+	 * We need to set up context on the current thread so that we can keep track
+	 * of who caused us to fault within the fault handler.
+	 * Here, 'who caused us to fault' would be the other end of the true
+	 * share (i.e. the task which handed us the memory in the first place).
+	 * Ideally we'd only set up this context just surrounding the potentially
+	 * faulting access, but the access happens deeper within IOMD machinery
+	 * by which point we've lost this _task ivar. So, just hold onto it here.
+	 * (Note that it's possible for the culprit who changed the tag to be
+	 * another party holding a true share to the mapping, separate from the task
+	 * which handed us the memory that backs the IOMD, but we're not going to
+	 * worry too much about this case for now.)
+	 */
+	/* Note that we don't need any special handling for when _task is NULL. */
+	current_thread_enter_iomd_faultable_access_with_buffer_provider(_task);
+#endif /* HAS_MTE */
 	IOByteCount count = super::writeBytes(offset, bytes, withLength);
+#if HAS_MTE
+	current_thread_exit_iomd_faultable_access();
+#endif /* HAS_MTE */
 	return count;
 }
 
@@ -4045,7 +4308,7 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 	}
 
 	res = 0x0UL;
-	remaining = length = min(length, getLength() - offset);
+	remaining = length = IOMin(length, getLength() - offset);
 	while (remaining) {
 		// (process another target segment?)
 		addr64_t    dstAddr64;
@@ -4180,7 +4443,8 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 	vm_tag_t tag = VM_KERN_MEMORY_NONE;
 	mach_vm_size_t numBytesWired = 0;
 
-	assert(kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type);
+	assert(kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type
+	    || kIOMemoryTypeUIO == type || kIOMemoryTypeVnode == type);
 
 	if ((kIODirectionOutIn & forDirection) == kIODirectionNone) {
 		forDirection = (IODirection) (forDirection | getDirection());
@@ -4321,10 +4585,11 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 
 			// Iterate over the current range, creating UPLs
 			while (numBytes) {
-				vm_address_t kernelStart = (vm_address_t) startPage;
+				vm_address_t kernelStart = (vm_address_t)vm_memtag_canonicalize_kernel(startPage);
 				vm_map_t theMap;
 				if (curMap) {
 					theMap = curMap;
+					startPage = vm_memtag_canonicalize(curMap, startPage);
 				} else if (_memRef) {
 					theMap = NULL;
 				} else {
@@ -4403,6 +4668,8 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 					    &highPage);
 				} else {
 					assert(theMap);
+					assert(startPage == vm_memtag_canonicalize(theMap, startPage));
+
 					error = vm_map_create_upl(theMap,
 					    startPage,
 					    (upl_size_t*)&ioplSize,
@@ -4690,6 +4957,7 @@ IOGeneralMemoryDescriptor::dmaMap(
 		return kIOReturnNotAttached;
 	}
 
+
 	if ((type == kIOMemoryTypePhysical) || (type == kIOMemoryTypePhysical64)
 	    || offset || (length != _length)) {
 		err = super::dmaMap(mapper, memory, command, mapSpec, offset, length, mapAddress, mapLength);
@@ -4773,7 +5041,8 @@ IOGeneralMemoryDescriptor::prepare(IODirection forDirection)
 		IOLockLock(_prepareLock);
 	}
 
-	if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type) {
+	if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type
+	    || kIOMemoryTypeUIO == type || kIOMemoryTypeVnode == type) {
 		if ((forDirection & kIODirectionPrepareAvoidThrottling) && NEED_TO_HARD_THROTTLE_THIS_TASK()) {
 			error = kIOReturnNotReady;
 			goto finish;
@@ -4856,7 +5125,7 @@ IOGeneralMemoryDescriptor::complete(IODirection forDirection)
 
 			if (_wireCount) {
 				// kIODirectionCompleteWithDataValid & forDirection
-				if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type) {
+				if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type || kIOMemoryTypeVnode == type) {
 					vm_tag_t tag;
 					tag = (typeof(tag))getVMTag(kernel_map);
 					for (ind = 0; ind < count; ind++) {
@@ -4880,7 +5149,7 @@ IOGeneralMemoryDescriptor::complete(IODirection forDirection)
 				}
 #endif /* IOTRACKING */
 				// Only complete iopls that we created which are for TypeVirtual
-				if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type) {
+				if (kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type || kIOMemoryTypeUIO == type || kIOMemoryTypeVnode == type) {
 					for (ind = 0; ind < count; ind++) {
 						if (ioplList[ind].fIOPL) {
 							if (dataP->fCompletionError) {
@@ -5589,9 +5858,7 @@ IOMemoryMap::userClientUnmap( void )
 void
 IOMemoryMap::taggedRelease(const void *tag) const
 {
-	LOCK;
 	super::taggedRelease(tag, 2);
-	UNLOCK;
 }
 
 void
@@ -5715,11 +5982,14 @@ IOMemoryMap::copyCompatible(
 		return NULL;
 	}
 
-	if ((fLength == _length) && (!_offset)) {
-		retain();
+	if (!taggedTryRetain(NULL)) {
+		return NULL;
+	}
+
+	if ((fLength == _length) && !_offset) {
 		newMapping = this;
 	} else {
-		newMapping->fSuperMap.reset(this, OSRetain);
+		newMapping->fSuperMap.reset(this, OSNoRetain);
 		newMapping->fOffset   = fOffset + _offset;
 		newMapping->fAddress  = fAddress + _offset;
 	}
@@ -6187,7 +6457,11 @@ IOGeneralMemoryDescriptor::serialize(OSSerialize * s) const
 		for (index = 0; index < vcopy.size(); index++) {
 			mach_vm_address_t addr; mach_vm_size_t len;
 			getAddrLenForInd(addr, len, type, vec, index, _task);
-			vcopy[index].address = addr;
+			if ((kIOMemoryTypePhysical == type) || (kIOMemoryTypePhysical64 == type)) {
+				vcopy[index].address = addr;
+			} else {
+				vcopy[index].address = VM_KERNEL_ADDRHIDE(addr);
+			}
 			vcopy[index].length  = len;
 		}
 	} else {

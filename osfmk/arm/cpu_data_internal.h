@@ -47,6 +47,7 @@
 #include <arm/pmap.h>
 #include <machine/monotonic.h>
 #include <san/kcov_data.h>
+#include <arm64/cpc_arm64.h>
 
 #define NSEC_PER_HZ     (NSEC_PER_SEC / 100)
 
@@ -117,7 +118,7 @@ __options_closed_decl(cpu_flags_t, uint16_t, {
 
 __options_closed_decl(cpu_signal_t, unsigned int, {
 	SIGPnop         = 0x00000000U,     /* Send IPI with no service */
-	/* 0x1U unused */
+	SIGPMaintenance = 0x00000001U,     /* SMR, Ledger flush        */
 	/* 0x2U unused */
 	SIGPxcall       = 0x00000004U,     /* Call a function on a processor */
 	SIGPast         = 0x00000008U,     /* Request AST check */
@@ -129,6 +130,9 @@ __options_closed_decl(cpu_signal_t, unsigned int, {
 	SIGPxcallImm    = 0x00000200U,     /* Send a cross-call, fail if already pending */
 	SIGPTimerLocal  = 0x00000400U,     /* Update the decrementer via timer_queue_expire_local */
 	SIGPdeferred    = 0x00000800U,     /* Scheduler deferred IPI to wake core */
+#if DEVELOPMENT || DEBUG
+	SIGPtest        = 0x00002000U,     /* Test signal for panic testing */
+#endif
 
 	SIGPdisabled    = 0x80000000U,     /* Signal disabled */
 });
@@ -214,6 +218,9 @@ typedef struct cpu_data {
 	vm_offset_t                     coresight_base[CORESIGHT_REGIONS];
 #endif
 
+#if NEEDS_MTE_IRG_RESEED
+	uint64_t                        cpu_irg_reseed_counter;
+#endif
 
 	/* CCC ARMv8 registers */
 	uint64_t                        cpu_regmap_paddr;
@@ -245,16 +252,10 @@ typedef struct cpu_data {
 	uint64_t                        jop_key;
 #endif /* defined(HAS_APPLE_PAC) */
 
-	/* large structs with large alignment requirements */
-
-	/* double-buffered performance counter data */
-	uint64_t                        *cpu_kpc_buf[2];
-	/* PMC shadow and reload value buffers */
-	uint64_t                        *cpu_kpc_shadow;
-	uint64_t                        *cpu_kpc_reload;
-
 #if CONFIG_CPU_COUNTERS
-	struct mt_cpu                   cpu_monotonic;
+	struct cpc_cpu                  cpu_cpc;
+	// For thread counting in kpc.
+	uint64_t                       *cpu_kpc_buf[2];
 #endif /* CONFIG_CPU_COUNTERS */
 
 	cpu_stat_t                      cpu_stat;
@@ -288,6 +289,10 @@ typedef struct cpu_data {
 	uint64_t cpu_reg_paddr;
 	uint64_t acc_reg_paddr;
 	uint64_t cpm_reg_paddr;
+#endif
+
+#if HAS_MTE
+	uint64_t mte_rgsr_el1_seed;
 #endif
 
 } cpu_data_t;

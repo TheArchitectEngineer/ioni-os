@@ -44,7 +44,7 @@ struct flow_entry *fe_alloc(boolean_t);
 static void fe_free(struct flow_entry *);
 static int fe_id_cmp(const struct flow_entry *, const struct flow_entry *);
 static void fe_stats_init(struct flow_entry *);
-static void fe_stats_update(struct flow_entry *);
+void fe_stats_update(struct flow_entry *);
 
 RB_GENERATE_PREV(flow_entry_id_tree, flow_entry, fe_id_link, fe_id_cmp);
 
@@ -309,7 +309,7 @@ flow_entry_set_demux_patterns(struct flow_entry *fe, struct nx_flow_req *req)
 	}
 }
 
-static int
+int
 convert_flowkey_to_inet_td(struct flow_key *key,
     struct ifnet_traffic_descriptor_inet *td)
 {
@@ -515,6 +515,9 @@ flow_entry_alloc(struct flow_owner *fo, struct nx_flow_req *req, int *perr)
 	}
 	if (req->nfr_flags & NXFLOWREQF_CONNECTION_IDLE) {
 		fe->fe_flags |= FLOWENTF_CONNECTION_IDLE;
+	}
+	if (req->nfr_flags & NXFLOWREQF_DISABLED) {
+		os_atomic_or(&fe->fe_flags, FLOWENTF_DISABLED, relaxed);
 	}
 	fe->fe_port_reservation = req->nfr_port_reservation;
 	req->nfr_port_reservation = NULL;
@@ -1026,7 +1029,7 @@ fe_stats_init(struct flow_entry *fe)
 	fe_stats_update(fe);
 }
 
-static void
+void
 fe_stats_update(struct flow_entry *fe)
 {
 	struct sk_stats_flow *sf = &fe->fe_stats->fs_stats;

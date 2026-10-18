@@ -90,7 +90,9 @@ typedef struct _load_result {
 	    custom_stack            : 1,
 	    is_rosetta              : 1,
 	    hardened_heap           : 1,
-	    is_hardened_process     : 1;
+	    is_ipc_containment_vessel   : 1;
+	// 0 if not entitled, non-zero otherwise
+	uint8_t hardened_process_version;
 	unsigned int            csflags;
 	unsigned char           uuid[16];
 	mach_vm_address_t       min_vm_addr;

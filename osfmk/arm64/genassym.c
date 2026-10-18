@@ -81,10 +81,12 @@
 #include <arm/cpu_internal.h>
 #include <arm/rtclock.h>
 #include <machine/commpage.h>
+#include <machine/static_if.h>
 #include <vm/vm_map.h>
 #include <pexpert/arm64/boot.h>
 #include <arm64/machine_machdep.h>
 #include <arm64/proc_reg.h>
+#include <arm64/sop.h>
 #include <prng/random.h>
 #if HIBERNATION
 #include <IOKit/IOHibernatePrivate.h>
@@ -111,6 +113,8 @@
 #define DECLARE(SYM, VAL) \
 	__asm("DEFINITION__define__" SYM ":\t .ascii \"%0\"" : : "i"  ((u_long)(VAL)))
 
+#define DECLARE_STATIC_IF_METADATA(KEY) \
+	DECLARE(#KEY "_jump_key_INIT_VALUE", __static_if_key_init_value(KEY))
 
 int main(int     argc,
     char ** argv);
@@ -125,13 +129,18 @@ main(int     argc,
 	DECLARE("TH_TXM_THREAD_STACK", offsetof(struct thread, txm_thread_stack));
 #if CONFIG_EXCLAVES
 	DECLARE("TH_EXCLAVES_INTSTATE", offsetof(struct thread, th_exclaves_intstate));
+	DECLARE("TH_EXCLAVES_STATE", offsetof(struct thread, th_exclaves_state));
 	DECLARE("TH_EXCLAVES_EXECUTION", TH_EXCLAVES_EXECUTION);
 #endif /* CONFIG_EXCLAVES */
 #endif /* CONFIG_SPTM */
 	DECLARE("TH_RECOVER", offsetof(struct thread, recover));
 	DECLARE("TH_KSTACKPTR", offsetof(struct thread, machine.kstackptr));
+	DECLARE("TH_KERNEL_STACK", offsetof(struct thread, kernel_stack));
 #if __has_feature(ptrauth_calls)
 	DECLARE("TH_KSTACKPTR_DIVERSIFIER", ptrauth_string_discriminator("machine_thread.kstackptr"));
+#endif
+#if CONFIG_SPTM
+	DECLARE("TH_KREDZONESTACK", offsetof(struct thread, machine.kredzonestack));
 #endif
 	DECLARE("TH_THREAD_ID", offsetof(struct thread, thread_id));
 #if defined(HAS_APPLE_PAC)
@@ -157,6 +166,7 @@ main(int     argc,
 #if HAS_ARM_FEAT_SME
 	DECLARE("ACT_UMATRIX_HDR", offsetof(struct thread, machine.umatrix_hdr));
 	DECLARE("ACT_UMATRIX_HDR_DIVERSIFIER", ptrauth_string_discriminator("machine_thread.umatrix_hdr"));
+
 #endif /* HAS_ARM_FEAT_SME */
 	DECLARE("TH_CTH_SELF", offsetof(struct thread, machine.cthread_self));
 	DECLARE("ACT_PREEMPT_CNT", offsetof(struct thread, machine.preemption_count));
@@ -266,6 +276,9 @@ main(int     argc,
 	DECLARE("SS64_KERNEL_SSBS", offsetof(arm_kernel_context_t, ss.ssbs));
 	DECLARE("SS64_KERNEL_DIT", offsetof(arm_kernel_context_t, ss.dit));
 	DECLARE("SS64_KERNEL_UAO", offsetof(arm_kernel_context_t, ss.uao));
+#if HAS_MTE
+	DECLARE("SS64_KERNEL_TCO", offsetof(arm_kernel_context_t, ss.tco));
+#endif
 
 	DECLARE("NS64_KERNEL_D8", offsetof(arm_kernel_context_t, ns.d[0]));
 	DECLARE("NS64_KERNEL_D9", offsetof(arm_kernel_context_t, ns.d[1]));
@@ -311,6 +324,9 @@ main(int     argc,
 #if __ARM_KERNEL_PROTECT__
 	DECLARE("CPU_EXC_VECTORS", offsetof(cpu_data_t, cpu_exc_vectors));
 #endif /* __ARM_KERNEL_PROTECT__ */
+#if NEEDS_MTE_IRG_RESEED
+	DECLARE("CPU_IRG_RESEED_COUNTER", offsetof(cpu_data_t, cpu_irg_reseed_counter));
+#endif
 	DECLARE("CPU_NUMBER_GS", offsetof(cpu_data_t, cpu_number));
 	DECLARE("CPU_PENDING_AST", offsetof(cpu_data_t, cpu_pending_ast));
 	DECLARE("CPU_INT_STATE", offsetof(cpu_data_t, cpu_int_state));
@@ -380,6 +396,9 @@ main(int     argc,
 
 
 	DECLARE("CPU_SYNC_ON_CSWITCH", offsetof(cpu_data_t, sync_on_cswitch));
+#if HAS_MTE
+	DECLARE("IN_UNPRIVILEGED_ACCESS", offsetof(struct thread, machine.in_unprivileged_access));
+#endif /* HAS_MTE */
 
 #if HIBERNATION
 	DECLARE("HIBHDR_STACKOFFSET", offsetof(IOHibernateImageHeader, restore1StackOffset));
@@ -409,6 +428,25 @@ main(int     argc,
 	DECLARE("PANIC_LOCKDOWN_INITIATOR_STATE_ELR", offsetof(struct panic_lockdown_initiator_state, elr));
 	DECLARE("PANIC_LOCKDOWN_INITIATOR_STATE_FAR", offsetof(struct panic_lockdown_initiator_state, far));
 #endif /* CONFIG_SPTM && (DEVELOPMENT || DEBUG) */
+
+#if CONFIG_SPTM
+	DECLARE("PAGE_SIZE", PAGE_SIZE);
+	DECLARE("PAGE_MASK", PAGE_SIZE - 1);
+#endif /* CONFIG_SPTM */
+
+	DECLARE("SOP_EXCEPTION_SNAPSHOT_SIZE", sizeof(sop_exception_snapshot_t));
+
+	static_assert(!(SOP_EXCEPTION_RING_SIZE & (SOP_EXCEPTION_RING_SIZE - 1)),
+	    "SOP_EXCEPTION_RING_SIZE must be a power of 2");
+	DECLARE("SOP_EXCEPTION_RING_INDEX_MASK", SOP_EXCEPTION_RING_SIZE - 1);
+
+#if DEVELOPMENT || DEBUG
+	STATIC_IF_KEY_DECLARE_TRUE(static_if_test_key_true); DECLARE_STATIC_IF_METADATA(static_if_test_key_true);
+	STATIC_IF_KEY_DECLARE_TRUE(static_if_test_key_true_to_false); DECLARE_STATIC_IF_METADATA(static_if_test_key_true_to_false);
+	STATIC_IF_KEY_DECLARE_FALSE(static_if_test_key_false); DECLARE_STATIC_IF_METADATA(static_if_test_key_false);
+	STATIC_IF_KEY_DECLARE_FALSE(static_if_test_key_false_to_true); DECLARE_STATIC_IF_METADATA(static_if_test_key_false_to_true);
+#endif
+
 
 	return 0;
 }

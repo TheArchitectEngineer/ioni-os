@@ -283,7 +283,7 @@ ipc_object_translate(
 }
 
 /*
- *	Routine:	ipc_object_translate_pset_receive
+ *	Routine:	ipc_object_translate_port_pset
  *	Purpose:
  *		Look up two objects in a space (a port set and a receive right)
  *	Conditions:
@@ -560,15 +560,6 @@ ipc_object_copyin(
 
 	ipc_right_copyin_cleanup_destroy(&icc, name);
 	ipc_right_copyin_rcleanup_destroy(&icrc);
-
-	if (IP_VALID(*portp) &&
-	    ip_type(*portp) == IOT_SERVICE_PORT &&
-	    msgt_name == MACH_MSG_TYPE_MOVE_RECEIVE &&
-	    !task_is_initproc(space->is_task) &&
-	    !ipc_space_has_telemetry_type(space, IS_HAS_SERVICE_PORT_TELEMETRY)) {
-		ipc_stash_policy_violations_telemetry(IPCPV_MOVE_SERVICE_PORT,
-		    *portp, name);
-	}
 
 	return kr;
 }
@@ -1251,6 +1242,7 @@ ipc_object_validate_preflight_panic(ipc_object_t io)
  *		true:  the lock was acquired
  *		false: the object was freed or not initialized.
  */
+__mockable
 bool
 ipc_object_lock_allow_invalid(ipc_object_t orig_io)
 {
@@ -1273,7 +1265,7 @@ ipc_object_lock_allow_invalid(ipc_object_t orig_io)
 	return false;
 }
 
-__attribute__((always_inline))
+__always_inline_testable
 void
 ipc_object_unlock(ipc_object_t object)
 {

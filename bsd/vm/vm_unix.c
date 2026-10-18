@@ -39,7 +39,6 @@
  */
 #include <vm/vm_options.h>
 
-#include <kern/ecc.h>
 #include <kern/task.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
@@ -90,12 +89,13 @@
 #if SKYWALK
 #include <skywalk/os_channel.h>
 #endif /* SKYWALK */
-
 #include <security/audit/audit.h>
 #include <security/mac.h>
 #include <bsm/audit_kevents.h>
 
 #include <kern/kalloc.h>
+#include <kern/host_statistics.h>
+
 #include <vm/vm_map_internal.h>
 #include <vm/vm_kern_xnu.h>
 #include <vm/vm_pageout_xnu.h>
@@ -106,11 +106,19 @@
 #include <vm/vm_dyld_pager_internal.h>
 #include <vm/vm_protos_internal.h>
 #include <vm/vm_compressor_info.h>         /* for c_segment_info */
+#include <vm/vm_compressor_internal.h>
 #include <vm/vm_compressor_xnu.h>          /* for vm_compressor_serialize_segment_debug_info() */
 #include <vm/vm_object_xnu.h>              /* for vm_chead_select_t */
 #include <vm/vm_memory_entry_xnu.h>
 #include <vm/vm_iokit.h>
 #include <vm/vm_reclaim_xnu.h>
+#include <vm/vm_map_xnu.h>
+#include <vm/vm_page.h>
+#if HAS_MTE
+#include <vm/vm_compressor_xnu.h>
+#include <vm/vm_mteinfo_internal.h>
+#endif /* HAS_MTE */
+#include <vm/vm_page.h>
 
 #include <sys/kern_memorystatus.h>
 #include <sys/kern_memorystatus_freeze.h>
@@ -149,6 +157,159 @@ sysctl_vm_object_cache_evict SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_vm, OID_AUTO, object_cache_evict, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED,
     0, 0, &sysctl_vm_object_cache_evict, "I", "");
 
+static vm_map_t
+get_vm_map(pid_t pid)
+{
+	proc_t p = PROC_NULL;
+	task_t task = TASK_NULL;
+	vm_map_t map = VM_MAP_NULL;
+
+	/* go from pid to proc to task to vm_map */
+	p = proc_find(pid); /* this increments a reference to the proc */
+	if (p == PROC_NULL) {
+		return VM_MAP_NULL;
+	}
+
+	task = proc_task(p);
+	if (task == TASK_NULL) {
+		proc_rele(p);  /* decrement ref of proc */
+		return VM_MAP_NULL;
+	}
+	/* convert proc reference to task reference */
+	task_reference(task);
+
+	proc_rele(p);
+	p = PROC_NULL;
+
+	/* task reference to map reference */
+	map = get_task_map_reference(task);
+	task_deallocate(task);
+
+	return map;
+}
+
+/* Structure for VM entry lock/block operations */
+typedef struct {
+	mach_vm_address_t address;
+	uint64_t size; /* bytes */
+	pid_t pid;
+	uint32_t flags;
+} dbg_vm_entry_lock_args;
+
+/* Structure for VM entry read count check operations */
+typedef struct {
+	mach_vm_address_t address;
+	pid_t pid;
+	uint16_t expected_readers;
+} dbg_vm_entry_read_count_args;
+
+static int
+sysctl_dbg_vm_entry_lock_block SYSCTL_HANDLER_ARGS
+{
+	int error;
+	vm_map_t map = VM_MAP_NULL;
+	dbg_vm_entry_lock_args args;
+	kern_return_t kr;
+
+	error = SYSCTL_IN(req, &args, sizeof(args));
+	if (error) {
+		return error;
+	}
+
+	map = get_vm_map(args.pid);
+	if (map == VM_MAP_NULL) {
+		printf("couldn't find vm_map of pid %d\n", args.pid);
+		return EINVAL;
+	}
+
+	if (args.flags != DBG_LCK_FLAG_EXCLUSIVE && args.flags != DBG_LCK_FLAG_SHARED) {
+		printf("error: bad locking type %d\n", args.flags);
+		vm_map_deallocate(map);
+		return EINVAL;
+	}
+
+	kr = vm_map_dbg_lock_vm_entry_and_block(map, args.address, args.size, args.flags);
+	vm_map_deallocate(map);
+	if (kr != KERN_SUCCESS) {
+		return EINVAL;
+	}
+	return 0;
+}
+
+static int
+sysctl_dbg_vm_entry_read_count SYSCTL_HANDLER_ARGS
+{
+	int error;
+	vm_map_t map = VM_MAP_NULL;
+	dbg_vm_entry_read_count_args args;
+	kern_return_t kr;
+	uint16_t read_count = 0;
+	int result;
+
+	error = SYSCTL_IN(req, &args, sizeof(args));
+	if (error) {
+		return error;
+	}
+
+	if (!args.address) {
+		return EINVAL;
+	}
+
+	map = get_vm_map(args.pid);
+	if (map == VM_MAP_NULL) {
+		printf("couldn't find vm_map of pid %d\n", args.pid);
+		return EINVAL;
+	}
+
+	kr = get_vm_entry_read_count(map, args.address, &read_count);
+	vm_map_deallocate(map);
+
+	if (kr != KERN_SUCCESS) {
+		/* Return false (0) if we couldn't get the read count */
+		result = 0;
+	} else {
+		/* Exact match: read count must equal expected_readers */
+		result = (read_count == args.expected_readers) ? 1 : 0;
+		if (!result) {
+			printf("read count: %d, expected: %d\n", read_count, args.expected_readers);
+		}
+	}
+
+	return SYSCTL_OUT(req, &result, sizeof(result));
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, dbg_vm_entry_lock_block, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED | CTLFLAG_MASKED,
+    0, 0, &sysctl_dbg_vm_entry_lock_block, "I", "VM entry lock and block operation");
+
+SYSCTL_PROC(_vm, OID_AUTO, dbg_vm_entry_read_count, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED | CTLFLAG_MASKED,
+    0, 0, &sysctl_dbg_vm_entry_read_count, "I", "VM entry read count check operation");
+
+static int
+sysctl_dbg_range_lock_wakeup SYSCTL_HANDLER_ARGS
+{
+	int error;
+	vm_map_t map = VM_MAP_NULL;
+	pid_t pid = 0;
+
+	error = SYSCTL_IN(req, &pid, sizeof(pid));
+	if (error) {
+		return error;
+	}
+
+	map = get_vm_map(pid);
+	if (map == VM_MAP_NULL) {
+		printf("couldn't find vm_map of pid %d\n", pid);
+		return EINVAL;
+	}
+
+	thread_wakeup(map);
+	vm_map_deallocate(map);
+	return 0;
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, dbg_range_lock_wakeup, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED | CTLFLAG_MASKED,
+    0, 0, &sysctl_dbg_range_lock_wakeup, "I", "");
+
 static int
 sysctl_kmem_alloc_contig SYSCTL_HANDLER_ARGS
 {
@@ -179,20 +340,89 @@ SYSCTL_PROC(_vm, OID_AUTO, kmem_alloc_contig, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG
 extern int vm_region_footprint;
 SYSCTL_INT(_vm, OID_AUTO, region_footprint, CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &vm_region_footprint, 0, "");
 
-static int
-sysctl_kmem_gobj_stats SYSCTL_HANDLER_ARGS
-{
-#pragma unused(arg1, arg2, oidp)
-	kmem_gobj_stats stats = kmem_get_gobj_stats();
+#endif /* DEVELOPMENT || DEBUG */
 
-	return SYSCTL_OUT(req, &stats, sizeof(stats));
+SYSCTL_NODE(_vm, OID_AUTO, lock_contention, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM lock contention debugging");
+
+extern int vm_lock_contention_debug;
+
+/**
+ * This sysctl toggles whether VM lock contention profiling is enabled system-wide.  The vm_lock_contention_debug
+ * variable on which this sysctl operates is also exposed as a TUNABLE so that the profiling state can be
+ * managed from boot via a boot-arg.  Note that tasks examine this value and store it in a vm_map flag only
+ * upon task creation; therefore, changing this flag at runtime will only alter the behavior of tasks spawned
+ * after the change.
+ */
+SYSCTL_INT(_vm_lock_contention, OID_AUTO, global_enable, CTLFLAG_RW | CTLFLAG_LOCKED, &vm_lock_contention_debug, 0, "");
+
+/**
+ * This sysctl toggles whether VM lock contention profiling is enabled for the calling task.
+ * By default, each task inherits the value of the 'global_enable' state at the time of its creation.
+ * However, a task may also invoke this sysctl to independently alter its own lock contention profiling
+ * state; the update will take effect immediately.
+ */
+static int
+sysctl_set_vm_lock_contention_debug SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int enable = 0;
+	int error = sysctl_handle_int(oidp, &enable, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+	vm_map_set_lock_contention_debug(current_map(), enable);
+	return error;
 }
 
-SYSCTL_PROC(_vm, OID_AUTO, kmem_gobj_stats,
-    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_MASKED,
-    0, 0, &sysctl_kmem_gobj_stats, "S,kmem_gobj_stats", "");
+SYSCTL_PROC(_vm_lock_contention, OID_AUTO, local_enable, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_set_vm_lock_contention_debug, "I", "");
 
-#endif /* DEVELOPMENT || DEBUG */
+#if DEBUG || DEVELOPMENT
+
+/*
+ * These counters are meant to provide a frame of reference for the contention counters below, by
+ * tracking total instances of various locking scenarios, regardless of whether they produced
+ * additional lock contention.  As such, these counters must be updated on common VM fault paths
+ * and are therefore not tracked on release builds.
+ */
+SCALABLE_COUNTER_DECLARE(vm_fault_busy_trylock_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_busy_trylock_count, vm_fault_busy_trylock_count,
+    "Total number of VM fault entry lock attempts while holding busy page");
+SCALABLE_COUNTER_DECLARE(vm_fault_excl_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_excl_count, vm_fault_excl_count,
+    "Total number of VM fault operations taken under an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_count, vm_fault_page_excl_count,
+    "Total number vm_fault_page() operations taken under an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_copy_busy_trylock_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_copy_busy_trylock_count, vm_fault_copy_busy_trylock_count,
+    "Total number of vm_fault_copy() lock attempts while holding busy page");
+#endif /* DEBUG || DEVELOPMENT */
+
+SCALABLE_COUNTER_DECLARE(vm_fault_busy_retry_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_busy_retry_count, vm_fault_busy_retry_count,
+    "Number of VM fault entry lock attempts that needed retries while holding busy page");
+SCALABLE_COUNTER_DECLARE(vm_fault_excl_busy_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_excl_busy_count, vm_fault_excl_busy_count,
+    "Number of VM fault operations that needed to wait on a busy page while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_busy_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_busy_count, vm_fault_page_excl_busy_count,
+    "Number of vm_fault_page() operations  that needed to wait on a busy page while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_clean_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_clean_count, vm_fault_page_excl_clean_count,
+    "Number of vm_fault_page() operations that needed to wait on a page being cleaned while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_busy_copy_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_busy_copy_count, vm_fault_page_excl_busy_copy_count,
+    "Number of vm_fault_page() operations that needed to wait on a busy page to be copied, while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_blocked_obj_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_blocked_obj_count, vm_fault_page_excl_blocked_obj_count,
+    "Number of vm_fault_page() operations that needed to wait on a blocked VM object while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_page_excl_pager_not_ready_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_page_excl_pager_not_ready_count, vm_fault_page_excl_pager_not_ready_count,
+    "Number of vm_fault_page() operations that needed to wait for an object's pager to become ready, while holding an exclusive entry lock");
+SCALABLE_COUNTER_DECLARE(vm_fault_copy_busy_retry_count);
+SYSCTL_SCALABLE_COUNTER(_vm_lock_contention, fault_copy_busy_retry_count, vm_fault_copy_busy_retry_count,
+    "Number of vm_fault_copy() lock attempts that needed retries while holding busy page");
 
 static int
 sysctl_vm_self_region_footprint SYSCTL_HANDLER_ARGS
@@ -314,6 +544,9 @@ SYSCTL_INT(_vm, OID_AUTO, apple_protect_pager_count_mapped, CTLFLAG_RD | CTLFLAG
 SYSCTL_UINT(_vm, OID_AUTO, apple_protect_pager_cache_limit, CTLFLAG_RW | CTLFLAG_LOCKED, &apple_protect_pager_cache_limit, 0, "");
 
 #if DEVELOPMENT || DEBUG
+extern int vm_has_range_locking;
+SYSCTL_INT(_vm, OID_AUTO, has_range_locking, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_has_range_locking, 0, "");
+
 extern int radar_20146450;
 SYSCTL_INT(_vm, OID_AUTO, radar_20146450, CTLFLAG_RW | CTLFLAG_LOCKED, &radar_20146450, 0, "");
 
@@ -395,6 +628,11 @@ extern unsigned int free_page_size_tt_count;
 extern unsigned int free_tt_count;
 SYSCTL_UINT(_vm, OID_AUTO, free_1page_tte_root, CTLFLAG_RD | CTLFLAG_LOCKED, &free_page_size_tt_count, 0, "");
 SYSCTL_UINT(_vm, OID_AUTO, free_tte_root, CTLFLAG_RD | CTLFLAG_LOCKED, &free_tt_count, 0, "");
+#else
+extern unsigned long total_delayed_free_pt_count;
+extern unsigned long current_delayed_free_pt_count;
+SYSCTL_ULONG(_vm, OID_AUTO, total_delayed_free_pt_count, CTLFLAG_RD | CTLFLAG_LOCKED, &total_delayed_free_pt_count, "");
+SYSCTL_ULONG(_vm, OID_AUTO, current_delayed_free_pt_count, CTLFLAG_RD | CTLFLAG_LOCKED, &current_delayed_free_pt_count, "");
 #endif
 #if DEVELOPMENT || DEBUG
 extern unsigned long pmap_asid_flushes;
@@ -614,7 +852,11 @@ log_unnest_badness(
 	    vm_map_offset_t, s,
 	    vm_map_offset_t, e,
 	    vm_map_offset_t, lowest_unnestable_addr);
+#if defined(__x86_64__)
 	printf("%s[%d] triggered unnest of range 0x%qx->0x%qx of DYLD shared region in VM map %p. While not abnormal for debuggers, this increases system memory footprint until the target exits.\n", current_proc()->p_comm, proc_getpid(current_proc()), (uint64_t)s, (uint64_t)e, (void *) VM_KERNEL_ADDRPERM(m));
+#else
+	printf("%s[%d] triggered unnest of range 0x%qx->0x%qx of DYLD shared region in VM map %p. While not abnormal for debuggers, this increases system memory footprint almost permanently (until the shared region is re-slid).\n", current_proc()->p_comm, proc_getpid(current_proc()), (uint64_t)s, (uint64_t)e, (void *) VM_KERNEL_ADDRPERM(m));
+#endif
 }
 
 uint64_t
@@ -2106,6 +2348,17 @@ done:
 	return kr;
 }
 
+
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_total_success, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_total_success, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_total_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_total_fail, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_overflow, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_overflow, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_offset, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_offset, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_addr, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_addr, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_prot, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_prot, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_file, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_file, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_shadows, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_shadows, "");
+SYSCTL_QUAD(_vm, OID_AUTO, vmwls_bad_cow, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_with_linking_stats.vmwls_bad_cow, "");
+
 /*
  * A syscall for dyld to use to map data pages that need load time relocation fixups.
  * The fixups are performed by a custom pager during page-in, so the pages still appear
@@ -2460,13 +2713,13 @@ SYSCTL_PROC(_vm, OID_AUTO, page_free_wanted,
     CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, vm_ctl_page_free_wanted, "I", "");
 
-extern unsigned int     vm_page_purgeable_count;
-SYSCTL_INT(_vm, OID_AUTO, page_purgeable_count, CTLFLAG_RD | CTLFLAG_LOCKED,
-    &vm_page_purgeable_count, 0, "Purgeable page count");
+SCALABLE_COUNTER_DECLARE(vm_page_purgeable_count);
+SYSCTL_SCALABLE_COUNTER(_vm, page_purgeable_count,
+    vm_page_purgeable_count, "Purgeable page count");
 
-extern unsigned int     vm_page_purgeable_wired_count;
-SYSCTL_INT(_vm, OID_AUTO, page_purgeable_wired_count, CTLFLAG_RD | CTLFLAG_LOCKED,
-    &vm_page_purgeable_wired_count, 0, "Wired purgeable page count");
+SCALABLE_COUNTER_DECLARE(vm_page_purgeable_wired_count);
+SYSCTL_SCALABLE_COUNTER(_vm, page_purgeable_wired_count,
+    vm_page_purgeable_wired_count, "Wired purgeable page count");
 
 extern unsigned int vm_page_kern_lpage_count;
 SYSCTL_INT(_vm, OID_AUTO, kern_lpage_count, CTLFLAG_RD | CTLFLAG_LOCKED,
@@ -2562,19 +2815,27 @@ SYSCTL_QUAD(_vm, OID_AUTO, free_shared, CTLFLAG_RD | CTLFLAG_LOCKED,
     &vm_page_stats_reusable.free_shared, "");
 
 
-extern unsigned int vm_page_free_count, vm_page_speculative_count;
-SYSCTL_UINT(_vm, OID_AUTO, page_free_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_free_count, 0, "");
-SYSCTL_UINT(_vm, OID_AUTO, page_speculative_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_speculative_count, 0, "");
-
-extern unsigned int vm_page_cleaned_count;
-SYSCTL_UINT(_vm, OID_AUTO, page_cleaned_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_cleaned_count, 0, "Cleaned queue size");
+SYSCTL_UINT(_vm, OID_AUTO, page_free_count, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_free_count, 0, "The number of pages which are free");
+SYSCTL_UINT(_vm, OID_AUTO, page_speculative_count, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_speculative_count, 0,
+    "The number of pages which hold content read speculatively (due to "
+    "read-around)");
+SYSCTL_UINT(_vm, OID_AUTO, page_cleaned_count, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_cleaned_count, 0,
+    "The number of inactive pages which have been cleaned");
+SYSCTL_UINT(_vm, OID_AUTO, page_throttled_count, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_throttled_count, 0,
+    "The number of inactive pages which are throttled");
 
 extern unsigned int vm_page_pageable_internal_count, vm_page_pageable_external_count;
 SYSCTL_UINT(_vm, OID_AUTO, page_pageable_internal_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_pageable_internal_count, 0, "");
 SYSCTL_UINT(_vm, OID_AUTO, page_pageable_external_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_pageable_external_count, 0, "");
 
 /* pageout counts */
-SYSCTL_UINT(_vm, OID_AUTO, pageout_inactive_clean, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_state.vm_pageout_inactive_clean, 0, "");
+SYSCTL_UINT(_vm, OID_AUTO, pageout_clean_but_shadowing, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_state.vm_pageout_clean_but_shadowing, 0, "");
+SYSCTL_UINT(_vm, OID_AUTO, pageout_clean_no_shadowing, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_state.vm_pageout_clean_no_shadowing, 0, "");
+SYSCTL_ULONG(_vm, OID_AUTO, pageout_inactive_clean, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_vminfo.vm_pageout_inactive_clean, "");
 SYSCTL_UINT(_vm, OID_AUTO, pageout_inactive_used, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_state.vm_pageout_inactive_used, 0, "");
 
 SYSCTL_ULONG(_vm, OID_AUTO, pageout_inactive_dirty_internal, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_pageout_vminfo.vm_pageout_inactive_dirty_internal, "");
@@ -2592,6 +2853,11 @@ extern unsigned int vm_page_realtime_count;
 SYSCTL_UINT(_vm, OID_AUTO, page_realtime_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_realtime_count, 0, "");
 extern int vm_pageout_protect_realtime;
 SYSCTL_INT(_vm, OID_AUTO, pageout_protect_realtime, CTLFLAG_RW | CTLFLAG_LOCKED, &vm_pageout_protect_realtime, 0, "");
+
+extern _Atomic unsigned int vm_page_shared_region_count;
+SYSCTL_UINT(_vm, OID_AUTO, page_shared_region_count,
+    CTLFLAG_RD | CTLFLAG_LOCKED, &vm_page_shared_region_count, 0,
+    "The number of resident pages backed by a shared region");
 
 /* counts of pages prefaulted when entering a memory object */
 extern int64_t vm_prefault_nb_pages, vm_prefault_nb_bailout;
@@ -2731,15 +2997,23 @@ sysctl_vm_reclaim_drain_pid SYSCTL_HANDLER_ARGS
 	}
 	task_reference(t);
 	proc_rele(p);
-	kr = vm_deferred_reclamation_task_drain(t, RECLAIM_OPTIONS_NONE);
+	vm_deferred_reclamation_options_t opt =
+	    (vm_deferred_reclamation_options_t)arg2;
+	kr = vm_deferred_reclamation_task_drain(t, opt);
 	task_deallocate(t);
 	return mach_to_bsd_errno(kr);
 }
 
 SYSCTL_PROC(_vm_reclaim, OID_AUTO, drain_pid,
-    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0,
-    &sysctl_vm_reclaim_drain_pid, "I",
+    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0,
+    RECLAIM_OPTIONS_NONE, &sysctl_vm_reclaim_drain_pid, "I",
     "Drain the deferred reclamation buffer for a pid");
+
+SYSCTL_PROC(_vm_reclaim, OID_AUTO, drain_pid_no_fault,
+    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0,
+    RECLAIM_NO_FAULT, &sysctl_vm_reclaim_drain_pid, "I",
+    "Drain the deferred reclamation buffer for a pid but do not fault on rings "
+    "if non-resident");
 
 static int
 proc_filter_reclaimable(proc_t p, __unused void *arg)
@@ -2782,13 +3056,14 @@ SYSCTL_PROC(_vm_reclaim, OID_AUTO, drain_all,
 extern uint32_t vm_reclaim_buffer_count;
 extern uint64_t vm_reclaim_gc_epoch;
 extern uint64_t vm_reclaim_gc_reclaim_count;
-extern uint64_t vm_reclaim_sampling_period_abs;
-extern uint64_t vm_reclaim_sampling_period_ns;
 extern bool vm_reclaim_debug;
-#if XNU_TARGET_OS_IOS
-extern uint64_t vm_reclaim_max_threshold;
-#else /* !XNU_TARGET_OS_IOS */
 extern bool vm_reclaim_enabled;
+extern uint64_t vm_reclaim_sampling_period_normal_abs;
+extern uint64_t vm_reclaim_sampling_period_pressure_abs;
+extern uint64_t vm_reclaim_sampling_period_critical_abs;
+extern uint64_t vm_reclaim_sampling_period_normal_ns;
+extern uint64_t vm_reclaim_sampling_period_pressure_ns;
+extern uint64_t vm_reclaim_sampling_period_critical_ns;
 extern uint32_t vm_reclaim_autotrim_pct_normal;
 extern uint32_t vm_reclaim_autotrim_pct_pressure;
 extern uint32_t vm_reclaim_autotrim_pct_critical;
@@ -2796,7 +3071,6 @@ extern uint32_t vm_reclaim_wma_weight_base;
 extern uint32_t vm_reclaim_wma_weight_cur;
 extern uint32_t vm_reclaim_wma_denom;
 extern uint64_t vm_reclaim_abandonment_threshold;
-#endif /* XNU_TARGET_OS_IOS */
 
 SYSCTL_UINT(_vm_reclaim, OID_AUTO, reclaim_buffer_count,
     CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)&vm_reclaim_buffer_count, 0,
@@ -2810,12 +3084,6 @@ SYSCTL_QUAD(_vm_reclaim, OID_AUTO, reclaim_gc_reclaim_count,
 SYSCTL_COMPAT_UINT(_vm_reclaim, OID_AUTO, debug,
     CTLFLAG_RW | CTLFLAG_LOCKED, &vm_reclaim_debug, 0,
     "Debug logs for vm.reclaim");
-#if XNU_TARGET_OS_IOS
-SYSCTL_QUAD(_vm_reclaim, OID_AUTO, max_threshold,
-    CTLFLAG_RW | CTLFLAG_LOCKED, &vm_reclaim_max_threshold,
-    "Maximum amount of virtual memory (in B) that may be deferred without "
-    "synchronous reclamation");
-#else /* !XNU_TARGET_OS_IOS */
 SYSCTL_COMPAT_UINT(_vm_reclaim, OID_AUTO, enabled,
     CTLFLAG_RW | CTLFLAG_LOCKED, &vm_reclaim_enabled, 0,
     "Whether deferred memory reclamation is enabled on this system");
@@ -2844,27 +3112,43 @@ SYSCTL_QUAD(_vm_reclaim, OID_AUTO, abandonment_threshold,
     CTLFLAG_RW | CTLFLAG_LOCKED, &vm_reclaim_abandonment_threshold,
     "The number of sampling periods between accounting updates that may elapse "
     "before the buffer is considered \"abandoned\"");
-#endif /* XNU_TARGET_OS_IOS */
 
 static int
 sysctl_vm_reclaim_sampling_period SYSCTL_HANDLER_ARGS
 {
 	uint64_t new_val_ns;
-	uint64_t old_val_ns = vm_reclaim_sampling_period_ns;
-	int err = sysctl_io_number(req, vm_reclaim_sampling_period_ns,
-	    sizeof(vm_reclaim_sampling_period_ns), &new_val_ns, NULL);
+	uint64_t old_val_ns = *(uint64_t *)arg1;
+	int err = sysctl_io_number(req, old_val_ns,
+	    sizeof(old_val_ns), &new_val_ns, NULL);
 	if (err || !req->newptr) {
 		return err;
 	}
 	if (new_val_ns != old_val_ns) {
-		vm_reclaim_sampling_period_ns = new_val_ns;
-		nanoseconds_to_absolutetime(vm_reclaim_sampling_period_ns, &vm_reclaim_sampling_period_abs);
+		uint64_t *ptr = (uint64_t *)arg1;
+		if (ptr == &vm_reclaim_sampling_period_normal_ns) {
+			nanoseconds_to_absolutetime(new_val_ns, &vm_reclaim_sampling_period_normal_abs);
+		} else if (ptr == &vm_reclaim_sampling_period_pressure_ns) {
+			nanoseconds_to_absolutetime(new_val_ns, &vm_reclaim_sampling_period_pressure_abs);
+		} else if (ptr == &vm_reclaim_sampling_period_critical_ns) {
+			nanoseconds_to_absolutetime(new_val_ns, &vm_reclaim_sampling_period_critical_abs);
+		} else {
+			return EINVAL;
+		}
+		*ptr = new_val_ns;
 	}
 	return 0;
 }
 
-SYSCTL_PROC(_vm_reclaim, OID_AUTO, sampling_period_ns,
-    CTLFLAG_RW | CTLTYPE_QUAD | CTLFLAG_LOCKED, NULL, 0, sysctl_vm_reclaim_sampling_period, "QU",
+SYSCTL_PROC(_vm_reclaim, OID_AUTO, sampling_period_normal_ns,
+    CTLFLAG_RW | CTLTYPE_QUAD | CTLFLAG_LOCKED, &vm_reclaim_sampling_period_normal_ns, 0, sysctl_vm_reclaim_sampling_period, "QU",
+    "Interval (nanoseconds) at which to sample the minimum buffer size and "
+    "consider trimming excess");
+SYSCTL_PROC(_vm_reclaim, OID_AUTO, sampling_period_pressure_ns,
+    CTLFLAG_RW | CTLTYPE_QUAD | CTLFLAG_LOCKED, &vm_reclaim_sampling_period_pressure_ns, 0, sysctl_vm_reclaim_sampling_period, "QU",
+    "Interval (nanoseconds) at which to sample the minimum buffer size and "
+    "consider trimming excess");
+SYSCTL_PROC(_vm_reclaim, OID_AUTO, sampling_period_critical_ns,
+    CTLFLAG_RW | CTLTYPE_QUAD | CTLFLAG_LOCKED, &vm_reclaim_sampling_period_critical_ns, 0, sysctl_vm_reclaim_sampling_period, "QU",
     "Interval (nanoseconds) at which to sample the minimum buffer size and "
     "consider trimming excess");
 #endif /* DEVELOPMENT || DEBUG */
@@ -3235,12 +3519,6 @@ SYSCTL_INT(_vm, OID_AUTO, shared_region_count,
 SYSCTL_INT(_vm, OID_AUTO, shared_region_peak,
     CTLFLAG_RD | CTLFLAG_LOCKED, &vm_shared_region_peak, 0, "");
 #if DEVELOPMENT || DEBUG
-extern unsigned int shared_region_pagers_resident_count;
-SYSCTL_INT(_vm, OID_AUTO, shared_region_pagers_resident_count,
-    CTLFLAG_RD | CTLFLAG_LOCKED, &shared_region_pagers_resident_count, 0, "");
-extern unsigned int shared_region_pagers_resident_peak;
-SYSCTL_INT(_vm, OID_AUTO, shared_region_pagers_resident_peak,
-    CTLFLAG_RD | CTLFLAG_LOCKED, &shared_region_pagers_resident_peak, 0, "");
 extern int shared_region_pager_count;
 SYSCTL_INT(_vm, OID_AUTO, shared_region_pager_count,
     CTLFLAG_RD | CTLFLAG_LOCKED, &shared_region_pager_count, 0, "");
@@ -3273,6 +3551,10 @@ SYSCTL_QUAD(_vm, OID_AUTO, map_set_size_limit_count, CTLFLAG_RD | CTLFLAG_LOCKED
 SYSCTL_QUAD(_vm, OID_AUTO, map_set_data_limit_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_set_data_limit_count, "");
 SYSCTL_QUAD(_vm, OID_AUTO, map_enter_RLIMIT_AS_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_enter_RLIMIT_AS_count, "");
 SYSCTL_QUAD(_vm, OID_AUTO, map_enter_RLIMIT_DATA_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_map_enter_RLIMIT_DATA_count, "");
+
+extern uint64_t vm_map_copy_extra_adjustments;
+SYSCTL_QUAD(_vm, OID_AUTO, map_copy_extra_adjustments, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_map_copy_extra_adjustments, "");
 
 extern uint64_t vm_fault_resilient_media_initiate;
 extern uint64_t vm_fault_resilient_media_retry;
@@ -3334,20 +3616,239 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_pivot,
 
 extern uint64_t vm_object_shadow_forced;
 extern uint64_t vm_object_shadow_skipped;
+extern uint64_t vm_object_shadow_set_shadowed;
 SYSCTL_QUAD(_vm, OID_AUTO, object_shadow_forced, CTLFLAG_RD | CTLFLAG_LOCKED,
     &vm_object_shadow_forced, "");
 SYSCTL_QUAD(_vm, OID_AUTO, object_shadow_skipped, CTLFLAG_RD | CTLFLAG_LOCKED,
     &vm_object_shadow_skipped, "");
+SYSCTL_QUAD(_vm, OID_AUTO, object_shadow_set_shadowed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_object_shadow_set_shadowed, "");
 
 extern uint64_t vm_object_upl_throttle_cnt;
 SYSCTL_QUAD(_vm, OID_AUTO, object_upl_throttle_cnt, CTLFLAG_RD | CTLFLAG_LOCKED,
     &vm_object_upl_throttle_cnt,
     "The number of times in which a UPL write was throttled due to pageout starvation");
 
+#if HAS_MTE
+#pragma mark MTE
+
+SYSCTL_NODE(_vm, OID_AUTO, mte, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "mte");
+
+/* sysctls for vm.mte.* counters. */
+
+SYSCTL_UINT(_vm_mte, OID_AUTO, tagged, CTLFLAG_RD,
+    &vm_page_tagged_count, 0, "tagged pages in use");
+
+SYSCTL_QUAD(_vm_mte, OID_AUTO, refill_thread_wakeups, CTLFLAG_RD,
+    &vm_mte_refill_thread_wakeups,
+    "the number of times the refill thread was woken up");
+
+/* sysctls for vm.mte.free.* counters. */
+
+SYSCTL_NODE(_vm_mte, OID_AUTO, free, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "free counts");
+
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, total, CTLFLAG_RD,
+    &vm_page_free_count, 0,
+    "total free pages (same as vm.page_free_count)");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, taggable, CTLFLAG_RD,
+    &vm_page_free_taggable_count, 0,
+    "free taggable pages in the MTE free queue");
+
+static int
+tag_storage_claimable SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2, oidp)
+	/* Note: this calculation will be racey. */
+	uint32_t value = mteinfo_claimable_count();
+
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+SYSCTL_PROC(_vm_mte_free, OID_AUTO, claimable,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, &tag_storage_claimable, "I",
+    "claimable inactive tag storage pages");
+
+SYSCTL_SCALABLE_COUNTER(_vm_mte_free, cpu_untagged, vm_cpu_free_count,
+    "free untagged pages in CPU lists");
+SYSCTL_SCALABLE_COUNTER(_vm_mte_free, cpu_claimed, vm_cpu_free_claimed_count,
+    "free claimed pages in CPU lists");
+SYSCTL_SCALABLE_COUNTER(_vm_mte_free, cpu_tagged, vm_cpu_free_tagged_count,
+    "free tagged pages in CPU lists");
+
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_untaggable_0, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_UNTAGGABLE_0].vmpfq_count, 0,
+    "disabled/pinned/deactivating/claimed (with 16 free pages or less) tag storage pages");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_untaggable_1, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_UNTAGGABLE_1].vmpfq_count, 0,
+    "claimed (with 17 free pages or more) or disabled (with 16 pages or less) tag storage pages");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_untaggable_2, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_UNTAGGABLE_2].vmpfq_count, 0,
+    "disabled (with 17 pages or more) tag storage pages");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_active_0, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_ACTIVE_0].vmpfq_count, 0,
+    "active tag storages with free covered pages (bucket 0)");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_active_1, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_ACTIVE_1].vmpfq_count, 0,
+    "active tag storages with free covered pages (bucket 1)");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_active_2, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_ACTIVE_2].vmpfq_count, 0,
+    "active tag storages with free covered pages (bucket 2)");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_active_3, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_ACTIVE_3].vmpfq_count, 0,
+    "active tag storages with free covered pages (bucket 3)");
+SYSCTL_UINT(_vm_mte_free, OID_AUTO, tag_storage_untaggable_activating, CTLFLAG_RD,
+    &mte_free_queues[MTE_FREE_UNTAGGABLE_ACTIVATING].vmpfq_count, 0,
+    "activating/reclaiming tag storages with free covered pages");
+
+/* sysctls for vm.mte.tag_storage.cell_* counters. */
+
+SYSCTL_NODE(_vm_mte, OID_AUTO, cell, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "mte cell");
+
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, disabled, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_DISABLED_IDX].count, 0,
+    "free inactive tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, disabled_recursive, CTLFLAG_RD,
+    &vm_page_recursive_tag_storage_count, 0,
+    "recursive tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, disabled_unmanaged, CTLFLAG_RD,
+    &vm_page_unmanaged_tag_storage_count, 0,
+    "unmanaged tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, retired, CTLFLAG_RD,
+    &vm_page_retired_tag_storage_count, 0,
+    "retired tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, pinned, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_PINNED_IDX].count, 0,
+    "unreclaimable tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, deactivating, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_DEACTIVATING_IDX].count, 0,
+    "deactivating tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, claimed, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_CLAIMED_IDX].count, 0,
+    "claimed tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, inactive, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_INACTIVE_IDX].count, 0,
+    "free inactive tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, reclaiming, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_RECLAIMING_IDX].count, 0,
+    "reclaiming tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, activating, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_ACTIVATING_IDX].count, 0,
+    "activating tag storage pages");
+SYSCTL_UINT(_vm_mte_cell, OID_AUTO, active_0, CTLFLAG_RD,
+    &mte_info_lists[MTE_LIST_ACTIVE_0_IDX].count, 0,
+    "active tag storage pages with no used page tagged");
+static int
+tag_storage_active SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2, oidp)
+	uint32_t value = mteinfo_tag_storage_active();
+
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+SYSCTL_PROC(_vm_mte_cell, OID_AUTO, active,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, &tag_storage_active, "I",
+    "active tag storage pages");
+
+/* sysctls for vm.mte.tag_storage.* counters. */
+
+SYSCTL_NODE(_vm_mte, OID_AUTO, tag_storage, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "mte tag storage");
+
+SYSCTL_UINT(_vm_mte_tag_storage, OID_AUTO, reserved, CTLFLAG_RD,
+    &vm_page_tag_storage_reserved, 0,
+    "free tag storage pages reserve");
+SYSCTL_UINT(_vm_mte_tag_storage, OID_AUTO, wired, CTLFLAG_RD,
+    &vm_page_wired_tag_storage_count, 0,
+    "wired tag storage pages");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, activations, CTLFLAG_RD,
+    &vm_page_tag_storage_activation_count,
+    "tag storage activations (inactive/claimed -> active)");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, deactivations, CTLFLAG_RD,
+    &vm_page_tag_storage_deactivation_count,
+    "tag storage deactivations (active -> inactive)");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, reclaims, CTLFLAG_RD,
+    &vm_page_tag_storage_reclaim_success_count,
+    "successful tag storage reclamations");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, reclaims_from_cpu, CTLFLAG_RD,
+    &vm_page_tag_storage_reclaim_from_cpu_count,
+    "successful tag storage reclamations from the cpu free lists");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, reclaim_failures, CTLFLAG_RD,
+    &vm_page_tag_storage_reclaim_failure_count,
+    "failed tag storage reclamations");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, reclaim_wired_failures, CTLFLAG_RD,
+    &vm_page_tag_storage_reclaim_wired_failure_count,
+    "failed tag storage reclamations due to tag storage being wired");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, wire_relocations, CTLFLAG_RD,
+    &vm_page_tag_storage_wire_relocation_count,
+    "tag storage relocations due to wiring");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, reclaim_compressor_failures, CTLFLAG_RD,
+    &vm_page_tag_storage_reclaim_compressor_failure_count,
+    "failed tag storage reclamations due to tag storage used in compressor pool");
+SYSCTL_QUAD(_vm_mte_tag_storage, OID_AUTO, compressor_relocations, CTLFLAG_RD,
+    &vm_page_tag_storage_compressor_relocation_count,
+    "tag storage relocations due to compressor pool");
+SYSCTL_UINT(_vm_mte_tag_storage, OID_AUTO, free_unmanaged, CTLFLAG_RD,
+    &vm_page_free_unmanaged_tag_storage_count, 0,
+    "number of free unmanaged tag storage pages");
+
+SYSCTL_SCALABLE_COUNTER(_vm_mte_tag_storage, cpu_allocated_claimed,
+    vm_cpu_claimed_count, "claimed tag storage pages allocated");
+
+static int
+tag_storage_fragmentation SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2, oidp)
+	uint32_t value = mteinfo_tag_storage_fragmentation(false);
+
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+SYSCTL_PROC(_vm_mte_tag_storage, OID_AUTO, fragmentation,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, &tag_storage_fragmentation, "I",
+    "the achievable the fragmentation of the tag storage space (in parts per thousand)");
+
+static int
+tag_storage_fragmentation_actual SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2, oidp)
+	uint32_t value = mteinfo_tag_storage_fragmentation(true);
+
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+SYSCTL_PROC(_vm_mte_tag_storage, OID_AUTO, fragmentation_actual,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, &tag_storage_fragmentation_actual, "I",
+    "the actual the fragmentation of the tag storage space (in parts per thousand)");
+
+/* sysctls for vm.mte.compresor_* */
+
+extern unsigned int vm_object_no_compressor_pager_for_mte_count;
+SYSCTL_INT(_vm_mte, OID_AUTO, no_compressor_pager_for_mte, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_no_compressor_pager_for_mte_count, 0, "");
+
+/* sysctls for MTE compression stats */
+
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_pages_compressed, compressor_tagged_pages_compressed, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_pages_decompressed, compressor_tagged_pages_decompressed, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_pages_freed, compressor_tagged_pages_freed, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_pages_corrupted, compressor_tagged_pages_corrupted, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_overhead_bytes, compressor_tags_overhead_bytes, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_pages, compressor_tagged_pages, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_ts_pages_used, compressor_tag_storage_pages_in_pool,
+    "the number of tag storage pages used in the compressor");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_non_ts_pages_used, compressor_non_tag_storage_pages_in_pool,
+    "the number of non-tag storage pages used in the compressor");
+#if DEVELOPMENT || DEBUG
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_all_zero, compressor_tags_all_zero, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_same_value, compressor_tags_same_value, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_below_align, compressor_tags_below_align, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_above_align, compressor_tags_above_align, "");
+SYSCTL_SCALABLE_COUNTER(_vm_mte, compress_incompressible, compressor_tags_incompressible, "");
+#endif /* DEVELOPMENT || DEBUG */
+
+#endif /* HAS_MTE */
 
 SYSCTL_INT(_vm, OID_AUTO, vmtc_total, CTLFLAG_RD | CTLFLAG_LOCKED,
     &vmtc_total, 0, "total text page corruptions detected");
-
 
 #if DEBUG || DEVELOPMENT
 /*
@@ -3375,6 +3876,23 @@ SYSCTL_PROC(_vm, OID_AUTO, corrupt_text_addr,
     CTLTYPE_QUAD | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED,
     0, 0, corrupt_text_addr, "-", "");
 #endif /* DEBUG || DEVELOPMENT */
+
+/*
+ * vm.guard_objects_enabled
+ *
+ * Returns whether guard-objects are enabled for the current task/process.
+ */
+static int
+vm_guard_objects_enabled SYSCTL_HANDLER_ARGS
+{
+	uint32_t enabled = task_has_guard_objects(current_task());
+
+	return SYSCTL_OUT(req, &enabled, sizeof(enabled));
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, guard_objects_enabled,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_MASKED,
+    0, 0, &vm_guard_objects_enabled, "I", "");
 
 #if CONFIG_MAP_RANGES
 /*
@@ -3487,21 +4005,6 @@ extern clock_nsec_t c_seg_filled_contention_nsec_max;
 SYSCTL_QUAD(_vm, OID_AUTO, c_seg_filled_no_contention, CTLFLAG_RD | CTLFLAG_LOCKED, &c_seg_filled_no_contention, "");
 SYSCTL_QUAD(_vm, OID_AUTO, c_seg_filled_contention, CTLFLAG_RD | CTLFLAG_LOCKED, &c_seg_filled_contention, "");
 SYSCTL_ULONG(_vm, OID_AUTO, c_seg_filled_contention_sec_max, CTLFLAG_RD | CTLFLAG_LOCKED, &c_seg_filled_contention_sec_max, "");
-SYSCTL_UINT(_vm, OID_AUTO, c_seg_filled_contention_nsec_max, CTLFLAG_RD | CTLFLAG_LOCKED, &c_seg_filled_contention_nsec_max, 0, "");
-#if (XNU_TARGET_OS_OSX && __arm64__)
-extern clock_nsec_t c_process_major_report_over_ms; /* report if over ? ms */
-extern int c_process_major_yield_after; /* yield after moving ? segments */
-extern uint64_t c_process_major_reports;
-extern clock_sec_t c_process_major_max_sec;
-extern clock_nsec_t c_process_major_max_nsec;
-extern uint32_t c_process_major_peak_segcount;
-SYSCTL_UINT(_vm, OID_AUTO, c_process_major_report_over_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &c_process_major_report_over_ms, 0, "");
-SYSCTL_INT(_vm, OID_AUTO, c_process_major_yield_after, CTLFLAG_RW | CTLFLAG_LOCKED, &c_process_major_yield_after, 0, "");
-SYSCTL_QUAD(_vm, OID_AUTO, c_process_major_reports, CTLFLAG_RD | CTLFLAG_LOCKED, &c_process_major_reports, "");
-SYSCTL_ULONG(_vm, OID_AUTO, c_process_major_max_sec, CTLFLAG_RD | CTLFLAG_LOCKED, &c_process_major_max_sec, "");
-SYSCTL_UINT(_vm, OID_AUTO, c_process_major_max_nsec, CTLFLAG_RD | CTLFLAG_LOCKED, &c_process_major_max_nsec, 0, "");
-SYSCTL_UINT(_vm, OID_AUTO, c_process_major_peak_segcount, CTLFLAG_RD | CTLFLAG_LOCKED, &c_process_major_peak_segcount, 0, "");
-#endif /* (XNU_TARGET_OS_OSX && __arm64__) */
 
 #if DEVELOPMENT || DEBUG
 extern int panic_object_not_alive;
@@ -3520,10 +4023,16 @@ extern uint64_t vm_object_pageout_not_on_queue;
 extern uint64_t vm_object_pageout_not_pageable;
 extern uint64_t vm_object_pageout_pageable;
 extern uint64_t vm_object_pageout_active_local;
+extern uint64_t vm_object_pageout_clean_no_shadowing;
+extern uint64_t vm_object_pageout_clean_but_shadowing;
 SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_not_on_queue, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_not_on_queue, "");
 SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_not_pageable, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_not_pageable, "");
 SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_pageable, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_pageable, "");
 SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_active_local, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_active_local, "");
+SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_clean_no_shadowing, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_clean_no_shadowing, "");
+SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_clean_but_shadowing, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_pageout_clean_but_shadowing, "");
+extern uint64_t vm_object_no_shadowing_extra_refs;
+SYSCTL_QUAD(_vm, OID_AUTO, object_no_shadowing_extra_refs, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_object_no_shadowing_extra_refs, "");
 
 
 #if DEVELOPMENT || DEBUG
@@ -3531,7 +4040,13 @@ SYSCTL_QUAD(_vm, OID_AUTO, object_pageout_active_local, CTLFLAG_RD | CTLFLAG_LOC
 static uint32_t
 sysctl_compressor_seg_magic(vm_c_serialize_add_data_t with_data)
 {
+#if HAS_MTE
+	if (with_data == VM_C_SERIALIZE_DATA_TAGS) {
+		return VM_C_SEGMENT_INFO_MAGIC_WITH_TAGS;
+	}
+#else
 #pragma unused(with_data)
+#endif /* HAS_MTE */
 	return VM_C_SEGMENT_INFO_MAGIC;
 }
 
@@ -3605,6 +4120,14 @@ sysctl_compressor_segments(__unused struct sysctl_oid *oidp, __unused void *arg1
 }
 SYSCTL_PROC(_vm, OID_AUTO, compressor_segments, CTLTYPE_STRUCT | CTLFLAG_LOCKED | CTLFLAG_RD, 0, 0, sysctl_compressor_segments, "S", "");
 
+#if HAS_MTE
+static int
+sysctl_compressor_segments_data(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	return sysctl_compressor_segments_stream(req, VM_C_SERIALIZE_DATA_TAGS);
+}
+SYSCTL_PROC(_vm, OID_AUTO, compressor_segments_data, CTLTYPE_STRUCT | CTLFLAG_LOCKED | CTLFLAG_RD, 0, 0, sysctl_compressor_segments_data, "S", "");
+#endif /* HAS_MTE */
 
 extern uint32_t vm_compressor_fragmentation_level(void);
 
@@ -3641,36 +4164,19 @@ sysctl_task_vm_objects_slotmap(__unused struct sysctl_oid *oidp, void *arg1, int
 {
 	int error = 0;
 	char *buf = NULL;
-	proc_t p = PROC_NULL;
-	task_t task = TASK_NULL;
 	vm_map_t map = VM_MAP_NULL;
 	__block size_t offset = 0;
 
-	/* go from pid to proc to task to vm_map. see sysctl_procargsx() for another example of this procession */
 	int *name = arg1;
 	int namelen = arg2;
 	if (namelen < 1) {
 		return EINVAL;
 	}
 	int pid = name[0];
-	p = proc_find(pid);  /* this increments a reference to the proc */
-	if (p == PROC_NULL) {
-		return EINVAL;
-	}
-	task = proc_task(p);
-	proc_rele(p);  /* decrement ref of proc */
-	p = PROC_NULL;
-	if (task == TASK_NULL) {
-		return EINVAL;
-	}
-	/* convert proc reference to task reference */
-	task_reference(task);
-	/* task reference to map reference */
-	map = get_task_map_reference(task);
-	task_deallocate(task);
 
+	map = get_vm_map(pid);
 	if (map == VM_MAP_NULL) {
-		return EINVAL;  /* nothing allocated yet */
+		return EINVAL;
 	}
 
 	buf = kalloc_data(SYSCTL_VM_OBJECTS_SLOTMAP_BUF_SIZE, Z_WAITOK | Z_ZERO);
@@ -3683,15 +4189,6 @@ sysctl_task_vm_objects_slotmap(__unused struct sysctl_oid *oidp, void *arg1, int
 	 * This should be incremented if c_segment_info or c_slot_info are changed */
 	((struct sysctl_buf_header*)buf)->magic = VM_MAP_ENTRY_INFO_MAGIC;
 	offset += sizeof(uint32_t);
-
-	kern_return_t (^write_header)(int) = ^kern_return_t (int nentries) {
-		/* write the header, happens only once at the beginning so we should have enough space */
-		assert(offset + sizeof(struct vm_map_info_hdr) < SYSCTL_VM_OBJECTS_SLOTMAP_BUF_SIZE);
-		struct vm_map_info_hdr* out_hdr = (struct vm_map_info_hdr*)(buf + offset);
-		out_hdr->vmi_nentries = nentries;
-		offset += sizeof(struct vm_map_info_hdr);
-		return KERN_SUCCESS;
-	};
 
 	kern_return_t (^write_entry)(void*) = ^kern_return_t (void* entry) {
 		while (true) { /* try up to 2 times, first try write the the current buffer, otherwise to a new buffer */
@@ -3721,9 +4218,10 @@ sysctl_task_vm_objects_slotmap(__unused struct sysctl_oid *oidp, void *arg1, int
 
 	/* this foreach first calls to the first callback with the number of entries, then calls the second for every entry
 	 * when the buffer is exhausted, it is flushed to the sysctl and restarted */
-	kern_return_t kr = vm_map_entries_foreach(map, write_header, write_entry);
+	kern_return_t kr = vm_map_entries_foreach(map, write_entry);
 
 	if (kr != KERN_SUCCESS) {
+		error = EIO;
 		goto out;
 	}
 
@@ -3742,6 +4240,27 @@ out:
 }
 
 SYSCTL_PROC(_vm, OID_AUTO, task_vm_objects_slotmap, CTLTYPE_NODE | CTLFLAG_LOCKED | CTLFLAG_RD, 0, 0, sysctl_task_vm_objects_slotmap, "S", "");
+
+#pragma mark VM Host Statistics
+
+SYSCTL_NODE(_vm, OID_AUTO, stat, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Host memory statistics");
+
+SYSCTL_SCALABLE_COUNTER(_vm_stat, zero_fills, vm_statistics_zero_fill_count, "Pages zero-filled");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, reactivations, vm_statistics_reactivations, "Pages reactivated");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, pageins, vm_statistics_pageins, "Pages paged-in (including speculation)");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, pageins_requested, vm_statistics_pageins_requested, "Page-ins requested");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, pageins_aborted, vm_statistics_pageins_aborted, "Pages aborted during page-in");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, pageouts, vm_statistics_pageouts, "Pages paged-out");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, faults, vm_statistics_faults, "Pages faulted");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, cow_faults, vm_statistics_cow_faults, "Pages faulted due to copy-on-write");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, obj_cache_lookups, vm_statistics_lookups, "Pages looked up in the object-cache");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, obj_cache_hits, vm_statistics_hits, "Object-cache lookup hits");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, purges, vm_statistics_purges, "Pages purged");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, decompressions, vm_statistics_decompressions, "Pages decompressed");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, compressions, vm_statistics_compressions, "Pages compressed");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, swapins, vm_statistics_swapins, "Pages swapped in");
+SYSCTL_SCALABLE_COUNTER(_vm_stat, swapouts, vm_statistics_swapouts, "Pages swapped out");
+
 static int
 systctl_vm_reset_tag SYSCTL_HANDLER_ARGS
 {
@@ -3774,7 +4293,7 @@ SYSCTL_PROC(_vm, OID_AUTO, reset_tag,
     0, 0, &systctl_vm_reset_tag, "I", "");
 
 static int
-systctl_vm_reset_all_tags SYSCTL_HANDLER_ARGS
+sysctl_vm_reset_all_tags SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
 	/* Only reset the values if the sysctl is a write */
@@ -3794,6 +4313,220 @@ systctl_vm_reset_all_tags SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_vm, OID_AUTO, reset_all_tags,
     CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MASKED | CTLFLAG_LOCKED,
-    0, 0, &systctl_vm_reset_all_tags, "I", "");
+    0, 0, &sysctl_vm_reset_all_tags, "I", "");
+
+
+static int
+sysctl_vm_compressor_age_all_segments SYSCTL_HANDLER_ARGS
+{
+	uint64_t age_ns = 0;
+
+	int ret = sysctl_handle_quad(oidp, &age_ns, 0, req);
+	if (ret) {
+		return ret;
+	}
+
+	if (age_ns != 0) {
+		vm_compressor_age_all_segments(age_ns);
+	}
+	return 0;
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, compressor_age_all_segments,
+    CTLTYPE_QUAD | CTLFLAG_WR | CTLFLAG_MASKED | CTLFLAG_LOCKED,
+    0, 0, &sysctl_vm_compressor_age_all_segments, "QU", "");
 
 #endif /* DEVELOPMENT || DEBUG */
+
+SYSCTL_NODE(_vm, OID_AUTO, compressor, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor");
+
+SYSCTL_COMPAT_UINT(_vm_compressor, OID_AUTO, debug_events, CTLFLAG_RW | CTLFLAG_LOCKED, &c_debug_events, 0, "");
+
+SYSCTL_INT(_vm_compressor, OID_AUTO, mode, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_compressor_mode, 0, "");
+SYSCTL_INT(_vm_compressor, OID_AUTO, is_active, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_compressor_is_active, 0, "");
+SYSCTL_INT(_vm_compressor, OID_AUTO, is_available, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_compressor_available, 0, "");
+
+extern int c_report_age_enabled;
+SYSCTL_INT(_vm_compressor, OID_AUTO, report_age, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &c_report_age_enabled, 0, "Enable compressor age telemetry reporting");
+
+SYSCTL_UINT(_vm_compressor, OID_AUTO, pages_compressed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_segment_pages_compressed, 0, "The amount of uncompressed data stored in the compressor + swapfile (in pages)");
+SYSCTL_UINT(_vm_compressor, OID_AUTO, pages_compressed_incore, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_segment_pages_compressed_incore, 0, "The amount of uncompressed data stored in the in-core compressor (in pages)");
+SYSCTL_UINT(_vm_compressor, OID_AUTO, pages_compressed_incore_late_swapout, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_segment_pages_compressed_incore_late_swapout, 0, "The amount of uncompressed data stored in the in-core compressor and queued for late-swapout (in pages)");
+SYSCTL_UINT(_vm_compressor, OID_AUTO, pages_compressed_limit, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_segment_pages_compressed_limit, 0, "The limit on the amount of uncompressed data the compressor will store (in pages)");
+
+SYSCTL_UINT(_vm_compressor, OID_AUTO, pages_swapped, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_swapped_count, 0, "The amount of uncompressed data stored in the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swapped_pressure, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swapped_by_reason[C_SWAPOUT_REG], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swapped_freezer, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swapped_by_reason[C_SWAPOUT_FREEZER], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swapped_scavenger, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swapped_by_reason[C_SWAPOUT_RIPE], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swapped_donated, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swapped_by_reason[C_SWAPOUT_DONATE], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swapped_darkwake, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swapped_by_reason[C_SWAPOUT_DARKWAKE], "");
+
+
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_page_swap_count, "The number of pages occupied by swapped data in the swapfile");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap_pressure, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swap_by_reason[C_SWAPOUT_REG], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap_freezer, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swap_by_reason[C_SWAPOUT_FREEZER], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap_scavenger, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swap_by_reason[C_SWAPOUT_RIPE], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap_donated, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swap_by_reason[C_SWAPOUT_DONATE], "");
+SYSCTL_QUAD(_vm_compressor, OID_AUTO, pages_swap_darkwake, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &c_pages_swap_by_reason[C_SWAPOUT_DARKWAKE], "");
+
+
+SYSCTL_NODE(_vm_compressor, OID_AUTO, segment, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor Segment Counts");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, total, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_count, 0, "Number of allocated segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, aging, CTLFLAG_RD | CTLFLAG_LOCKED, &c_age_count, 0, "Number of aging segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedin_early, CTLFLAG_RD | CTLFLAG_LOCKED, &c_early_swappedin_count, 0, "Number of (early) swapped-in segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedin_regular, CTLFLAG_RD | CTLFLAG_LOCKED, &c_regular_swappedin_count, 0, "Number of (regular) swapped-in segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedin_late, CTLFLAG_RD | CTLFLAG_LOCKED, &c_late_swappedin_count, 0, "Number of (late) swapped-in segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swapout_early, CTLFLAG_RD | CTLFLAG_LOCKED, &c_early_swapout_count, 0, "Number of (early) ready-to-swap segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swapout_regular, CTLFLAG_RD | CTLFLAG_LOCKED, &c_regular_swapout_count, 0, "Number of (regular) ready-to-swap segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swapout_late, CTLFLAG_RD | CTLFLAG_LOCKED, &c_late_swapout_count, 0, "Number of (late) ready-to-swap segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swapio, CTLFLAG_RD | CTLFLAG_LOCKED, &c_swapio_count, 0, "Number of swapping-out segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedout, CTLFLAG_RD | CTLFLAG_LOCKED, &c_swappedout_count, 0, "Number of (non-sparse) swapped-out segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedout_sparse, CTLFLAG_RD | CTLFLAG_LOCKED, &c_swappedout_sparse_count, 0, "Number of (sparse) swapped-out segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, majorcompact, CTLFLAG_RD | CTLFLAG_LOCKED, &c_major_count, 0, "Number of recently-compacted segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, minorcompact, CTLFLAG_RD | CTLFLAG_LOCKED, &c_minor_count, 0, "Number of segments queued for deferred minor compaction");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, filling, CTLFLAG_RD | CTLFLAG_LOCKED, &c_filling_count, 0, "Number of filling segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, empty, CTLFLAG_RD | CTLFLAG_LOCKED, &c_empty_count, 0, "Number of empty segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, bad, CTLFLAG_RD | CTLFLAG_LOCKED, &c_bad_count, 0, "Number of bad segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, limit, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segments_limit, 0, "Limit on the number of allocated segments");
+SYSCTL_UINT(_vm_compressor_segment, OID_AUTO, swappedout_ripe, CTLFLAG_RD | CTLFLAG_LOCKED, &c_overage_swapped_count, 0, "The number of segments in the swapfile which contain \"ripe\" memory");
+
+SYSCTL_NODE(_vm_compressor, OID_AUTO, svp, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor Single-Value");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, in_hash, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_in_hash, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, hash_succeeded, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_hash_succeeded, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, hash_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_hash_failed, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, zval_compressions, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_zero_compressions, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, zval_decompressions, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_zero_decompressions, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, nzval_compressions, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_nonzero_compressions, 0, "");
+SYSCTL_UINT(_vm_compressor_svp, OID_AUTO, nzval_decompressions, CTLFLAG_RD | CTLFLAG_LOCKED, &c_segment_svp_nonzero_decompressions, 0, "");
+
+SYSCTL_NODE(_vm_compressor, OID_AUTO, compactor, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor Compactor");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compactions_completed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compactions_completed, "Major compactions completed");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compactions_considered, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compactions_considered, "Major compactions considered");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compactions_bailed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compactions_bailed, "Major compactions bailed (due to contention)");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compaction_bytes_moved, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compaction_bytes_moved, "Bytes moved between segments during major compactions");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compaction_slots_moved, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compaction_slots_moved, "Slots moved between segments during major compactions");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compaction_bytes_freed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compaction_bytes_freed, "Bytes freed as a result of major compaction");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, major_compaction_segments_freed, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_major_compaction_segments_freed, "Segments freed as a result of major compaction");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_swapouts_queued, "The number of segments queued for swapout after a major compaction");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued_pressure, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_regular_swapouts_queued, "The number of segments queued for swapout due to VM pressure");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued_freezer, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_freezer_swapouts_queued, "The number of segments queued for swapout by the freezer");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued_donate, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_donate_swapouts_queued, "The number of segments queued for swapout due to self donation");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued_scavenger, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_scavenger_swapouts_queued, "The number of segments queued for swapout by the abandoned memory scavenger");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapouts_queued_darkwake, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_darkwake_swapouts_queued, "The number of segments queued for swapout by the abandoned memory scavenger");
+SYSCTL_QUAD(_vm_compressor_compactor, OID_AUTO, swapout_bytes_wasted, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_compactor_swapout_bytes_wasted, "The number of unused bytes in segments queued for swapout");
+
+SYSCTL_NODE(_vm_compressor, OID_AUTO, swapper, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor Swapper");
+SYSCTL_SCALABLE_COUNTER(_vm_compressor_swapper, swapouts_total, vm_statistics_swapouts,
+    "The lifetime amount of data swapped to the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapouts_pressure, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_regular_swapouts,
+    "The lifetime amount of data written to the swapfile due to VM pressure (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapouts_freezer, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_freezer_swapouts,
+    "The lifetime amount of data written to the swapfile by the freezer (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapouts_donate, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_donate_swapouts,
+    "The lifetime amount of data written to the swapfile due to self-donation (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapouts_scavenger, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_scavenger_swapouts,
+    "The lifetime amount of data written to the swapfile by the abandoned memory scavenger (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapouts_darkwake, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_darkwake_swapouts,
+    "The lifetime amount of data written to the swapfile due to dark-wake (in pages)");
+SYSCTL_SCALABLE_COUNTER(_vm_compressor_swapper, swapins_total, vm_statistics_swapins,
+    "The lifetime amount of data read from the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapins_pressure, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_regular_swapins,
+    "The lifetime amount of pressure-swapped data read from the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapins_freezer, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_freezer_swapins,
+    "The lifetime amount of frozen data read from the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapins_donate, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_donate_swapins,
+    "The lifetime amount of donated data read from the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapins_scavenger, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_scavenger_swapins,
+    "The lifetime amount of scavenged data read from the swapfile (in pages)");
+SYSCTL_QUAD(_vm_compressor_swapper, OID_AUTO, swapins_darkwake, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_pageout_vminfo.vm_darkwake_swapins,
+    "The lifetime amount of dark-wake data read from the swapfile (in pages)");
+
+
+SYSCTL_NODE(_vm_compressor, OID_AUTO, config, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "VM Compressor Configuration");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, compressor_present, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.compressor_is_present, 0, "In-core compressor is configured");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, compressor_active, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.compressor_is_active, 0, "Dynamic in-core compressor is enabled");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, swap_present, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.swap_is_present, 0, "Swap to file is configured");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, swap_active, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.swap_is_active, 0, "Dynamic swap to file is enabled");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, freezer_swap_enabled, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.freezer_swap_is_active, 0, "Freezer swap to file is enabled");
+SYSCTL_UINT(_vm_compressor_config, OID_AUTO, scavenger_swap_enabled, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vm_config.scavenger_swap_is_active, 0, "Dynamic swap to file is enabled");
+
+EXPERIMENT_FACTOR_UINT64(compressor_ripeness_age_s,
+    &c_segment_ripeness_age_s, 0, UINT64_MAX,
+    "The minimum age (in sec) of a compressed segment after which to consider it "
+    "\"ripe\" and eligible for swapout");
+
+static int
+sysctl_vm_compressor_scavenger_enabled SYSCTL_HANDLER_ARGS
+{
+	boolean_t changed;
+	boolean_t enabled = VM_CONFIG_SCAVENGER_SWAP_IS_ACTIVE;
+
+	int ret = sysctl_io_number(req, enabled, sizeof(enabled), &enabled, &changed);
+	if (ret || !changed) {
+		return ret;
+	}
+
+	if (enabled) {
+		if (!(VM_CONFIG_SWAP_IS_PRESENT && VM_CONFIG_COMPRESSOR_IS_ACTIVE) ||
+		    VM_CONFIG_SWAP_IS_ACTIVE) {
+			return ENOTSUP;
+		}
+		vm_config.scavenger_swap_is_active = true;
+	} else {
+		vm_config.scavenger_swap_is_active = false;
+	}
+	return 0;
+}
+
+EXPERIMENT_FACTOR_PROC(vm_compressor_scavenger_enabled,
+    CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_vm_compressor_scavenger_enabled, "IU",
+    "Whether the VM compressor scavenger is enabled, allowing \"ripe\" "
+    "segments to be swapped out");

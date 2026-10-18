@@ -544,8 +544,7 @@ ipc_kmsg_init_trailer_and_sign(
 		bzero(trailer, sizeof(*trailer));
 		trailer->msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
 		trailer->msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
-		trailer->msgh_sender = *task_get_sec_token(sender);
-		trailer->msgh_audit = *task_get_audit_token(sender);
+		task_get_tokens(sender, &trailer->msgh_sender, &trailer->msgh_audit);
 	}
 
 	ipc_kmsg_sign(kmsg, trailer);
@@ -594,7 +593,7 @@ ipc_kmsg_sign_descriptors(
 			mach_port_array_t    array = dsc->kext_address;
 
 			for (mach_msg_size_t j = 0; j < dsc->count; j++) {
-				array[i].port = ports[i];
+				array[j].port = ports[j];
 			}
 			dsc->address = array;
 			break;
@@ -671,7 +670,7 @@ ipc_kmsg_strip_descriptors(
 			mach_port_array_t    array = dsc->address;
 
 			for (mach_msg_size_t j = 0; j < dsc->count; j++) {
-				ports[i] = array[i].port;
+				ports[j] = array[j].port;
 			}
 			dsc->kext_address = array;
 			break;
@@ -845,7 +844,7 @@ ipc_kmsg_alloc(
 	if (kmsg_type == IKM_TYPE_ALL_OOL || kmsg_type == IKM_TYPE_KDATA_OOL) {
 		if (kmsg_type == IKM_TYPE_ALL_OOL) {
 			msg_kdata = kalloc_type(mach_msg_base_t, mach_msg_kdescriptor_t,
-			    desc_count, alloc_flags | Z_SPRAYQTN);
+			    desc_count, alloc_flags);
 		} else {
 			msg_kdata = ikm_alloc_kdata_ool(max_kdata_size, alloc_flags);
 		}
@@ -1883,9 +1882,6 @@ ipc_kmsg_copyin_header_rights(
 	mach_msg_type_name_t dest_type;
 	ipc_object_copyin_flags_t dest_xtra;
 	kern_return_t kr = KERN_SUCCESS;
-	/* for service port immovability violation */
-	ipc_port_t violation_port = MACH_PORT_NULL;
-	mach_port_name_t violation_name = 0;
 
 	is_write_lock(space);
 	if (__improbable(!is_active(space))) {
@@ -1970,8 +1966,7 @@ ipc_kmsg_copyin_header_rights(
 		assert(!IP_VALID(st->dest_cleanup.icc_release_port));
 	} else {
 		ipc_space_unlock(space);
-		kr = MACH_SEND_INVALID_DEST;
-		goto send_telemetry;
+		return MACH_SEND_INVALID_DEST;
 	}
 
 	/*
@@ -2018,31 +2013,6 @@ ipc_kmsg_copyin_header_rights(
 	st->dest_request = dest_entry->ie_request;
 
 	is_write_unlock(space);
-
-send_telemetry:
-	if (IP_VALID(st->dest_port) &&
-	    ip_type(st->dest_port) == IOT_SERVICE_PORT &&
-	    st->dest_type == MACH_MSG_TYPE_MOVE_RECEIVE) {
-		violation_port = st->dest_port;
-		violation_name = st->dest_name;
-	} else if (IP_VALID(st->voucher_port) &&
-	    ip_type(st->voucher_port) == IOT_SERVICE_PORT &&
-	    st->voucher_type == MACH_MSG_TYPE_MOVE_RECEIVE) {
-		violation_port = st->voucher_port;
-		violation_name = st->voucher_name;
-	} else if (IP_VALID(st->reply_port) &&
-	    ip_type(st->reply_port) == IOT_SERVICE_PORT &&
-	    st->reply_type == MACH_MSG_TYPE_MOVE_RECEIVE) {
-		violation_port = st->reply_port;
-		violation_name = st->reply_name;
-	}
-
-	if (violation_port &&
-	    !task_is_initproc(space->is_task) &&
-	    !ipc_space_has_telemetry_type(space, IS_HAS_SERVICE_PORT_TELEMETRY)) {
-		ipc_stash_policy_violations_telemetry(IPCPV_MOVE_SERVICE_PORT,
-		    violation_port, violation_name);
-	}
 
 	return kr;
 }
@@ -2205,6 +2175,12 @@ ipc_kmsg_inflate_port_descriptor(
 	mach_msg_port_descriptor_t *kdesc;
 
 	ikm_udsc_get(&udesc, udesc_addr);
+
+	/* Update counters for both inline port descriptors, and total port descriptors */
+	if (os_add_overflow(send_uctx->send_dsc_inline_port_count, 1,
+	    &send_uctx->send_dsc_inline_port_count)) {
+		return MACH_SEND_TOO_LARGE;
+	}
 	if (os_add_overflow(send_uctx->send_dsc_port_count, 1,
 	    &send_uctx->send_dsc_port_count)) {
 		return MACH_SEND_TOO_LARGE;
@@ -2446,21 +2422,28 @@ ipc_kmsg_copyin_ool_ports_descriptor(
 
 	/*
 	 * For enhanced v2 binaries, we restrict sending OOL
-	 * port array with any disposition besdies COPY_SEND.
+	 * port array with any disposition besides COPY_SEND.
 	 */
 	current_policy = ipc_convert_msg_options_to_space(options);
-	if (ool_port_array_enforced &&
+	if (ipc_sec_is_policy_enforced(IPC_SEC_POLICY_RESTRICT_OOL_PORT_ARRAYS) &&
 	    ipc_should_apply_policy(current_policy, IPC_POLICY_ENHANCED_V2) &&
 	    (user_disp != MACH_MSG_TYPE_COPY_SEND)) {
-		mach_port_guard_exception(current_policy,
-		    MPG_PAYLOAD(MPG_FLAGS_INVALID_OPTIONS_OOL_DISP, user_disp),
-		    kGUARD_EXC_DESCRIPTOR_VIOLATION);
-
+		ipc_triage_policy_violation_and_expect_deny(
+			IPC_SEC_POLICY_RESTRICT_OOL_PORT_ARRAYS,
+			space,
+			current_policy,
+			MPG_PAYLOAD(MPG_FLAGS_INVALID_OPTIONS_OOL_DISP, user_disp),
+			IPC_PORT_NULL,
+			0
+			);
 		return MACH_SEND_INVALID_OPTIONS;
 	}
 
 	if (count) {
-		array = mach_port_array_alloc(count, Z_WAITOK | Z_SPRAYQTN);
+		array = mach_port_array_alloc(count, Z_WAITOK);
+		if (array == NULL) {
+			return MACH_SEND_NO_BUFFER;
+		}
 
 		/* use the end of the array to store names we will copy in */
 		names = (mach_port_name_t *)(array + count) - count;
@@ -2472,7 +2455,7 @@ ipc_kmsg_copyin_ool_ports_descriptor(
 	}
 
 	if (dsc->deallocate) {
-		(void)mach_vm_deallocate(map, dsc->u_address, names_size);
+		(void)mach_vm_deallocate_kernel(map, dsc->u_address, names_size);
 	}
 
 	for (mach_msg_size_t i = 0; i < count; i++) {
@@ -3416,8 +3399,9 @@ handle_reply_again:
 			}
 
 			ip_label_put(reply, &label);
+			/* A reply port could be immovable-send, so mark it as such */
 			ipc_right_copyout_any_send(space, reply, reply_type,
-			    IPC_OBJECT_COPYOUT_FLAGS_NONE, reply_name, entry);
+			    IPC_OBJECT_COPYOUT_FLAGS_ALLOW_IMMOVABLE_SEND, reply_name, entry);
 			kr = KERN_SUCCESS;
 			/* reply port is unlocked */
 		} else {
@@ -3673,8 +3657,9 @@ ipc_kmsg_copyout_port(
 		return MACH_MSG_SUCCESS;
 	}
 
+	/* We're aware we might be copying out an immovable send right */
 	kr = ipc_object_copyout(space, port, msgt_name,
-	    IPC_OBJECT_COPYOUT_FLAGS_NONE, gdesc, namep);
+	    IPC_OBJECT_COPYOUT_FLAGS_ALLOW_IMMOVABLE_SEND, gdesc, namep);
 	if (kr != KERN_SUCCESS) {
 		if (kr == KERN_INVALID_CAPABILITY) {
 			*namep = MACH_PORT_DEAD;
@@ -3868,6 +3853,9 @@ ipc_kmsg_copyout_ool_descriptor(
 				rcv_addr = rounded_addr;
 
 				kr = vm_map_copy_overwrite(map, rcv_addr, copy, size,
+#if HAS_MTE
+				    FALSE,
+#endif
 				    FALSE);
 			}
 		} else {

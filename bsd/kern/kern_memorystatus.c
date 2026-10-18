@@ -96,8 +96,7 @@ errno_t mach_to_bsd_errno(kern_return_t mach_err);
 extern uint32_t vm_compressor_pool_size(void);
 extern uint32_t vm_compressor_fragmentation_level(void);
 
-pid_t memorystatus_freeze_last_pid_thawed = 0;
-uint64_t memorystatus_freeze_last_pid_thawed_ts = 0;
+extern boolean_t memorystatus_freeze_daemons_all_allowed;
 
 int block_corpses = 0; /* counter to block new corpses if jetsam purges them */
 
@@ -328,8 +327,16 @@ _memstat_write_memlimit_to_ledger_locked(proc_t p, bool is_active, bool drop_loc
 #define MEMORYSTATUS_IDLE_RATIO_DENOM_MEDIUM 4UL
 #define MEMORYSTATUS_PRESSURE_RATIO_NUM_MEDIUM  15UL
 #define MEMORYSTATUS_PRESSURE_RATIO_DENOM_MEDIUM  4UL
-#define MEMORYSTATUS_REAPER_RATIO_NUM_MEDIUM 18UL
+#define MEMORYSTATUS_REAPER_RATIO_NUM_MEDIUM 20UL
 #define MEMORYSTATUS_REAPER_RATIO_DENOM_MEDIUM 4UL
+#define MEMORYSTATUS_REAPER_MIN_AGE_SECS_DEFAULT_MEDIUM 240
+#define MEMORYSTATUS_REAPER_MIN_AGE_APPS_SECS_DEFAULT_MEDIUM 240
+
+/*
+ * For Large config device, set the reaper threhsold to be 19% of the Memsize
+ */
+#define MEMORYSTATUS_REAPER_RATIO_NUM_LARGE 19UL
+#define MEMORYSTATUS_REAPER_RATIO_DENOM_LARGE 4UL
 
 static int32_t memorystatus_get_default_task_active_limit(proc_t p);
 static int32_t memorystatus_get_default_task_inactive_limit(proc_t p);
@@ -589,6 +596,15 @@ static uint64_t
 memorystatus_sysprocs_idle_time(proc_t p)
 {
 	uint64_t idle_delay_time = 0;
+
+	/*
+	 * If the proc is brand-new (i.e. has not yet marked itself dirty),
+	 * always provide the full idle delay time
+	 */
+	if (p->p_memstat_dirty & P_DIRTY_IM_NEW_HERE) {
+		return memorystatus_sysprocs_idle_delay_time;
+	}
+
 	/*
 	 * For system processes, base the idle delay time on the
 	 * jetsam relaunch behavior specified by launchd. The idea
@@ -1100,9 +1116,9 @@ uint32_t _Atomic memorystatus_kill_counts[JETSAM_PRIORITY_MAX + 1][JETSAM_REASON
 uint32_t _Atomic memorystatus_idle_exit_kill_count = 0;
 
 TUNABLE_DT(int32_t, memorystatus_reaper_minimum_age_seconds, "/defaults",
-    "kern.memstat_reaper_minage_secs", "memorystatus_reaper_minimum_age_seconds", MEMORYSTATUS_REAPER_MIN_AGE_SECS_DEFAULT, TUNABLE_DT_NONE);
+    "kern.memstat_reaper_minage_secs", "memorystatus_reaper_minimum_age_seconds", MEMORYSTATUS_REAPER_SENTINAL_VALUE_MEANING_USE_DEFAULT, TUNABLE_DT_NONE);
 TUNABLE_DT(int32_t, memorystatus_reaper_minimum_age_apps_seconds, "/defaults",
-    "kern.memstat_reaper_minapp_secs", "memorystatus_reaper_minimum_age_apps_seconds", MEMORYSTATUS_REAPER_MIN_AGE_APPS_SECS_DEFAULT, TUNABLE_DT_NONE);
+    "kern.memstat_reaper_minapp_secs", "memorystatus_reaper_minimum_age_apps_seconds", MEMORYSTATUS_REAPER_SENTINAL_VALUE_MEANING_USE_DEFAULT, TUNABLE_DT_NONE);
 TUNABLE_DT(uint32_t, memorystatus_reaper_rescan_delay_seconds, "/defaults",
     "kern.memstat_reaper_rescan_secs", "memorystatus_reaper_rescan_delay_seconds", MEMORYSTATUS_REAPER_RESCAN_SECS_DEFAULT, TUNABLE_DT_NONE);
 TUNABLE_DT(boolean_t, memorystatus_reaper_enabled, "/defaults",
@@ -1981,7 +1997,7 @@ memorystatus_init(void)
 #if CONFIG_FREEZE
 	memorystatus_frozen_processes_max = FREEZE_PROCESSES_MAX_DEFAULT;
 	memorystatus_frozen_shared_mb_max = ((MAX_FROZEN_SHARED_MB_PERCENT * max_task_footprint_mb) / 100); /* 10% of the system wide task limit */
-	memorystatus_freeze_shared_mb_per_process_max = (memorystatus_frozen_shared_mb_max / 4);
+	memorystatus_freeze_shared_mb_per_process_max = ((memorystatus_frozen_shared_mb_max * MAX_FROZEN_SHARED_MB_PER_PROCESS_PERCENT) / 100);
 	memorystatus_freeze_pages_min = FREEZE_PAGES_MIN_DEFAULT;
 	memorystatus_freeze_pages_max = FREEZE_PAGES_MAX_DEFAULT;
 	memorystatus_max_frozen_demotions_daily = MAX_FROZEN_PROCESS_DEMOTIONS_DEFAULT;
@@ -2095,6 +2111,9 @@ memorystatus_init(void)
 		    (max_mem <= MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD)) {
 			memstat_reaper_threshold = (MEMORYSTATUS_REAPER_RATIO_NUM_MEDIUM * memstat_critical_threshold) /
 			    MEMORYSTATUS_REAPER_RATIO_DENOM_MEDIUM;
+		} else if (max_mem > MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD) {
+			memstat_reaper_threshold = (MEMORYSTATUS_REAPER_RATIO_NUM_LARGE * memstat_critical_threshold) /
+			    MEMORYSTATUS_REAPER_RATIO_DENOM_LARGE;
 		} else {
 			memstat_reaper_threshold = (MEMORYSTATUS_REAPER_RATIO_NUM * memstat_critical_threshold) /
 			    MEMORYSTATUS_REAPER_RATIO_DENOM;
@@ -2105,13 +2124,23 @@ memorystatus_init(void)
 	if (memorystatus_reaper_minimum_age_seconds != MEMORYSTATUS_REAPER_SENTINAL_VALUE_MEANING_USE_DEFAULT) {
 		memstat_reaper_min_age_secs = memorystatus_reaper_minimum_age_seconds;
 	} else {
-		memstat_reaper_min_age_secs = MEMORYSTATUS_REAPER_MIN_AGE_SECS_DEFAULT;
+		if ((max_mem > MEMORYSTATUS_SMALL_MEMORY_THRESHOLD) &&
+		    (max_mem <= MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD)) {
+			memstat_reaper_min_age_secs = MEMORYSTATUS_REAPER_MIN_AGE_SECS_DEFAULT_MEDIUM;
+		} else {
+			memstat_reaper_min_age_secs = MEMORYSTATUS_REAPER_MIN_AGE_SECS_DEFAULT;
+		}
 	}
 
 	if (memorystatus_reaper_minimum_age_apps_seconds != MEMORYSTATUS_REAPER_SENTINAL_VALUE_MEANING_USE_DEFAULT) {
 		memstat_reaper_min_age_apps_secs = memorystatus_reaper_minimum_age_apps_seconds;
 	} else {
-		memstat_reaper_min_age_apps_secs = MEMORYSTATUS_REAPER_MIN_AGE_APPS_SECS_DEFAULT;
+		if ((max_mem > MEMORYSTATUS_SMALL_MEMORY_THRESHOLD) &&
+		    (max_mem <= MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD)) {
+			memstat_reaper_min_age_apps_secs = MEMORYSTATUS_REAPER_MIN_AGE_APPS_SECS_DEFAULT_MEDIUM;
+		} else {
+			memstat_reaper_min_age_apps_secs = MEMORYSTATUS_REAPER_MIN_AGE_APPS_SECS_DEFAULT;
+		}
 	}
 
 	if (memorystatus_reaper_rescan_delay_seconds != MEMORYSTATUS_REAPER_SENTINAL_VALUE_MEANING_USE_DEFAULT) {
@@ -2221,8 +2250,16 @@ memorystatus_init(void)
 #endif /* DEVELOPMENT || DEBUG */
 
 	/* Initialize the jetsam_threads state array */
+#if __x86_64__
+	(void)zalloc_permanent(sizeof(struct jetsam_state_s) *
+	    max_jetsam_threads, ZALIGN(struct jetsam_state_s));
+#endif /* __x86_64__ */
 	jetsam_threads = zalloc_permanent(sizeof(struct jetsam_state_s) *
 	    max_jetsam_threads, ZALIGN(struct jetsam_state_s));
+#if __x86_64__
+	(void)zalloc_permanent(sizeof(struct jetsam_state_s) *
+	    max_jetsam_threads, ZALIGN(struct jetsam_state_s));
+#endif /* __x86_64__ */
 
 	/* Initialize all the jetsam threads */
 	for (i = 0; i < max_jetsam_threads; i++) {
@@ -2756,14 +2793,14 @@ memorystatus_add(proc_t p, boolean_t locked)
 		goto exit;
 	}
 
+#if CONFIG_FREEZE
 	/*
 	 * Opt out system processes from being frozen by default.
 	 * For coalition-based freezing, we only want to freeze sysprocs that have specifically opted in.
 	 */
-	if (isSysProc(p)) {
+	if (isSysProc(p) && !memorystatus_freeze_daemons_all_allowed) {
 		p->p_memstat_state |= P_MEMSTAT_FREEZE_DISABLED;
 	}
-#if CONFIG_FREEZE
 	memorystatus_freeze_init_proc(p);
 #endif
 
@@ -2804,6 +2841,17 @@ exit:
 	}
 
 	return 0;
+}
+
+void
+memorystatus_set_proc_entitlement_flags(proc_t p)
+{
+	static const char kInternalJetsamRangeEntitlement[] = "com.apple.private.internal-jetsam-range";
+	task_t t = proc_task(p);
+	assert(t != TASK_NULL);
+	if (IOTaskHasEntitlement(t, kInternalJetsamRangeEntitlement)) {
+		p->p_memstat_state |= P_MEMSTAT_INTERNAL_RANGE;
+	}
 }
 
 /*
@@ -2848,6 +2896,20 @@ _memstat_record_prio_transition(proc_t p, int new_priority)
 }
 
 /*
+ * Everything between the idle band and the application agining band
+ * are reserved for internal use. We allow some entitled user space programs
+ * to use this range for experimentation.
+ */
+static bool
+_memstat_proc_can_use_entitled_range(proc_t proc)
+{
+	if (proc == PROC_NULL) {
+		return false;
+	}
+	return proc->p_memstat_state & P_MEMSTAT_INTERNAL_RANGE;
+}
+
+/*
  * Description:
  *	Moves a process from one jetsam bucket to another.
  *	which changes the LRU position of the process.
@@ -2885,7 +2947,8 @@ memstat_update_priority_locked(proc_t p,
 
 	if (priority == JETSAM_PRIORITY_IDLE &&
 	    !(_memstat_proc_can_idle_exit(p) && !_memstat_proc_is_dirty(p)) &&
-	    !(_memstat_proc_is_managed(p) && !_memstat_proc_has_priority_assertion(p))) {
+	    !(_memstat_proc_is_managed(p) && !_memstat_proc_has_priority_assertion(p)) &&
+	    !_memstat_proc_can_use_entitled_range(p)) {
 		priority = JETSAM_PRIORITY_BACKGROUND;
 		memorystatus_log_error("memorystatus: %s [%d] is neither "
 		    "clean (0x%x) nor assertion-less (0x%x) and cannot "
@@ -3047,22 +3110,6 @@ SYSCTL_PROC(_kern, OID_AUTO, memorystatus_relaunch_flags, CTLTYPE_INT | CTLFLAG_
 #endif /* DEVELOPMENT || DEBUG */
 
 /*
- * Everything between the idle band and the application agining band
- * are reserved for internal use. We allow some entitled user space programs
- * to use this range for experimentation.
- */
-static bool
-current_task_can_use_entitled_range()
-{
-	static const char kInternalJetsamRangeEntitlement[] = "com.apple.private.internal-jetsam-range";
-	task_t task = current_task();
-	if (task == kernel_task) {
-		return true;
-	}
-	return IOTaskHasEntitlement(task, kInternalJetsamRangeEntitlement);
-}
-
-/*
  * Set a process' requested priority band. This is the entry point used during
  * spawn and by memorystatus_control.
  */
@@ -3087,7 +3134,7 @@ memorystatus_set_priority(proc_t p, int priority, uint64_t user_data,
 		 * Entitled processes (just munch) can use a subset of this range for testing.
 		 */
 		if (priority > JETSAM_PRIORITY_ENTITLED_MAX ||
-		    !current_task_can_use_entitled_range()) {
+		    !_memstat_proc_can_use_entitled_range(current_proc())) {
 			priority = JETSAM_PRIORITY_IDLE;
 			options |= MEMSTAT_PRIORITY_NO_AGING;
 		}
@@ -3498,6 +3545,9 @@ memorystatus_dirty_track(proc_t p, uint32_t pcontrol)
 		}
 
 		p->p_memstat_dirty |= P_DIRTY_TRACK;
+		if (!(old_dirty & P_DIRTY_TRACK)) {
+			p->p_memstat_dirty |= P_DIRTY_IM_NEW_HERE;
+		}
 	}
 
 	if (pcontrol & PROC_DIRTY_ALLOW_IDLE_EXIT) {
@@ -3659,6 +3709,7 @@ memorystatus_dirty_set(proc_t p, boolean_t self, uint32_t pcontrol)
 			kill = true;
 		}
 	} else if (!was_dirty && now_dirty) {
+		p->p_memstat_dirty &= ~P_DIRTY_IM_NEW_HERE;
 		priority = p->p_memstat_requestedpriority;
 		task_set_dirty_start(t, mach_absolute_time());
 	}
@@ -3865,8 +3916,8 @@ memorystatus_on_resume(proc_t p)
 		p->p_memstat_last_thaw_interval = memorystatus_freeze_current_interval;
 		p->p_memstat_thaw_count++;
 
-		memorystatus_freeze_last_pid_thawed = p->p_pid;
-		memorystatus_freeze_last_pid_thawed_ts = mach_absolute_time();
+		memorystatus_log("memorystatus: resuming/thawing pid %d [%s]\n", p->p_pid, proc_best_name(p));
+		memorystatus_freeze_record_process_thawed(p);
 
 		memorystatus_thaw_count++;
 		memorystatus_thaw_count_since_boot++;
@@ -3999,9 +4050,9 @@ memstat_kill_idle_process(memorystatus_kill_cause_t cause,
 			proc_best_name(p), proc_getpid(p), memstat_kill_cause_name[cause], cause);
 		memorystatus_kill_proc(p, cause, jetsam_reason, &killed, footprint_out);
 		proc_rele(p);
-	} else {
-		os_reason_free(jetsam_reason);
 	}
+
+	os_reason_free(jetsam_reason);
 
 	return killed;
 }
@@ -4477,18 +4528,72 @@ memstat_purge_caches(jetsam_state_t state)
 	}
 
 #if CONFIG_DEFERRED_RECLAIM
-	/* TODO: estimate memory recovered from deferred reclaim */
 	memorystatus_log("memorystatus: reclaiming all deferred user memory\n");
-	mach_vm_size_t vmdr_bytes_reclaimed;
+	size_t vmdr_bytes_reclaimed;
 	vm_deferred_reclamation_gc(RECLAIM_GC_DRAIN, &vmdr_bytes_reclaimed,
 	    RECLAIM_NO_FAULT | RECLAIM_NO_WAIT);
-	memorystatus_log("memorystatus: purged %llu KiB of deferred user memory\n",
-	    vmdr_bytes_reclaimed);
+	memorystatus_log("memorystatus: purged %zu KiB of deferred user memory\n",
+	    vmdr_bytes_reclaimed >> 10);
 #endif /* CONFIG_DEFERRED_RECLAIM */
 
 	/* TODO: estimate wired memory recovered from zone_gc */
 	memorystatus_log("memorystatus: trimming kernel zone allocator\n");
 	zone_gc_trim();
+}
+
+static void
+memstat_no_victim(jetsam_state_t state,
+    memorystatus_kill_cause_t cause)
+{
+	/*
+	 * We tried to kill a process, but failed to find anyone to kill. It's
+	 * possible we chose not to because we reclaimed some purgeable memory or
+	 * hit this thread's priority limit.
+	 */
+	assert3u(state->memory_reclaimed, ==, 0);
+	if (state->limit_to_low_bands) {
+		/*
+		 * This thread isn't allowed to reach the high bands -- no need to overreact.
+		 */
+		return;
+	}
+	/*
+	 * We should have found someone to kill. Either we failed because of a transient
+	 * error or we've run out of candidates and the issue is caused by the kernel.
+	 */
+	memorystatus_log("memorystatus: failed to find a %s victim!\n", memstat_kill_cause_name[cause]);
+	if (state->errors && !state->errors_cleared) {
+		/*
+		 * It's possible that all of the kill candidates had the error bit set
+		 * (e.g. because we caught them in exec()). Clear all the error bits and
+		 * try to kill them one more time in the hopes that they are now killable.
+		 */
+		memorystatus_log("memorystatus: clearing kill errors and retrying\n");
+		memorystatus_clear_errors();
+		state->errors_cleared = true;
+	} else {
+		/* The memory may be held by a corpse or zalloc. */
+		memstat_purge_caches(state);
+		struct memorystatus_system_health_s health_status;
+		bool is_system_healthy = memstat_check_system_health(&health_status);
+		if (!is_system_healthy) {
+			memorystatus_log("memorystatus: system still unhealthy after cache purge!\n");
+			/*
+			 * We trimmed the zones above but it's possible there is a bug with
+			 * working set estimation and we needed a full drain.
+			 */
+			memorystatus_log_fault("memorystatus: fully draining kernel zone allocator\n");
+			zone_gc_drain();
+			is_system_healthy = memstat_check_system_health(&health_status);
+			if (!is_system_healthy) {
+				/*
+				 * We've killed everything and purged all xnu caches. There is nothing
+				 * left to do but panic.
+				 */
+				panic("memorystatus: all %s victims exhausted", memstat_kill_cause_name[cause]);
+			}
+		}
+	}
 }
 
 /*
@@ -4701,9 +4806,12 @@ memstat_do_priority_kill(jetsam_state_t state,
 			}
 		}
 
-		if (priority >= JETSAM_PRIORITY_FREEZER) {
+		if (priority >= JETSAM_PRIORITY_FREEZER && !state->fg_approached) {
+			state->fg_approached = true;
 			memstat_approaching_fg_band(state);
-		} else if (priority >= JETSAM_PRIORITY_BACKGROUND) {
+		}
+		if (priority >= JETSAM_PRIORITY_BACKGROUND && !state->bg_approached) {
+			state->bg_approached = true;
 			memorystatus_broadcast_jetsam_pressure(kVMPressureBackgroundJetsam);
 		}
 	}
@@ -4759,8 +4867,7 @@ memorystatus_do_action(jetsam_state_t state, memorystatus_action_t action, memor
 		memorystatus_log_info(
 			"memorystatus_do_action: Waking up swap thread. memorystatus_available_pages: %llu\n",
 			(uint64_t)MEMORYSTATUS_LOG_AVAILABLE_PAGES);
-		os_atomic_store(&vm_swapout_wake_pending, true, relaxed);
-		thread_wakeup((event_t)&vm_swapout_thread);
+		vm_swapout_wakeup();
 		break;
 	case MEMORYSTATUS_PROCESS_SWAPIN_QUEUE:
 		memorystatus_log_info(
@@ -4872,6 +4979,8 @@ memorystatus_thread_internal(jetsam_state_t state)
 	state->hwm_kills = 0;
 	state->sort_flag = true;
 	state->corpse_list_purged = false;
+	state->bg_approached = false;
+	state->fg_approached = false;
 	state->post_snapshot = false;
 	state->memory_reclaimed = 0;
 
@@ -4928,60 +5037,24 @@ memorystatus_thread_internal(jetsam_state_t state)
 		killed = memorystatus_do_action(state, action, cause);
 		total_memory_reclaimed += state->memory_reclaimed;
 
-		if (!killed) {
-			if (action == MEMORYSTATUS_KILL_HIWATER) {
+		if (!killed && !state->memory_reclaimed) {
+			switch (action) {
+			case MEMORYSTATUS_KILL_HIWATER:
 				highwater_remaining = false;
-			} else if (action == MEMORYSTATUS_KILL_SWAPPABLE) {
+				break;
+			case MEMORYSTATUS_KILL_SWAPPABLE:
 				swappable_apps_remaining = false;
 				suspended_swappable_apps_remaining = false;
-			} else if (action == MEMORYSTATUS_KILL_SUSPENDED_SWAPPABLE) {
+				break;
+			case MEMORYSTATUS_KILL_SUSPENDED_SWAPPABLE:
 				suspended_swappable_apps_remaining = false;
-			} else if (action == MEMORYSTATUS_KILL_TOP_PROCESS ||
-			    action == MEMORYSTATUS_KILL_AGGRESSIVE) {
-				/*
-				 * We tried to kill a process, but failed to find anyone to kill. It's
-				 * possible we chose not to because we reclaimed some purgeable memory or
-				 * hit this thread's priority limit.
-				 */
-				if (state->memory_reclaimed == 0 && !state->limit_to_low_bands) {
-					/*
-					 * We should have found someone to kill. Either we failed because of a transient
-					 * error or we've run out of candidates and the issue is caused by the kernel.
-					 */
-					memorystatus_log("memorystatus: failed to find a process to kill!\n");
-					if (state->errors && !state->errors_cleared) {
-						/*
-						 * It's possible that all of the kill candidates had the error bit set
-						 * (e.g. because we caught them in exec()). Clear all the error bits and
-						 * try to kill them one more time in the hopes that they are now killable.
-						 */
-						memorystatus_log("memorystatus: clearing kill errors and retrying\n");
-						memorystatus_clear_errors();
-						state->errors_cleared = true;
-					} else {
-						/* The memory may be held by a corpse or zalloc. */
-						memstat_purge_caches(state);
-						struct memorystatus_system_health_s health_status;
-						bool is_system_healthy = memstat_check_system_health(&health_status);
-						if (!is_system_healthy) {
-							memorystatus_log("memorystatus: system still unhealthy after cache purge!\n");
-							/*
-							 * We trimmed the zones above but it's possible there is a bug with
-							 * working set estimation and we needed a full drain.
-							 */
-							memorystatus_log_fault("memorystatus: fully draining kernel zone allocator\n");
-							zone_gc_drain();
-							is_system_healthy = memstat_check_system_health(&health_status);
-							if (!is_system_healthy) {
-								/*
-								 * We've killed everything and purged all xnu caches. There is nothing
-								 * left to do but panic.
-								 */
-								panic("memorystatus: all victims exhausted");
-							}
-						}
-					}
-				}
+				break;
+			case MEMORYSTATUS_KILL_TOP_PROCESS:
+				memstat_no_victim(state, cause);
+				break;
+			default:
+				memorystatus_log("memorystatus: no victim found (action: %d)\n", action);
+				break;
 			}
 		} else {
 			/* We successfully killed a process */
@@ -8142,7 +8215,7 @@ memorystatus_cmd_grp_set_priorities(user_addr_t buffer, size_t buffer_size)
 			 * Entitled processes (just munch) can use a subset of this range for testing.
 			 */
 			if (entries[i].priority > JETSAM_PRIORITY_ENTITLED_MAX ||
-			    !current_task_can_use_entitled_range()) {
+			    !_memstat_proc_can_use_entitled_range(current_proc())) {
 				entries[i].priority = JETSAM_PRIORITY_IDLE;
 			}
 		} else if (entries[i].priority == JETSAM_PRIORITY_IDLE_HEAD) {
@@ -9438,18 +9511,17 @@ memstat_insert_list_locked(
 	for (i = list_sz - 1; i >= 0; i--) {
 		p = proc_find_locked(pid_list[i]);
 
-		if (p == NULL || p == before) {
+		if (p == NULL) {
+			continue;
+		}
+
+		if ((p == before) || (p->p_memstat_effectivepriority != bucket_idx)) {
 			/*
 			 * We can encounter p == before when we try to sort a coalition with an in-
 			 * progress exec of the leader, such that the leader and the exec-ing
 			 * member have the same PID. Just skip over it for now, since this member
 			 * will soon be removed from the proc list anyway.
 			 */
-			continue;
-		}
-
-		if (p->p_memstat_effectivepriority != bucket_idx) {
-			/* proc not in bucket, skip it */
 			proc_rele(p);
 			continue;
 		}
@@ -9557,13 +9629,6 @@ memstat_sort_coals_locked(unsigned int bucket_index, memorystatus_jetsam_sort_or
 uint32_t
 memstat_get_idle_proccnt(void)
 {
-#if CONFIG_JETSAM
-	/*
-	 * On fully jetsam-enabled systems, all processes on the idle band may
-	 * be idle-exited
-	 */
-	return os_atomic_load(&memstat_bucket[JETSAM_PRIORITY_IDLE].count, relaxed);
-#else /* !CONFIG_JETSAM */
 	uint32_t count = 0;
 	uint32_t bucket = JETSAM_PRIORITY_IDLE;
 
@@ -9571,6 +9636,16 @@ memstat_get_idle_proccnt(void)
 	for (proc_t p = memorystatus_get_first_proc_locked(&bucket, FALSE);
 	    p != PROC_NULL;
 	    p = memorystatus_get_next_proc_locked(&bucket, p, FALSE)) {
+#if CONFIG_JETSAM
+		if (!_memstat_proc_has_error(p)) {
+			/*
+			 * If termination hit an error on this jetsam iteration, don't consider the
+			 * process idle. We'll clear the error bit before going to sleep and have
+			 * another chance at killing it when we get re-awoken.
+			 */
+			count++;
+		}
+#else /* !CONFIG_JETSAM */
 		/*
 		 * On macOS, we can only exit clean daemons. In the future, we
 		 * should include assertion-less managed daemons. Apps may make
@@ -9581,11 +9656,11 @@ memstat_get_idle_proccnt(void)
 		    !_memstat_proc_is_terminating(p)) {
 			count++;
 		}
+#endif /* CONFIG_JETSAM */
 	}
 	proc_list_unlock();
 
 	return count;
-#endif /* CONFIG_JETSAM */
 }
 
 uint32_t

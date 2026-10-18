@@ -366,7 +366,11 @@ typedef struct {
 	vm_size_t len;
 } ptov_table_entry;
 
+#if HAS_MTE
+#define PTOV_TABLE_SIZE 9
+#else /* HAS_MTE */
 #define PTOV_TABLE_SIZE 8
+#endif /* HAS_MTE */
 
 SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
 SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
@@ -985,7 +989,7 @@ update_or_defer_tte(tt_entry_t *ttep, tt_entry_t entry, pmap_paddr_t pa, vm_map_
  *
  * unsigned granule: 0 => force to page granule, or a combination of
  * ARM64_GRANULE_* flags declared above.
- * 
+ *
  * unsigned int guarded => flag indicating whether this range should be
  * considered an ARM "guarded" page. This enables BTI enforcement for a region.
  */
@@ -1241,10 +1245,10 @@ arm_vm_auxkc_init(void)
 		arm_vm_page_granular_RNX(segHIGHESTRXAuxKC, segLOWEST - segHIGHESTRXAuxKC, 0);
 	}
 	if (segLOWESTRXAuxKC < segHIGHESTRXAuxKC) {
-		/* 
+		/*
 		 * We cannot mark auxKC text as guarded because doing so would enforce
-		 * BTI on oblivious third-party kexts and break ABI compatibility. 
-		 * Doing this defeats the purpose of BTI (branches to these pages are 
+		 * BTI on oblivious third-party kexts and break ABI compatibility.
+		 * Doing this defeats the purpose of BTI (branches to these pages are
 		 * unchecked!) but given both the relative rarity and the diversity of
 		 * third-party kexts, we expect that this is likely impractical to
 		 * exploit in practice.
@@ -1604,6 +1608,9 @@ arm_vm_physmap_init(boot_args *args)
 	    real_avail_end - args->topOfKernelData, AP_RWNA, 0);
 
 
+#if HAS_MTE
+	arm_vm_physmap_tag_region_init(temp_ptov_table);
+#endif /* HAS_MTE */
 
 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
 
@@ -1833,7 +1840,6 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 	 * in units of the hardware page size and should not need similar treatment.
 	 */
 	gPhysSize = mem_size = ((gPhysBase + args->memSize) & ~PAGE_MASK) - gPhysBase;
-
 	mem_actual = args->memSizeActual ? args->memSizeActual : mem_size;
 
 	if ((memory_size != 0) && (mem_size > memory_size)) {
@@ -1870,6 +1876,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 #endif // ARM_LARGE_MEMORY
 	physmap_end = physmap_base + real_phys_size;
 
+#if HAS_MTE
+	physmap_end += gDramSize / MTE_PAGES_PER_TAG_PAGE;
+#endif /* HAS_MTE */
 
 #else
 #if defined(ARM_LARGE_MEMORY)
@@ -2025,8 +2034,21 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 		assert(segKCTEXTEXECB <= segLASTB);                                    // KC TEXT_EXEC must contain kernel LAST
 		assert(segKCTEXTEXECB + segSizeKCTEXTEXEC >= segLASTB + segSizeLAST);
-		segPLKTEXTEXECB = segLASTB + segSizeLAST;
-		segSizePLKTEXTEXEC = segSizeKCTEXTEXEC - (segPLKTEXTEXECB - segKCTEXTEXECB);
+
+		if (segTEXTEXECB == segKCTEXTEXECB) {
+			segPLKTEXTEXECB = segLASTB + segSizeLAST;
+			segSizePLKTEXTEXEC = segSizeKCTEXTEXEC - (segPLKTEXTEXECB - segKCTEXTEXECB);
+		} else {
+			/**
+			 * In the KC's __TEXT_EXEC segment, the __TEXT_EXEC segments of the kexts are placed before the kernel's
+			 * __TEXT_EXEC segment. This is because the KC's __TEXT_BOOT_EXEC segment is placed after its __TEXT_EXEC
+			 * segment, and there are branch instructions between it and the kernel's __TEXT_EXEC segment. With this
+			 * arrangement, the __TEXT_EXEC segments of the kexts cannot be placed in between them because it can get
+			 * arbitrarily large and the branch distance can go beyond the +-128M limit.
+			 */
+			segPLKTEXTEXECB = segKCTEXTEXECB;
+			segSizePLKTEXTEXEC = segTEXTEXECB - segKCTEXTEXECB;
+		}
 
 		// fileset has kext PLK_DATA_CONST under kernel collection DATA_CONST following kernel's LASTDATA_CONST
 		segKCDATACONSTB = (vm_offset_t) getsegdatafromheader(kc_mh,            "__DATA_CONST", &segSizeKCDATACONST);
@@ -2070,13 +2092,26 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 	vm_kernel_base = segTEXTB;
 	vm_kernel_top = (vm_offset_t) &last_kernel_symbol;
 	vm_kext_base = segPRELINKTEXTB;
-	vm_kext_top = vm_kext_base + segSizePRELINKTEXT;
+	if (!segSizePLKTEXTEXEC && !segSizePLKDATACONST) {
+		vm_kext_top = vm_kext_base + segSizePRELINKTEXT;
+	} else {
+		/**
+		 * When the PLK (i.e. kext) __TEXT_EXEC and __DATA_CONST ranges are
+		 * present, the top of the kext text is the end of the PLK __TEXT_EXEC
+		 * range computed above.
+		 */
+		vm_kext_top = segPLKTEXTEXECB + segSizePLKTEXTEXEC;
+	}
 
 	vm_prelink_stext = segPRELINKTEXTB;
 	if (!segSizePLKTEXTEXEC && !segSizePLKDATACONST) {
 		vm_prelink_etext = segPRELINKTEXTB + segSizePRELINKTEXT;
 	} else {
-		vm_prelink_etext = segPRELINKTEXTB + segSizePRELINKTEXT + segSizePLKDATACONST + segSizePLKTEXTEXEC;
+		/**
+		 * Same as vm_kext_top, the end of the kext text in this case is the end
+		 * of the PLK __TEXT_EXEC range.
+		 */
+		vm_prelink_etext = segPLKTEXTEXECB + segSizePLKTEXTEXEC;
 	}
 	vm_prelink_sinfo = segPRELINKINFOB;
 	vm_prelink_einfo = segPRELINKINFOB + segSizePRELINKINFO;
@@ -2125,10 +2160,6 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 	physmap_vtop = physmap_end;
 	kasan_init();
 #endif /* KASAN */
-
-#if CONFIG_CPU_COUNTERS
-	mt_early_init();
-#endif /* CONFIG_CPU_COUNTERS */
 
 	arm_vm_physmap_init(args);
 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);

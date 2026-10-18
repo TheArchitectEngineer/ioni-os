@@ -1988,7 +1988,7 @@ ipc_right_copyin_check_reply(
 		 */
 		if (reply_entry->ie_bits & IE_BITS_IMMOVABLE_SEND) {
 			mach_port_guard_exception_immovable(space, reply_name, reply_port, MACH_MSG_TYPE_MOVE_SEND_ONCE, reply_entry);
-			return FALSE;
+			return false;
 		}
 
 		if (reply_type == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
@@ -2129,6 +2129,13 @@ ipc_right_copyin(
 	bool deadok = !!(flags & IPC_OBJECT_COPYIN_FLAGS_DEADOK);
 	bool allow_imm_send = !!(flags & IPC_OBJECT_COPYIN_FLAGS_ALLOW_IMMOVABLE_SEND);
 
+	/*
+	 * This is a temporary fix to allow re-sending a connection port after
+	 * pseudo receive. We need to fix this properly. See rdar://164492988.
+	 */
+	allow_imm_send |= (bits & MACH_PORT_TYPE_RECEIVE) &&
+	    IP_VALID(port) && ip_is_connection_port(port);
+
 	if (flags & IPC_OBJECT_COPYIN_FLAGS_DEST_EXTRA_MOVE) {
 		assert((flags & IPC_OBJECT_COPYIN_FLAGS_DEST_EXTRA_COPY) == 0);
 		assert(msgt_name == MACH_MSG_TYPE_MOVE_SEND);
@@ -2144,7 +2151,7 @@ ipc_right_copyin(
 
 	assert(is_active(space));
 
-	/* Only allow send_once disposition on certain ports */
+	/* On certain port types (reply ports), only allow SEND_ONCE dispositions */
 	if (IP_VALID(port) && ip_is_reply_port(port) &&
 	    !MACH_MSG_TYPE_PORT_ANY_SEND_ONCE(msgt_name)) {
 		mach_port_guard_exception(name,
@@ -2173,7 +2180,7 @@ ipc_right_copyin(
 	}
 
 	case MACH_MSG_TYPE_MAKE_SEND_ONCE: {
-		bool send_telemetry = false;
+		/* const bool send_telemetry = false; */
 
 		if ((bits & MACH_PORT_TYPE_RECEIVE) == 0) {
 			goto invalid_right;
@@ -2200,20 +2207,24 @@ ipc_right_copyin(
 		 * send-once right at any given moment.
 		 */
 #if DEVELOPMENT || DEBUG
-		if (ip_is_reply_port(port) && (port->ip_sorights > 0)) {
-			send_telemetry = true;
-		}
+		/*
+		 *  if (ip_is_reply_port(port) && (port->ip_sorights > 0)) {
+		 *       send_telemetry = true;
+		 *  }
+		 */
 #endif /* DEVELOPMENT || DEBUG */
 
 		ipc_port_make_sonce_locked(port);
 		ip_mq_unlock(port);
 
-		if (__improbable(send_telemetry)) {
-			mach_port_guard_exception(name,
-			    MPG_PAYLOAD(MPG_FLAGS_INVALID_RIGHT_COPYIN, copyin_reason,
-			    msgt_name),
-			    kGUARD_EXC_REPLY_PORT_SINGLE_SO_RIGHT);
-		}
+		/*
+		 *  if (__improbable(send_telemetry)) {
+		 *       mach_port_guard_exception(name,
+		 *           MPG_PAYLOAD(MPG_FLAGS_INVALID_RIGHT_COPYIN, copyin_reason,
+		 *           msgt_name),
+		 *           kGUARD_EXC_REPLY_PORT_SINGLE_SO_RIGHT);
+		 *  }
+		 */
 
 		*portp = port;
 		break;
@@ -2593,9 +2604,24 @@ ipc_right_copyout_any_send(
 	}
 	ip_label_put(port, &label);
 
+	/*
+	 * A caller that copies out an immovable send right for a new entry
+	 * must demonstrate sufficient awareness of what they're doing.
+	 */
+	if ((bits & IE_BITS_IMMOVABLE_SEND) &&
+	    !(flags & IPC_OBJECT_COPYOUT_FLAGS_ALLOW_IMMOVABLE_SEND) &&
+	    IE_BITS_TYPE(bits) == MACH_PORT_TYPE_NONE) {
+		ipc_triage_policy_violation_and_expect_continue(
+			IPC_SEC_POLICY_RESTRICT_IMMOVABLE_SEND_RIGHT_CREATION,
+			space,
+			0,
+			0,
+			IP_NULL,
+			0);
+	}
+
 	switch (msgt_name) {
 	case MACH_MSG_TYPE_PORT_SEND_ONCE:
-
 		assert(IE_BITS_TYPE(bits) == MACH_PORT_TYPE_NONE);
 		assert(IE_BITS_UREFS(bits) == 0);
 		assert(port->ip_sorights > 0);

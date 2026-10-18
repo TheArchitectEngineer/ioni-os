@@ -335,6 +335,7 @@ memory_object_lock_request(
 	 *	Lock the object, and acquire a paging reference to
 	 *	prevent the memory_object reference from being released.
 	 */
+	vm_page_grab_prime();
 	vm_object_lock(object);
 	vm_object_paging_begin(object);
 
@@ -422,6 +423,7 @@ vm_object_sync(
 	 * prevent the memory_object and control ports from
 	 * being destroyed.
 	 */
+	vm_page_grab_prime();
 	vm_object_lock(object);
 	vm_object_paging_begin(object);
 
@@ -820,7 +822,8 @@ RETRY_COW_OF_LOCK_REQUEST:
 			    (int *)0,
 			    &error,
 			    FALSE,
-			    &fault_info);
+			    &fault_info,
+			    NULL);
 
 			switch (result) {
 			case VM_FAULT_SUCCESS:
@@ -857,16 +860,15 @@ RETRY_COW_OF_LOCK_REQUEST:
 				vm_object_paging_begin(copy_object);
 				goto RETRY_COW_OF_LOCK_REQUEST;
 			case VM_FAULT_SUCCESS_NO_VM_PAGE:
-				/* success but no VM page: fail */
-				vm_object_paging_end(copy_object);
-				vm_object_unlock(copy_object);
-				OS_FALLTHROUGH;
+				/* success but no VM page: skip to next page */
+				prot = VM_PROT_WRITE | VM_PROT_READ;
+				continue;
 			case VM_FAULT_MEMORY_ERROR:
-				if (object != copy_object) {
-					vm_object_deallocate(copy_object);
-				}
-				vm_object_lock(object);
-				goto BYPASS_COW_COPYIN;
+				/* no page here: skip to next page */
+				prot = VM_PROT_WRITE | VM_PROT_READ;
+				vm_object_lock(copy_object);
+				vm_object_paging_begin(copy_object);
+				continue;
 			default:
 				panic("vm_object_update: unexpected error 0x%x"
 				    " from vm_fault_page()\n", result);
@@ -897,7 +899,6 @@ RETRY_COW_OF_LOCK_REQUEST:
 		vm_object_deallocate(copy_object);
 		vm_object_lock(object);
 	}
-BYPASS_COW_COPYIN:
 
 	/*
 	 * when we have a really large range to check relative
@@ -1862,7 +1863,7 @@ memory_object_control_to_vm_object(
 	return control;
 }
 
-__private_extern__ vm_object_t
+__exported_hidden vm_object_t
 memory_object_to_vm_object(
 	memory_object_t mem_obj)
 {
@@ -2043,7 +2044,7 @@ memory_object_data_initialize
  */
 
 /* Routine memory_object_map */
-kern_return_t
+__mockable kern_return_t
 memory_object_map
 (
 	memory_object_t memory_object,
@@ -2056,7 +2057,7 @@ memory_object_map
 }
 
 /* Routine memory_object_last_unmap */
-kern_return_t
+__mockable kern_return_t
 memory_object_last_unmap
 (
 	memory_object_t memory_object

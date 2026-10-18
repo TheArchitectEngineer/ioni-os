@@ -458,7 +458,7 @@ freeit:
 	/*
 	 * If we can't tell whether or not we can generate ICMP6, free it.
 	 */
-	m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_ICMP_DROP, NULL, 0);
+	m_drop(m, DROPTAP_FLAG_DIR_OUT | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_ICMP_DROP, NULL, 0);
 }
 
 /*
@@ -1163,7 +1163,7 @@ notify:
 		icmp6src.sin6_len = sizeof(struct sockaddr_in6);
 		icmp6src.sin6_family = AF_INET6;
 		icmp6src.sin6_addr = eip6->ip6_src;
-		if (in6_setscope(&icmp6src.sin6_addr, m->m_pkthdr.rcvif, IN6_NULL_IF_EMBEDDED_SCOPE(&icmp6dst.sin6_scope_id))) {
+		if (in6_setscope(&icmp6src.sin6_addr, m->m_pkthdr.rcvif, IN6_NULL_IF_EMBEDDED_SCOPE(&icmp6src.sin6_scope_id))) {
 			goto freeit;
 		}
 		icmp6src.sin6_flowinfo =
@@ -2187,6 +2187,7 @@ icmp6_rip6_input(struct mbuf **mp, int off)
 					if (ret != 0) {
 						m_freem(n);
 						m_freem(opts);
+						opts = NULL;
 						last = in6p;
 						continue;
 					}
@@ -2297,7 +2298,7 @@ icmp6_reflect(struct mbuf *m, size_t off)
 				return;
 			}
 		}
-		bcopy((caddr_t)&nip6, mtod(m, caddr_t), sizeof(nip6));
+		bcopy((caddr_t)&nip6, mtod(m_ip6hdr, caddr_t), sizeof(nip6));
 	} else { /* off == sizeof(struct ip6_hdr) */
 		size_t l;
 		l = sizeof(struct ip6_hdr) + sizeof(struct icmp6_hdr);
@@ -2731,10 +2732,24 @@ icmp6_redirect_input(struct mbuf *m, int off, int icmp6len)
 		}
 		bcopy(&reddst6, &sdst.sin6_addr, sizeof(struct in6_addr));
 
+		/*
+		 * Drop inet6_domain_mutex before calling pfctlinput.
+		 * pfctlinput iterates all protocols and may call
+		 * in6_pcbnotify, which calls socket_lock on raw IPv6
+		 * sockets. Those sockets lack pr_lock, so socket_lock
+		 * acquires so->so_proto->pr_domain->dom_mtx -- which is
+		 * inet6_domain_mutex, already held by ip6_input.
+		 * This mirrors the pattern in icmp6_notify_error.
+		 */
+		LCK_MTX_ASSERT(inet6_domain_mutex, LCK_MTX_ASSERT_OWNED);
+		lck_mtx_unlock(inet6_domain_mutex);
+
 		pfctlinput(PRC_REDIRECT_HOST, SA(&sdst));
 #if IPSEC
 		key_sa_routechange(SA(&sdst));
 #endif
+
+		lck_mtx_lock(inet6_domain_mutex);
 	}
 
 freeit:
@@ -3011,6 +3026,7 @@ nolladdropt:;
 				/* pad if easy enough, truncate if not */
 				if (8 - extra <= M_TRAILINGSPACE(m0)) {
 					/* pad */
+					bzero(m_mtod_end(m0), 8 - extra);
 					m0->m_len += (8 - extra);
 					m0->m_pkthdr.len += (8 - extra);
 				} else {

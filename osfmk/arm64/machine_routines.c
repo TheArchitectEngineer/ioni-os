@@ -50,6 +50,7 @@
 #include <mach/machine.h>
 #include <machine/atomic.h>
 #include <machine/config.h>
+#include <machine/machine_cpc.h>
 #include <vm/pmap.h>
 #include <vm/vm_page.h>
 #include <vm/vm_page_internal.h>
@@ -62,6 +63,7 @@
 #include <kern/coalition.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
+#include <kern/smr.h>
 
 #include <IOKit/IOPlatformExpert.h>
 #if HIBERNATION
@@ -157,6 +159,7 @@ static TUNABLE_WRITEABLE(uint64_t, deferred_ipi_timer_ns, "fastipitimeout",
 thread_t Idle_context(void);
 
 SECURITY_READ_ONLY_LATE(bool) cpu_config_correct = true;
+SECURITY_READ_ONLY_LATE(bool) cpu_config_modified = false;
 
 SECURITY_READ_ONLY_LATE(static ml_topology_cpu_t) topology_cpu_array[MAX_CPUS];
 SECURITY_READ_ONLY_LATE(static ml_topology_cluster_t) topology_cluster_array[MAX_CPU_CLUSTERS];
@@ -209,6 +212,9 @@ static const struct vm_reserved_region vm_reserved_regions[] = {
 
 uint32_t get_arm_cpu_version(void);
 
+#if HAS_MTE
+static uint64_t arm_mte_random_rgsr_el1_seed(void);
+#endif
 
 #if defined(HAS_IPI)
 static inline void
@@ -867,6 +873,16 @@ ml_cpu_down(void)
 		panic("boot cpu powering down with nowhere for its timers to go");
 	}
 
+#if CONFIG_CPU_COUNTERS
+	/*
+	 * Offline CPC before IPIs are disabled in `cpu_signal_handler_internal`.
+	 * This prevents a race where a cyclic broadcast to cancel is ignored,
+	 * but the cyclic is removed from the global active list.
+	 * This would leave the call enqueued but not have a cyclic around to manage it.
+	 */
+	cpc_cpu_transition(CPC_CPU_OFFLINE, cpu_data_ptr);
+#endif /* CONFIG_CPU_COUNTERS */
+
 	cpu_signal_handler_internal(TRUE);
 
 	/* There should be no more pending IPIs on this core. */
@@ -923,7 +939,7 @@ machine_signal_idle(
 	processor_t processor)
 {
 	cpu_signal(processor_to_cpu_datap(processor), SIGPnop, (void *)NULL, (void *)NULL);
-	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, MACHDBG_CODE(DBG_MACH_SCHED, MACH_REMOTE_AST), processor->cpu_id, 0 /* nop */, 0, 0, 0);
+	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_SCHED, MACH_REMOTE_AST), processor->cpu_id, 0 /* nop */);
 }
 
 void
@@ -1144,6 +1160,12 @@ ml_parse_cpu_topology(void)
 		cpu_config_correct = false;
 	}
 
+	/* The scheduler makes some assumptions at compile time that may not be true
+	 * if cpus=N or cpumask=N boot-args are present. */
+	if (cpus_boot_arg_present || cpumask_boot_arg_present) {
+		cpu_config_modified = true;
+	}
+
 	err = SecureDTLookupEntry(NULL, "/cpus", &entry);
 	assert(err == kSuccess);
 
@@ -1209,6 +1231,8 @@ ml_parse_cpu_topology(void)
 		int cluster_type = (int)ml_readprop(child, "cluster-type", 0);
 		if (cluster_type == 'E') {
 			cpu->cluster_type = CLUSTER_TYPE_E;
+		} else if (cluster_type == 'M') {
+			cpu->cluster_type = CLUSTER_TYPE_M;
 		} else if (cluster_type == 'P') {
 			cpu->cluster_type = CLUSTER_TYPE_P;
 		}
@@ -1269,6 +1293,8 @@ ml_parse_cpu_topology(void)
 		cluster->die_cluster_id = cpu->die_cluster_id;
 
 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", MPIDR_CPU_ID(cpu->phys_id));
+
+		cpu->cpu_pset_id = PSET_ID_INVALID; /* initialized by ml_bootstrap_processors() */
 
 		cluster->num_cpus++;
 		cluster->cpu_mask |= 1ULL << cpu->cpu_id;
@@ -1553,7 +1579,6 @@ ml_mcache_flush(void)
 	}
 }
 
-
 kern_return_t ml_mem_fault_report_enable_register(void);
 kern_return_t
 ml_mem_fault_report_enable_register(void)
@@ -1576,16 +1601,59 @@ ml_dcs_error_inject_register(void)
 }
 
 
-extern lck_mtx_t pset_create_lock;
+/* Initialize the percpu data and initialize processor structs. */
+__startup_func
+static void
+ml_bootstrap_processors(void)
+{
+	assert(ml_get_interrupts_enabled() == false);
+	for (unsigned cpu_id = 0; cpu_id < ml_get_cpu_count(); cpu_id++) {
+		bool is_boot_cpu = (cpu_id == boot_cpu_id);
+		cpu_data_t *this_cpu_datap;
+		if (is_boot_cpu) {
+			this_cpu_datap = &BootCpuData;
+			/* initialized by arm_init() */
+		} else {
+			this_cpu_datap = cpu_data_alloc(false);
+			cpu_data_init(this_cpu_datap);
+		}
+		this_cpu_datap->cpu_number = (unsigned short)cpu_id;
+		if (is_boot_cpu) {
+			/* cpu_data_register()'ed by arm_init(). */
+
+			/* processor_init()'ed by processor_bootstrap(), but it skipped
+			 * the SCHED(processor_init) callout. */
+			SCHED(processor_init)(master_processor);
+		} else {
+			cpu_data_register(this_cpu_datap);
+			assert((this_cpu_datap->cpu_number & MACHDEP_TPIDR_CPUNUM_MASK) == this_cpu_datap->cpu_number);
+
+#if __AMP__
+			/* AMP ARM platforms set the cpu_bitmask during pset initialization,
+			 * so we can find the right pset for this processor. */
+			processor_set_t pset = pset_find_for_cpu_id(cpu_id);
+#else /* !__AMP__ */
+			/* Non-AMP ARM platforms only support one pset. */
+			processor_set_t pset = sched_boot_pset;
+#endif /* __AMP__ */
+			assert3p(pset, !=, PROCESSOR_SET_NULL);
+			processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
+			processor_init(processor, cpu_id, pset);
+		}
+		topology_info.cpus[cpu_id].cpu_pset_id = processor_array[cpu_id]->processor_set->pset_id;
+	}
+}
+STARTUP(SCHED, STARTUP_RANK_SECOND, ml_bootstrap_processors);
 
 kern_return_t
 ml_processor_register(ml_processor_info_t *in_processor_info,
     processor_t *processor_out, ipi_handler_t *ipi_handler_out,
     perfmon_interrupt_handler_func *pmi_handler_out)
 {
-	cpu_data_t *this_cpu_datap;
-	processor_set_t pset;
-	boolean_t  is_boot_cpu;
+	cpu_data_t *this_cpu_datap = cpu_datap(in_processor_info->log_id);
+	assert3u(this_cpu_datap->cpu_number, ==, in_processor_info->log_id); /* from ml_bootstrap_processors() */
+
+	boolean_t  is_boot_cpu     = (in_processor_info->log_id == ml_get_boot_cpu_number());
 	static unsigned int reg_cpu_count = 0;
 
 	if (in_processor_info->log_id > (uint32_t)ml_get_max_cpu_number()) {
@@ -1596,30 +1664,9 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
 		return KERN_FAILURE;
 	}
 
-	if (in_processor_info->log_id != (uint32_t)ml_get_boot_cpu_number()) {
-		is_boot_cpu = FALSE;
-		this_cpu_datap = cpu_data_alloc(FALSE);
-		cpu_data_init(this_cpu_datap);
-	} else {
-		this_cpu_datap = &BootCpuData;
-		is_boot_cpu = TRUE;
-		/*
-		 * Note that ml_processor_register happens for the boot cpu
-		 * *after* it starts running arbitrary threads, possibly
-		 * including *userspace*, depending on how long the CPU
-		 * services take to match.
-		 */
-	}
-
 	assert(in_processor_info->log_id <= (uint32_t)ml_get_max_cpu_number());
 
 	this_cpu_datap->cpu_id = in_processor_info->cpu_id;
-
-	if (!is_boot_cpu) {
-		this_cpu_datap->cpu_number = (unsigned short)(in_processor_info->log_id);
-		cpu_data_register(this_cpu_datap);
-		assert((this_cpu_datap->cpu_number & MACHDEP_TPIDR_CPUNUM_MASK) == this_cpu_datap->cpu_number);
-	}
 
 	this_cpu_datap->cpu_idle_notify = in_processor_info->processor_idle;
 	this_cpu_datap->cpu_cache_dispatch = (cache_dispatch_t)in_processor_info->platform_cache_dispatch;
@@ -1655,38 +1702,28 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
 #else /* HAS_CLUSTER */
 	this_cpu_datap->cluster_master = is_boot_cpu;
 #endif /* HAS_CLUSTER */
-	lck_mtx_lock(&pset_create_lock);
-	pset = pset_find(in_processor_info->cluster_id, NULL);
-	kprintf("[%d]%s>pset_find(cluster_id=%d) returned pset %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cluster_id, pset ? pset->pset_id : -1);
-	if (pset == NULL) {
-		pset = pset_create(this_cpu_datap->cpu_cluster_type, this_cpu_datap->cpu_cluster_id, this_cpu_datap->cpu_cluster_id);
-		assert(pset != PROCESSOR_SET_NULL);
-#if __AMP__
-		kprintf("[%d]%s>pset_create(cluster_id=%d) returned pset %d\n", current_processor()->cpu_id, __FUNCTION__, this_cpu_datap->cpu_cluster_id, pset->pset_id);
-#endif /* __AMP__ */
-	}
-	kprintf("[%d]%s>cpu_id %p cluster_id %d cpu_number %d is type %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cpu_id, in_processor_info->cluster_id, this_cpu_datap->cpu_number, in_processor_info->cluster_type);
-	lck_mtx_unlock(&pset_create_lock);
 
-	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
-	if (!is_boot_cpu) {
-		processor_init(processor, this_cpu_datap->cpu_number, pset);
-	}
-
+	processor_t processor = PERCPU_GET_WITH_BASE(other_percpu_base(this_cpu_datap->cpu_number), processor);
 	*processor_out = processor;
+	if (!is_boot_cpu) {
+		smr_cpu_init(*processor_out);
+	}
 	*ipi_handler_out = cpu_signal_handler;
-#if CPMU_AIC_PMI && CONFIG_CPU_COUNTERS
-	*pmi_handler_out = mt_cpmu_aic_pmi;
+#if CONFIG_CPU_COUNTERS
+	cpc_cpu_transition(CPC_CPU_INIT, this_cpu_datap);
+
+#if CPMU_AIC_PMI
+	extern void cpc_cpmu_aic_pmi(cpu_id_t);
+	*pmi_handler_out = cpc_cpmu_aic_pmi;
 #else
 	*pmi_handler_out = NULL;
-#endif /* CPMU_AIC_PMI && CONFIG_CPU_COUNTERS */
+#endif /* CPMU_AIC_PMI */
+#else /* CONFIG_CPU_COUNTERS */
+	*pmi_handler_out = NULL;
+#endif /* !CONFIG_CPU_COUNTERS */
 	if (in_processor_info->idle_tickle != (idle_tickle_t *) NULL) {
 		*in_processor_info->idle_tickle = (idle_tickle_t) cpu_idle_tickle;
 	}
-
-#if CONFIG_CPU_COUNTERS
-	kpc_register_cpu(this_cpu_datap);
-#endif /* CONFIG_CPU_COUNTERS */
 
 #ifdef APPLEEVEREST
 	/**
@@ -1700,6 +1737,18 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
 	this_cpu_datap->cpm_reg_paddr = topology_info.clusters[cluster_id].cpm_IMPL_pa;
 #endif
 
+#if HAS_MTE
+	/*
+	 * To avoid predictable allocation tags, we want to initialize
+	 * RGSR_EL1.SEED as early as possible.  Unfortunately this happens
+	 * too early during secondary CPU startup to safely use the
+	 * corecrypto-backed PRNG.  So the primary CPU will generate
+	 * the seeds on their behalf.
+	 */
+	if (!is_boot_cpu) {
+		this_cpu_datap->mte_rgsr_el1_seed = arm_mte_random_rgsr_el1_seed();
+	}
+#endif
 
 	if (!is_boot_cpu) {
 		random_cpu_init(this_cpu_datap->cpu_number);
@@ -1754,7 +1803,19 @@ cause_ast_check(
 
 	if (current_processor() != processor) {
 		cpu_signal(processor_to_cpu_datap(processor), SIGPast, (void *)NULL, (void *)NULL);
-		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, MACHDBG_CODE(DBG_MACH_SCHED, MACH_REMOTE_AST), processor->cpu_id, 1 /* ast */, 0, 0, 0);
+		KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_SCHED, MACH_REMOTE_AST), processor->cpu_id, 1 /* ast */);
+	}
+}
+
+/*
+ *	Routine:        cause_maintenance_ipi
+ *	Function:
+ */
+void
+cause_maintenance_ipi(int cpu)
+{
+	if (cpu != cpu_number()) {
+		cpu_signal(CpuDataEntries[cpu].cpu_data_vaddr, SIGPMaintenance, NULL, NULL);
 	}
 }
 
@@ -2160,8 +2221,9 @@ ml_static_mfree(
 	vm_page_wire_count_initial -= freed_pages;
 	vm_page_kernelcache_count -= freed_kernelcache_pages;
 	vm_page_unlock_queues();
-#if     DEBUG
-	kprintf("ml_static_mfree: Released 0x%x pages at VA %p, size:0x%llx, last ppn: 0x%x, +%d bad\n", freed_pages, (void *)vaddr, (uint64_t)size, ppn, bad_page_cnt);
+#if DEBUG
+	kprintf("%s: Released %u pages at VA %p, size: %llu, last ppn: %#x, +%u bad\n",
+	    __func__, freed_pages, (void *)vaddr, (uint64_t)size, ppn, bad_page_cnt);
 #endif
 }
 
@@ -2220,7 +2282,11 @@ ml_nofault_copy(vm_offset_t virtsrc, vm_offset_t virtdst, vm_size_t size)
 			count = size;
 		}
 
+#if HAS_MTE
+		bcopy_phys_with_options(cur_phys_src, cur_phys_dst, count, cppvDisableTagCheck);
+#else /* HAS_MTE */
 		bcopy_phys(cur_phys_src, cur_phys_dst, count);
+#endif /* HAS_MTE */
 
 		nbytes += count;
 		virtsrc += count;
@@ -2326,7 +2392,13 @@ ml_stack_base(void)
 	if ((local < intstack_top_ptr) && (local > intstack_top_ptr - INTSTACK_SIZE)) {
 		return intstack_top_ptr - INTSTACK_SIZE;
 	} else {
-		return current_thread()->kernel_stack;
+		vm_offset_t base = current_thread()->kernel_stack;
+#if CONFIG_SPTM
+		if (current_thread()->machine.kredzonestack) {
+			base -= PAGE_SIZE;
+		}
+#endif /* CONFIG_SPTM */
+		return base;
 	}
 }
 vm_size_t
@@ -2339,7 +2411,13 @@ ml_stack_size(void)
 	if ((local < intstack_top_ptr) && (local > intstack_top_ptr - INTSTACK_SIZE)) {
 		return INTSTACK_SIZE;
 	} else {
-		return kernel_stack_size;
+		vm_size_t sz = kernel_stack_size;
+#if CONFIG_SPTM
+		if (current_thread()->machine.kredzonestack) {
+			sz += PAGE_SIZE;
+		}
+#endif /* CONFIG_SPTM */
+		return sz;
 	}
 }
 #endif
@@ -3141,6 +3219,65 @@ ml_panic_on_invalid_new_cpsr(const arm_saved_state_t *ss, uint32_t cpsr)
 	panic("attempt to set non-user CPSR %#010x on user saved-state %p", cpsr, ss);
 }
 
+#if HAS_MTE
+
+#if APPLEVIRTUALPLATFORM
+static SECURITY_READ_ONLY_LATE(bool) have_apple_mte_tag_generator;
+#else
+static const bool have_apple_mte_tag_generator = true;
+#endif
+
+static uint64_t
+arm_mte_random_rgsr_el1_seed(void)
+{
+	uint64_t seed;
+	/*
+	 * RGSR_EL1.SEED must be non-zero.  Otherwise the LFSR used during
+	 * random tag generation will just produce an endless stream of 0 bits.
+	 */
+	do {
+		seed = early_random();
+		if (have_apple_mte_tag_generator) {
+			seed &= RGSR_EL1_SEED_RRND_1_MASK;
+			seed |= (0b111 << RGSR_EL1_SEED_OFFSET);
+		} else {
+			seed &= RGSR_EL1_SEED_RRND_0_MASK;
+		}
+	} while (seed == 0);
+	return seed;
+}
+
+void
+arm_mte_tag_generator_init(bool is_boot_cpu)
+{
+#if APPLEVIRTUALPLATFORM
+	if (is_boot_cpu) {
+		uint64_t aidr_mtever = __builtin_arm_rsr64("AIDR_EL1") & AIDR_MTEVER_MASK;
+		if (aidr_mtever == AIDR_MTEVER_V1) {
+			have_apple_mte_tag_generator = true;
+		}
+	}
+#else
+#pragma unused(is_boot_cpu)
+#endif
+
+	/*
+	 * Note: ARM guarantees that all accesses to RGSR_EL1 occur in program
+	 * order relative to other instructions.  So no barriers are needed to
+	 * ensure that the GCR_EL1 write is ordered before the RGSR_EL1 write,
+	 * or that the RGSR_EL1 write is ordered before any instructions that
+	 * use RGSR_EL1 to generate tags.
+	 */
+	if (have_apple_mte_tag_generator) {
+		uint64_t gcr_el1 = __builtin_arm_rsr64("GCR_EL1");
+		gcr_el1 |= GCR_EL1_RRND;
+		__builtin_arm_wsr64("GCR_EL1", gcr_el1);
+	}
+
+	uint64_t seed = is_boot_cpu ? arm_mte_random_rgsr_el1_seed() : getCpuDatap()->mte_rgsr_el1_seed;
+	__builtin_arm_wsr64("RGSR_EL1", seed);
+}
+#endif /* HAS_MTE */
 
 /**
  * Explicitly preallocates a floating point save area.
@@ -3162,8 +3299,75 @@ ml_task_post_signature_processing_hook(__unused task_t task)
 	 */
 	os_atomic_thread_fence(acquire);
 
+#if !__ARM_KERNEL_PROTECT__
+	/*
+	 * If process_signature() added the x18 thread preservation flags
+	 * only now, we may not run through machine_switch_cpu_data() to
+	 * properly set up TPIDR_EL0 before the thread actually gets to
+	 * run in userspace, because it already is the current thread
+	 * after all. So we do that here, now.
+	 *
+	 * It may seem weird that the thread got scheduled, and is
+	 * effectively running, before process_signature() actually set up
+	 * critical properties of it through processing of the code
+	 * signature, but a thread in that state only waits on a
+	 * turnstile, nothing else. (TCRW_CLEAR_INITIAL_WAIT)
+	 */
+	thread_t thread = current_thread();
+	uint32_t flags = thread->machine.arm_machine_flags;
+
+	if (flags & (ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL)) {
+		uint64_t tpidr = __builtin_arm_rsr64("TPIDR_EL0");
+		if (!(tpidr & MACHDEP_TPIDR_FLAG_PRESERVE_X18)) {
+			tpidr |= MACHDEP_TPIDR_FLAG_PRESERVE_X18;
+			__builtin_arm_wsr64("TPIDR_EL0", tpidr);
+		}
+	}
+
+	/* Clear INITIAL now that we've processed it */
+	if (flags & ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL) {
+		thread->machine.arm_machine_flags &= ~ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL;
+	}
+#endif /* !__ARM_KERNEL_PROTECT__ */
+
 }
 
+#if HAS_MTE
+/**
+ * Gets a flag indicating whether a thread should have MTE tag access disabled,
+ * even when the current map has MTE tag access enabled.
+ *
+ * @param thread the thread to inspect
+ * @returns whether to override MTE tag access for this thread
+ */
+bool
+ml_thread_get_sec_override(thread_t thread)
+{
+	return thread->machine.sec_override;
+}
+
+/**
+ * Sets a flag on the thread to indicate that MTE tag access should be disabled,
+ * even when the current map has MTE tag access enabled.
+ *
+ * @warning This function is intended to be used by `vm_map_switch_*`, where the
+ * caller switches pmaps after setting this flag.  `ml_thread_set_sec_override`
+ * and the accompanying `pmap_switch` MUST be called together in a
+ * preemption-disabled context.
+ *
+ * @note Currently this function can only safely update current_thread().
+ *
+ * @param thread the target thread
+ * @param sec_override the new override setting
+ */
+void
+ml_thread_set_sec_override(thread_t thread, bool sec_override)
+{
+	assert(!preemption_enabled());
+	assert(thread == current_thread());
+	thread->machine.sec_override = sec_override;
+}
+#endif /* HAS_MTE */
 
 #if DEVELOPMENT || DEBUG || CONFIG_DTRACE || CONFIG_CSR_FROM_DT
 static bool SECURITY_READ_ONLY_LATE(_unsafe_kernel_text_initialized) = false;

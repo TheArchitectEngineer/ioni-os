@@ -2138,6 +2138,9 @@ iopolicysys(struct proc *p, struct iopolicysys_args *uap, int32_t *retval)
 		}
 		break;
 	case IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES:
+#if !DEVELOPMENT
+		iop_param.iop_policy &= ~IOPOL_MATERIALIZE_DATALESS_FILES_ORIG;
+#endif
 		error = iopolicysys_vfs_materialize_dataless_files(p, uap->cmd, iop_param.iop_scope, iop_param.iop_policy, &iop_param);
 		if (error) {
 			goto out;
@@ -2536,18 +2539,26 @@ set_thread_materialize_policy(struct uthread *ut, int policy)
 static inline void
 set_proc_materialize_policy(struct proc *p, int policy)
 {
-	if (policy == IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT) {
+	int policy_basic = (policy & IOPOL_MATERIALIZE_DATALESS_FILES_BASIC_MASK);
+
+	if (policy_basic == IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT) {
 		/*
 		 * Caller has specified "use the default policy".
 		 * The default policy is to NOT materialize dataless
 		 * files.
 		 */
-		policy = IOPOL_MATERIALIZE_DATALESS_FILES_OFF;
+		policy_basic = IOPOL_MATERIALIZE_DATALESS_FILES_OFF;
 	}
-	if (policy == IOPOL_MATERIALIZE_DATALESS_FILES_ON) {
+	if (policy_basic == IOPOL_MATERIALIZE_DATALESS_FILES_ON) {
 		OSBitOrAtomic16((uint16_t)P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES, &p->p_vfs_iopolicy);
+		if (policy & IOPOL_MATERIALIZE_DATALESS_FILES_ORIG) {
+			OSBitOrAtomic16((uint16_t)P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES_ORIG, &p->p_vfs_iopolicy);
+		}
 	} else {
 		OSBitAndAtomic16(~((uint16_t)P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES), &p->p_vfs_iopolicy);
+		if (policy & IOPOL_MATERIALIZE_DATALESS_FILES_ORIG) {
+			OSBitAndAtomic16(~(uint16_t)P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES_ORIG, &p->p_vfs_iopolicy);
+		}
 	}
 }
 
@@ -2578,7 +2589,8 @@ iopolicysys_vfs_materialize_dataless_files(struct proc *p __unused, int cmd, int
 
 	/* Validate policy */
 	if (cmd == IOPOL_CMD_SET) {
-		switch (policy) {
+		int dataless_policy = policy & IOPOL_MATERIALIZE_DATALESS_FILES_BASIC_MASK;
+		switch (dataless_policy) {
 		case IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT:
 		case IOPOL_MATERIALIZE_DATALESS_FILES_OFF:
 		case IOPOL_MATERIALIZE_DATALESS_FILES_ON:
@@ -2591,13 +2603,15 @@ iopolicysys_vfs_materialize_dataless_files(struct proc *p __unused, int cmd, int
 
 	/* Perform command */
 	switch (cmd) {
-	case IOPOL_CMD_SET:
+	case IOPOL_CMD_SET: {
+		int dataless_policy = policy & IOPOL_MATERIALIZE_DATALESS_FILES_BASIC_MASK;
 		if (thread != THREAD_NULL) {
-			set_thread_materialize_policy(get_bsdthread_info(thread), policy);
+			set_thread_materialize_policy(get_bsdthread_info(thread), dataless_policy);
 		} else {
 			set_proc_materialize_policy(p, policy);
 		}
 		break;
+	}
 	case IOPOL_CMD_GET:
 		if (thread != THREAD_NULL) {
 			policy = get_thread_materialize_policy(get_bsdthread_info(thread));
@@ -3355,9 +3369,7 @@ gather_rusage_info(proc_t p, rusage_info_current *ru, int flavor)
 	case RUSAGE_INFO_V6:
 		ru->ri_neural_footprint = get_task_neural_nofootprint_total(proc_task(p));
 		ru->ri_lifetime_max_neural_footprint = get_task_neural_nofootprint_total_lifetime_max(proc_task(p));
-#if CONFIG_LEDGER_INTERVAL_MAX
 		ru->ri_interval_max_neural_footprint = get_task_neural_nofootprint_total_interval_max(proc_task(p), FALSE);
-#endif
 		/* Any P-specific resource counters are captured in fill_task_rusage. */
 		OS_FALLTHROUGH;
 
@@ -3372,9 +3384,7 @@ gather_rusage_info(proc_t p, rusage_info_current *ru, int flavor)
 	case RUSAGE_INFO_V4:
 		ru->ri_logical_writes = get_task_logical_writes(proc_task(p), false);
 		ru->ri_lifetime_max_phys_footprint = get_task_phys_footprint_lifetime_max(proc_task(p));
-#if CONFIG_LEDGER_INTERVAL_MAX
 		ru->ri_interval_max_phys_footprint = get_task_phys_footprint_interval_max(proc_task(p), FALSE);
-#endif
 		OS_FALLTHROUGH;
 
 	case RUSAGE_INFO_V3:
@@ -3503,10 +3513,8 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 	uint32_t cpumon_flags;
 	uint32_t cpulimits_flags;
 	kauth_cred_t my_cred, target_cred;
-#if CONFIG_LEDGER_INTERVAL_MAX
 	uint32_t footprint_interval_flags;
 	uint64_t interval_max_footprint;
-#endif /* CONFIG_LEDGER_INTERVAL_MAX */
 
 	/* -1 implicitly means our own process (perhaps even the current thread for per-thread attributes) */
 	if (uap->pid == -1) {
@@ -3564,7 +3572,6 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 		error = mach_to_bsd_rv(thread_set_cpulimit(THREAD_CPULIMIT_BLOCK, percent, ns_refill));
 		break;
 
-#if CONFIG_LEDGER_INTERVAL_MAX
 	case RLIMIT_FOOTPRINT_INTERVAL:
 		footprint_interval_flags = (uint32_t)uap->arg; // XXX temporarily stashing flags in argp (12592127)
 		/*
@@ -3578,7 +3585,6 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 		interval_max_footprint = get_task_neural_nofootprint_total_interval_max(proc_task(targetp), TRUE);
 		break;
 
-#endif /* CONFIG_LEDGER_INTERVAL_MAX */
 	default:
 		error = EINVAL;
 		break;

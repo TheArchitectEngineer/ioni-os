@@ -125,6 +125,7 @@
 #include <kern/assert.h>
 #include <kern/affinity.h>
 #include <kern/exc_resource.h>
+#include <kern/exc_guard.h>
 #include <kern/machine.h>
 #include <kern/policy_internal.h>
 #include <kern/restartable.h>
@@ -151,11 +152,13 @@
 #include <os/log.h>
 
 #include <vm/pmap.h>
+#include <vm/vm_map_lock_internal.h>
 #include <vm/vm_map_xnu.h>
 #include <vm/vm_kern_xnu.h>         /* for kernel_map, ipc_kernel_map */
 #include <vm/vm_pageout_xnu.h>
 #include <vm/vm_protos.h>
 #include <vm/vm_purgeable_xnu.h>
+#include <vm/vm_compressor_backing_store_xnu.h>
 #include <vm/vm_compressor_pager_xnu.h>
 #include <vm/vm_reclaim_xnu.h>
 #include <vm/vm_compressor_xnu.h>
@@ -168,7 +171,6 @@
 #include <sys/kdebug_triage.h>
 #include <sys/code_signing.h> /* for is_address_space_debugged */
 #include <sys/reason.h>
-
 /*
  * Exported interfaces
  */
@@ -200,6 +202,8 @@
 #endif
 
 #include <string.h>
+
+static KALLOC_TYPE_DEFINE(task_tokens_zone, struct task_token_data, KT_DEFAULT);
 
 #if KPERF
 extern int kpc_force_all_ctrs(task_t, int);
@@ -300,120 +304,160 @@ zinfo_usage_store_t tasks_tkm_shared;
 expired_task_statistics_t               dead_task_statistics;
 LCK_SPIN_DECLARE_ATTR(dead_task_statistics_lock, &task_lck_grp, &task_lck_attr);
 
-ledger_template_t task_ledger_template = NULL;
-
 /* global lock for task_dyld_process_info_notify_{register, deregister, get_trap} */
 LCK_GRP_DECLARE(g_dyldinfo_mtx_grp, "g_dyldinfo");
 LCK_MTX_DECLARE(g_dyldinfo_mtx, &g_dyldinfo_mtx_grp);
 
-SECURITY_READ_ONLY_LATE(struct _task_ledger_indices) task_ledgers __attribute__((used)) =
-{.cpu_time = -1,
- .tkm_private = -1,
- .tkm_shared = -1,
- .phys_mem = -1,
- .wired_mem = -1,
- .internal = -1,
- .iokit_mapped = -1,
- .external = -1,
- .reusable = -1,
- .alternate_accounting = -1,
- .alternate_accounting_compressed = -1,
- .page_table = -1,
- .phys_footprint = -1,
- .internal_compressed = -1,
- .purgeable_volatile = -1,
- .purgeable_nonvolatile = -1,
- .purgeable_volatile_compressed = -1,
- .purgeable_nonvolatile_compressed = -1,
- .tagged_nofootprint = -1,
- .tagged_footprint = -1,
- .tagged_nofootprint_compressed = -1,
- .tagged_footprint_compressed = -1,
- .network_volatile = -1,
- .network_nonvolatile = -1,
- .network_volatile_compressed = -1,
- .network_nonvolatile_compressed = -1,
- .media_nofootprint = -1,
- .media_footprint = -1,
- .media_nofootprint_compressed = -1,
- .media_footprint_compressed = -1,
- .graphics_nofootprint = -1,
- .graphics_footprint = -1,
- .graphics_nofootprint_compressed = -1,
- .graphics_footprint_compressed = -1,
- .neural_nofootprint = -1,
- .neural_footprint = -1,
- .neural_nofootprint_compressed = -1,
- .neural_footprint_compressed = -1,
- .neural_nofootprint_total = -1,
- .platform_idle_wakeups = -1,
- .interrupt_wakeups = -1,
-#if CONFIG_SCHED_SFI
- .sfi_wait_times = { 0 /* initialized at runtime */},
-#endif /* CONFIG_SCHED_SFI */
- .cpu_time_billed_to_me = -1,
- .cpu_time_billed_to_others = -1,
- .physical_writes = -1,
- .logical_writes = -1,
- .logical_writes_to_external = -1,
- .pages_grabbed = -1,
- .pages_grabbed_kern = -1,
- .pages_grabbed_iopl = -1,
- .pages_grabbed_upl = -1,
-#if CONFIG_FREEZE
- .frozen_to_swap = -1,
-#endif /* CONFIG_FREEZE */
- .energy_billed_to_me = -1,
- .energy_billed_to_others = -1,
-#if CONFIG_PHYS_WRITE_ACCT
- .fs_metadata_writes = -1,
-#endif /* CONFIG_PHYS_WRITE_ACCT */
+static void task_io_rate_exceeded(ledger_warning_t warning, const void *param0)
+asm("_SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO");
+static void task_wakeups_rate_exceeded(ledger_warning_t warning, const void *param0)
+asm("_SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MANY_WAKEUPS");
+static void task_footprint_exceeded(ledger_warning_t warning, const void *param0);
+static void task_conclave_mem_limit_exceeded(ledger_warning_t warning, const void *param0);
+
+SECURITY_READ_ONLY_LATE(struct _task_ledger_indices) task_ledgers;
+
+static SECURITY_READ_ONLY_LATE(struct ledger_entry_template) task_ledger_entries[] =
+{ LEDGER_ENTRY("cpu_time", "sched", "ns", LFEAT_DEBIT | LFEAT_REFILL),
+
+  LEDGER_ENTRY("tkm_private", "physmem", "bytes", LFEAT_SCALABLE),
+  LEDGER_ENTRY("tkm_shared", "physmem", "bytes", LFEAT_SCALABLE),
+  LEDGER_ENTRY("phys_mem", "physmem", "bytes", LFEAT_SCALABLE | LFEAT_MAXIMUM),
+  LEDGER_ENTRY("wired_mem", "physmem", "bytes", LFEAT_SCALABLE),
+
+  LEDGER_ENTRY("internal", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM),
+  LEDGER_ENTRY("external", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM),
+  LEDGER_ENTRY("reusable", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM),
+  LEDGER_ENTRY("internal_compressed", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM),
+
+  LEDGER_ENTRY("iokit_mapped", "mappings", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("alternate_accounting", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("alternate_accounting_compressed", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY_CALLBACK("conclave_mem", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM,
 #if CONFIG_MEMORYSTATUS
- .memorystatus_dirty_time = -1,
+    task_conclave_mem_limit_exceeded,
+#else
+    NULL,
+#endif
+    NULL),
+  LEDGER_ENTRY_CALLBACK("phys_footprint", "physmem", "bytes",
+    LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE | LFEAT_DEBIT | LFEAT_MAXIMUM | LFEAT_DIAG,
+#if CONFIG_MEMORYSTATUS
+    task_footprint_exceeded,
+#else
+    NULL,
+#endif
+    NULL),
+#if CONFIG_MEMORYSTATUS
+  LEDGER_ENTRY("memorystatus_dirty_time", "physmem", "ns", LFEAT_NONE),
 #endif /* CONFIG_MEMORYSTATUS */
- .swapins = -1,
- .conclave_mem = -1, };
+  LEDGER_ENTRY("page_table", "physmem", "bytes", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("pages_grabbed", "physmem", "count", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("pages_grabbed_kern", "physmem", "count", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("pages_grabbed_iopl", "physmem", "count", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("pages_grabbed_upl", "physmem", "count", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("purgeable_volatile", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("purgeable_nonvolatile", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("purgeable_volatile_compress", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("purgeable_nonvolatile_compress", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("tagged_nofootprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("tagged_footprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("tagged_nofootprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("tagged_footprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("network_volatile", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("network_nonvolatile", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("network_volatile_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("network_nonvolatile_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("media_nofootprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("media_footprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("media_nofootprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("media_footprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("graphics_nofootprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("graphics_footprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("graphics_nofootprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("graphics_footprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+
+  LEDGER_ENTRY("neural_nofootprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("neural_footprint", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("neural_nofootprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("neural_footprint_compressed", "physmem", "bytes", LFEAT_ASSERT_POSITIVE),
+  LEDGER_ENTRY("neural_nofootprint_total", "physmem", "bytes", LFEAT_ASSERT_POSITIVE | LFEAT_MAXIMUM),
+
+  LEDGER_ENTRY("swapins", "physmem", "bytes", LFEAT_SCALABLE | LFEAT_ASSERT_POSITIVE),
+#if CONFIG_FREEZE
+  LEDGER_ENTRY("frozen_to_swap", "physmem", "bytes", LFEAT_NONE),
+#endif /* CONFIG_FREEZE */
+#if CONFIG_DEFERRED_RECLAIM
+  LEDGER_ENTRY("est_reclaimable", "virtmem", "bytes", LFEAT_ASSERT_POSITIVE),
+#endif /* CONFIG_DEFERRED_RECLAIM */
+
+  LEDGER_ENTRY("platform_idle_wakeups", "power", "count", LFEAT_NONE),
+  LEDGER_ENTRY_CALLBACK("interrupt_wakeups", "power", "count",
+    LFEAT_DEBIT | LFEAT_REFILL,
+    task_wakeups_rate_exceeded, NULL),
+
+#if CONFIG_SCHED_SFI
+  SFI_LEDGER_ENTRY(APP_NAP),
+  SFI_LEDGER_ENTRY(DARWIN_BG),
+  SFI_LEDGER_ENTRY(DEFAULT),
+  SFI_LEDGER_ENTRY(LEGACY),
+  SFI_LEDGER_ENTRY(MAINTENANCE),
+  SFI_LEDGER_ENTRY(MANAGED),
+  SFI_LEDGER_ENTRY(OPTED_OUT),
+  SFI_LEDGER_ENTRY(USER_INITIATED),
+  SFI_LEDGER_ENTRY(USER_INTERACTIVE),
+  SFI_LEDGER_ENTRY(UTILITY),
+  SFI_LEDGER_ENTRY(RUNAWAY_MITIGATION),
+#endif /* CONFIG_SCHED_SFI */
+
+  LEDGER_ENTRY("cpu_time_billed_to_me", "sched", "ns", LFEAT_NONE),
+  LEDGER_ENTRY("cpu_time_billed_to_others", "sched", "ns", LFEAT_NONE),
+  LEDGER_ENTRY("energy_billed_to_me", "power", "nj", LFEAT_NONE),
+  LEDGER_ENTRY("energy_billed_to_others", "power", "nj", LFEAT_NONE),
+
+  LEDGER_ENTRY_CALLBACK("physical_writes", "res", "bytes",
+    LFEAT_DEBIT | LFEAT_REFILL,
+    task_io_rate_exceeded, (void *)FLAVOR_IO_PHYSICAL_WRITES),
+  LEDGER_ENTRY("logical_writes", "res", "bytes", LFEAT_DEBIT),
+  LEDGER_ENTRY("logical_writes_to_external", "res", "bytes", LFEAT_DEBIT),
+#if CONFIG_PHYS_WRITE_ACCT
+  LEDGER_ENTRY("fs_metadata_writes", "res", "bytes", LFEAT_DEBIT),
+#endif /* CONFIG_PHYS_WRITE_ACCT */
+};
+
+LEDGER_TEMPLATE_DEFINE(task_ledger_template, "Per-task ledger", task_ledger_entries);
 
 /* System sleep state */
 boolean_t tasks_suspend_state;
 
-__options_decl(send_exec_resource_is_fatal, bool, {
-	IS_NOT_FATAL            = false,
-	IS_FATAL                = true
-});
-
-__options_decl(send_exec_resource_is_diagnostics, bool, {
-	IS_NOT_DIAGNOSTICS      = false,
-	IS_DIAGNOSTICS          = true
-});
-
-__options_decl(send_exec_resource_is_warning, bool, {
-	IS_NOT_WARNING          = false,
-	IS_WARNING              = true
-});
-
 __options_decl(send_exec_resource_options_t, uint8_t, {
-	EXEC_RESOURCE_FATAL = 0x01,
-	EXEC_RESOURCE_DIAGNOSTIC = 0x02,
-	EXEC_RESOURCE_WARNING = 0x04,
-	EXEC_RESOURCE_CONCLAVE = 0x08 // A side memory limit independent of the main footprint.
+	EXC_RESOURCE_FATAL      = 0x01,
+	EXC_RESOURCE_DIAGNOSTIC = 0x02,
+	EXC_RESOURCE_WARNING    = 0x04,
+	EXC_RESOURCE_CONCLAVE   = 0x08, // A side memory limit independent of the main footprint.
+	EXC_RESOURCE_IS_ACTIVE  = 0x10
 });
 
 /**
  * Actions to take when a process has reached the memory limit or the diagnostics threshold limits
  */
-static inline void task_process_crossed_limit_no_diag(task_t task, ledger_amount_t ledger_limit_size, bool memlimit_is_fatal, bool memlimit_is_active, send_exec_resource_is_warning is_warning);
-#if DEBUG || DEVELOPMENT
-static inline void task_process_crossed_limit_diag(ledger_amount_t ledger_limit_size);
-#endif
 void init_task_ledgers(void);
-void task_footprint_exceeded(int warning, __unused const void *param0, __unused const void *param1);
-void task_wakeups_rate_exceeded(int warning, __unused const void *param0, __unused const void *param1);
-void task_io_rate_exceeded(int warning, const void *param0, __unused const void *param1);
-void task_conclave_mem_limit_exceeded(int warning, __unused const void *param0, __unused const void *param1);
-void __attribute__((noinline)) SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MANY_WAKEUPS(void);
 void __attribute__((noinline)) PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND(int max_footprint_mb, send_exec_resource_options_t exception_options);
-void __attribute__((noinline)) SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO(int flavor);
 #if CONFIG_PROC_RESOURCE_LIMITS
 void __attribute__((noinline)) SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_FILE_DESCRIPTORS(task_t task, int current_size, int soft_limit, int hard_limit);
 mach_port_name_t current_task_get_fatal_port_name(void);
@@ -440,18 +484,8 @@ extern kern_return_t thread_resume(thread_t thread);
 #define TASK_WAKEUPS_MONITOR_DEFAULT_LIMIT              150 /* wakeups per second */
 #define TASK_WAKEUPS_MONITOR_DEFAULT_INTERVAL   300 /* in seconds. */
 
-/*
- * Level (in terms of percentage of the limit) at which the wakeups monitor triggers telemetry.
- *
- * (ie when the task's wakeups rate exceeds 70% of the limit, start taking user
- *  stacktraces, aka micro-stackshots)
- */
-#define TASK_WAKEUPS_MONITOR_DEFAULT_USTACKSHOTS_TRIGGER        70
-
 int task_wakeups_monitor_interval; /* In seconds. Time period over which wakeups rate is observed */
 int task_wakeups_monitor_rate;     /* In hz. Maximum allowable wakeups per task before EXC_RESOURCE is sent */
-
-unsigned int task_wakeups_monitor_ustackshots_trigger_pct; /* Percentage. Level at which we start gathering telemetry. */
 
 TUNABLE(bool, disable_exc_resource, "disable_exc_resource", false); /* Global override to suppress EXC_RESOURCE for resource monitor violations. */
 TUNABLE(bool, disable_exc_resource_during_audio, "disable_exc_resource_during_audio", true); /* Global override to suppress EXC_RESOURCE while audio is active */
@@ -484,11 +518,6 @@ static boolean_t global_update_logical_writes(int64_t, int64_t*);
 static diagthreshold_check_return task_check_memorythreshold_is_valid(task_t task, uint64_t new_limit, bool is_diagnostics_value);
 #endif
 #define TASK_MAX_THREAD_LIMIT 256
-
-#if MACH_ASSERT
-int pmap_ledgers_panic = 1;
-int pmap_ledgers_panic_leeway = 3;
-#endif /* MACH_ASSERT */
 
 int task_max = CONFIG_TASK_MAX; /* Max number of tasks */
 
@@ -545,7 +574,7 @@ struct task_exc_guard_named_default {
 #define _TASK_EXC_GUARD_MP_ONCE    (_TASK_EXC_GUARD_MP_CORPSE | TASK_EXC_GUARD_MP_ONCE)
 #define _TASK_EXC_GUARD_MP_FATAL   (TASK_EXC_GUARD_MP_DELIVER | TASK_EXC_GUARD_MP_FATAL)
 
-#define _TASK_EXC_GUARD_VM_CORPSE  (TASK_EXC_GUARD_VM_DELIVER | TASK_EXC_GUARD_VM_ONCE)
+#define _TASK_EXC_GUARD_VM_CORPSE  (TASK_EXC_GUARD_VM_DELIVER | TASK_EXC_GUARD_VM_CORPSE)
 #define _TASK_EXC_GUARD_VM_ONCE    (_TASK_EXC_GUARD_VM_CORPSE | TASK_EXC_GUARD_VM_ONCE)
 #define _TASK_EXC_GUARD_VM_FATAL   (TASK_EXC_GUARD_VM_DELIVER | TASK_EXC_GUARD_VM_FATAL)
 
@@ -703,9 +732,9 @@ task_set_platform_binary(
 	}
 	assert(task->map);
 	if (task->map) {
-		vm_map_lock(task->map);
+		vm_map_ilk_lock(task->map);
 		vm_map_set_platform_binary(task->map, (bool)is_platform);
-		vm_map_unlock(task->map);
+		vm_map_ilk_unlock(task->map);
 	}
 }
 
@@ -745,16 +774,25 @@ task_is_ipc_active(task_t task)
 	return task->ipc_active;
 }
 
+bool
+task_is_immovable_no_assert(task_t task)
+{
+	task_control_port_options_t opt = task_get_control_port_options(task);
+	return !!(opt & TASK_CONTROL_PORT_IMMOVABLE_MASK);
+}
+
+bool
+task_is_immovable(task_t task)
+{
+	task_control_port_options_t opt = task_get_control_port_options(task);
+	assert(opt != TASK_CONTROL_PORT_OPTIONS_INVALID);
+	return !!(opt & TASK_CONTROL_PORT_IMMOVABLE_MASK);
+}
+
 void
 task_set_corpse(task_t task)
 {
 	return task_ro_flags_set(task, TFRO_CORPSE);
-}
-
-void
-task_copyout_control_port(task_t task)
-{
-	ipc_task_copyout_control_port(task);
 }
 
 /*
@@ -913,19 +951,25 @@ task_clear_return_wait(task_t task, uint32_t flags)
 }
 
 /*
- * Set default behavior for a task's control ports
+ *  Set default behavior for a task's control ports
+ *
+ *  Nothing locked. This is safe because it is called before
+ *  ipc_task_enable, so no one has access to the task yet.
  */
-static void
+void
 task_set_ctrl_port_default(
 	task_t         task,
 	thread_t       thread)
 {
 	ipc_space_policy_t pol = ipc_policy_for_task(task);
-	bool movable_allowed = mac_task_check_get_movable_control_port() == 0;
+	bool movable_allowed = mac_task_check_get_movable_control_port_during_spawn(task) == 0;
 	bool is_simulated = pol & IPC_SPACE_POLICY_SIMULATED;
 	bool is_translated = false;
-
 	task_control_port_options_t opts = TASK_CONTROL_PORT_OPTIONS_NONE;
+
+	/* verify it is call before ipc_task_enable */
+	assert(!task->ipc_active);
+
 	if (movable_allowed || is_simulated || is_translated) {
 		/* Disable control port hardening for entitled||simulated binaries */
 		opts = TASK_CONTROL_PORT_OPTIONS_NONE;
@@ -933,19 +977,15 @@ task_set_ctrl_port_default(
 		/* set control port options for 1p code, inherited from parent task by default */
 		if (ipc_control_port_options & ICP_OPTIONS_IMMOVABLE_1P_HARD) {
 			opts |= TASK_CONTROL_PORT_IMMOVABLE_HARD;
-		} else if (ipc_control_port_options & ICP_OPTIONS_IMMOVABLE_1P_SOFT) {
-			opts |= TASK_CONTROL_PORT_IMMOVABLE_SOFT;
 		}
 	} else {
 		/* set control port options for 3p code, inherited from parent task by default */
 		if (ipc_control_port_options & ICP_OPTIONS_IMMOVABLE_3P_HARD) {
 			opts |= TASK_CONTROL_PORT_IMMOVABLE_HARD;
-		} else if (ipc_control_port_options & ICP_OPTIONS_IMMOVABLE_3P_SOFT) {
-			opts |= TASK_CONTROL_PORT_IMMOVABLE_SOFT;
 		}
 	}
 
-	/* see `copyout_should_mark_immovable_send`, which consumes these flags */
+	/* see `ipc_should_mark_immovable_send`, which consumes these flags */
 	task_set_control_port_options(task, opts);
 
 	/*
@@ -962,7 +1002,6 @@ void __attribute__((noreturn))
 task_wait_to_return(void)
 {
 	task_t task = current_task();
-	thread_t thread = current_thread();
 	uint8_t returnwaitflags;
 
 	is_write_lock(task->itk_space);
@@ -1015,11 +1054,6 @@ task_wait_to_return(void)
 		mac_proc_notify_exec_complete(current_proc());
 	}
 #endif
-
-	/*
-	 * Set task/thread control port movability now that we can call AMFI
-	 */
-	task_set_ctrl_port_default(task, thread);
 
 	thread_bootstrap_return();
 }
@@ -1142,11 +1176,6 @@ task_init(void)
 		task_wakeups_monitor_interval = TASK_WAKEUPS_MONITOR_DEFAULT_INTERVAL;
 	}
 
-	if (!PE_parse_boot_argn("task_wakeups_monitor_ustackshots_trigger_pct", &task_wakeups_monitor_ustackshots_trigger_pct,
-	    sizeof(task_wakeups_monitor_ustackshots_trigger_pct))) {
-		task_wakeups_monitor_ustackshots_trigger_pct = TASK_WAKEUPS_MONITOR_DEFAULT_USTACKSHOTS_TRIGGER;
-	}
-
 	if (!PE_parse_boot_argn("task_iomon_limit_mb", &task_iomon_limit_mb, sizeof(task_iomon_limit_mb))) {
 		task_iomon_limit_mb = IOMON_DEFAULT_LIMIT;
 	}
@@ -1165,7 +1194,7 @@ task_init(void)
  * then we have to call it now.
  */
 #if CONFIG_COALITIONS
-	assert(task_ledger_template);
+	assert(task_ledger_template.lt_size);
 #else /* CONFIG_COALITIONS */
 	init_task_ledgers();
 #endif /* CONFIG_COALITIONS */
@@ -1190,6 +1219,9 @@ task_init(void)
 		panic("task_init");
 	}
 
+#if HAS_MTE && CONFIG_KERNEL_TAGGING
+	task_set_sec(kernel_task);
+#endif /* HAS_MTE && CONFIG_KERNEL_TAGGING */
 
 
 	vm_map_setup(get_task_map(kernel_task), kernel_task);
@@ -1257,270 +1289,86 @@ task_zone_init(void)
 void
 init_task_ledgers(void)
 {
-	ledger_template_t t;
+	ledger_template_t t = &task_ledger_template;
 
-	assert(task_ledger_template == NULL);
-	assert(kernel_task == TASK_NULL);
+	ledger_template_finalize(t,
+	    LEDGER_TPL_SCALABLE | LEDGER_TPL_SECURE_ALLOC);
 
-#if MACH_ASSERT
-	PE_parse_boot_argn("pmap_ledgers_panic",
-	    &pmap_ledgers_panic,
-	    sizeof(pmap_ledgers_panic));
-	PE_parse_boot_argn("pmap_ledgers_panic_leeway",
-	    &pmap_ledgers_panic_leeway,
-	    sizeof(pmap_ledgers_panic_leeway));
-#endif /* MACH_ASSERT */
-
-	if ((t = ledger_template_create("Per-task ledger")) == NULL) {
-		panic("couldn't create task ledger template");
-	}
-
-	task_ledgers.cpu_time = ledger_entry_add(t, "cpu_time", "sched", "ns");
-	task_ledgers.tkm_private = ledger_entry_add(t, "tkm_private",
-	    "physmem", "bytes");
-	task_ledgers.tkm_shared = ledger_entry_add(t, "tkm_shared", "physmem",
-	    "bytes");
-	task_ledgers.phys_mem = ledger_entry_add(t, "phys_mem", "physmem",
-	    "bytes");
-	task_ledgers.wired_mem = ledger_entry_add(t, "wired_mem", "physmem",
-	    "bytes");
-	task_ledgers.conclave_mem = ledger_entry_add_with_flags(t, "conclave_mem", "physmem", "bytes",
-	    LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE | LEDGER_ENTRY_ALLOW_DEBIT);
-	task_ledgers.internal = ledger_entry_add(t, "internal", "physmem",
-	    "bytes");
-	task_ledgers.iokit_mapped = ledger_entry_add_with_flags(t, "iokit_mapped", "mappings",
-	    "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.alternate_accounting = ledger_entry_add_with_flags(t, "alternate_accounting", "physmem",
-	    "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.alternate_accounting_compressed = ledger_entry_add_with_flags(t, "alternate_accounting_compressed", "physmem",
-	    "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.page_table = ledger_entry_add_with_flags(t, "page_table", "physmem",
-	    "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.phys_footprint = ledger_entry_add(t, "phys_footprint", "physmem",
-	    "bytes");
-	task_ledgers.internal_compressed = ledger_entry_add(t, "internal_compressed", "physmem",
-	    "bytes");
-	task_ledgers.reusable = ledger_entry_add(t, "reusable", "physmem", "bytes");
-	task_ledgers.external = ledger_entry_add(t, "external", "physmem", "bytes");
-	task_ledgers.purgeable_volatile = ledger_entry_add_with_flags(t, "purgeable_volatile", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.purgeable_nonvolatile = ledger_entry_add_with_flags(t, "purgeable_nonvolatile", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.purgeable_volatile_compressed = ledger_entry_add_with_flags(t, "purgeable_volatile_compress", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.purgeable_nonvolatile_compressed = ledger_entry_add_with_flags(t, "purgeable_nonvolatile_compress", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.pages_grabbed = ledger_entry_add_with_flags(t, "pages_grabbed", "physmem", "count", LEDGER_ENTRY_USE_COUNTER);
-	task_ledgers.pages_grabbed_kern = ledger_entry_add_with_flags(t, "pages_grabbed_kern", "physmem", "count", LEDGER_ENTRY_USE_COUNTER);
-	task_ledgers.pages_grabbed_iopl = ledger_entry_add_with_flags(t, "pages_grabbed_iopl", "physmem", "count", LEDGER_ENTRY_USE_COUNTER);
-	task_ledgers.pages_grabbed_upl = ledger_entry_add_with_flags(t, "pages_grabbed_upl", "physmem", "count", LEDGER_ENTRY_USE_COUNTER);
-	task_ledgers.tagged_nofootprint = ledger_entry_add_with_flags(t, "tagged_nofootprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.tagged_footprint = ledger_entry_add_with_flags(t, "tagged_footprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.tagged_nofootprint_compressed = ledger_entry_add_with_flags(t, "tagged_nofootprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.tagged_footprint_compressed = ledger_entry_add_with_flags(t, "tagged_footprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.network_volatile = ledger_entry_add_with_flags(t, "network_volatile", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.network_nonvolatile = ledger_entry_add_with_flags(t, "network_nonvolatile", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.network_volatile_compressed = ledger_entry_add_with_flags(t, "network_volatile_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.network_nonvolatile_compressed = ledger_entry_add_with_flags(t, "network_nonvolatile_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.media_nofootprint = ledger_entry_add_with_flags(t, "media_nofootprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.media_footprint = ledger_entry_add_with_flags(t, "media_footprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.media_nofootprint_compressed = ledger_entry_add_with_flags(t, "media_nofootprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.media_footprint_compressed = ledger_entry_add_with_flags(t, "media_footprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.graphics_nofootprint = ledger_entry_add_with_flags(t, "graphics_nofootprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.graphics_footprint = ledger_entry_add_with_flags(t, "graphics_footprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.graphics_nofootprint_compressed = ledger_entry_add_with_flags(t, "graphics_nofootprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.graphics_footprint_compressed = ledger_entry_add_with_flags(t, "graphics_footprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.neural_nofootprint = ledger_entry_add_with_flags(t, "neural_nofootprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.neural_footprint = ledger_entry_add_with_flags(t, "neural_footprint", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.neural_nofootprint_compressed = ledger_entry_add_with_flags(t, "neural_nofootprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.neural_footprint_compressed = ledger_entry_add_with_flags(t, "neural_footprint_compressed", "physmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-	task_ledgers.neural_nofootprint_total = ledger_entry_add(t, "neural_nofootprint_total", "physmem", "bytes");
-
-#if CONFIG_DEFERRED_RECLAIM
-	task_ledgers.est_reclaimable = ledger_entry_add_with_flags(t, "est_reclaimable", "virtmem", "bytes", LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-#endif /* CONFIG_DEFERRED_RECLAIM */
-
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, cpu_time);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tkm_private);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tkm_shared);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, phys_mem);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, wired_mem);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, conclave_mem);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, internal);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, iokit_mapped);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, alternate_accounting);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, alternate_accounting_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, page_table);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, phys_footprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, internal_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, reusable);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, external);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, purgeable_volatile);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, purgeable_nonvolatile);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, purgeable_volatile_compress);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, purgeable_nonvolatile_compress);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, pages_grabbed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, pages_grabbed_kern);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, pages_grabbed_iopl);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, pages_grabbed_upl);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tagged_nofootprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tagged_footprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tagged_nofootprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, tagged_footprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, network_volatile);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, network_nonvolatile);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, network_volatile_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, network_nonvolatile_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, media_nofootprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, media_footprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, media_nofootprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, media_footprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, graphics_nofootprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, graphics_footprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, graphics_nofootprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, graphics_footprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, neural_nofootprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, neural_footprint);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, neural_nofootprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, neural_footprint_compressed);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, neural_nofootprint_total);
 #if CONFIG_FREEZE
-	task_ledgers.frozen_to_swap = ledger_entry_add(t, "frozen_to_swap", "physmem", "bytes");
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, frozen_to_swap);
 #endif /* CONFIG_FREEZE */
-
-	task_ledgers.platform_idle_wakeups = ledger_entry_add(t, "platform_idle_wakeups", "power",
-	    "count");
-	task_ledgers.interrupt_wakeups = ledger_entry_add(t, "interrupt_wakeups", "power",
-	    "count");
+#if CONFIG_DEFERRED_RECLAIM
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, est_reclaimable);
+#endif /* CONFIG_DEFERRED_RECLAIM */
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, platform_idle_wakeups);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, interrupt_wakeups);
 
 #if CONFIG_SCHED_SFI
-	sfi_class_id_t class_id, ledger_alias;
-	for (class_id = SFI_CLASS_UNSPECIFIED; class_id < MAX_SFI_CLASS_ID; class_id++) {
-		task_ledgers.sfi_wait_times[class_id] = -1;
-	}
-
 	/* don't account for UNSPECIFIED */
-	for (class_id = SFI_CLASS_UNSPECIFIED + 1; class_id < MAX_SFI_CLASS_ID; class_id++) {
-		ledger_alias = sfi_get_ledger_alias_for_class(class_id);
-		if (ledger_alias != SFI_CLASS_UNSPECIFIED) {
-			/* Check to see if alias has been registered yet */
-			if (task_ledgers.sfi_wait_times[ledger_alias] != -1) {
-				task_ledgers.sfi_wait_times[class_id] = task_ledgers.sfi_wait_times[ledger_alias];
-			} else {
-				/* Otherwise, initialize it first */
-				task_ledgers.sfi_wait_times[class_id] = task_ledgers.sfi_wait_times[ledger_alias] = sfi_ledger_entry_add(t, ledger_alias);
-			}
-		} else {
-			task_ledgers.sfi_wait_times[class_id] = sfi_ledger_entry_add(t, class_id);
-		}
-
-		if (task_ledgers.sfi_wait_times[class_id] < 0) {
-			panic("couldn't create entries for task ledger template for SFI class 0x%x", class_id);
-		}
+	for (sfi_class_id_t class_id = SFI_CLASS_UNSPECIFIED + 1; class_id < MAX_SFI_CLASS_ID; class_id++) {
+		task_ledgers.sfi_wait_times[class_id] = ledger_key_lookup(t,
+		    sfi_class_ledger_name(class_id), true);
 	}
-
-	assert(task_ledgers.sfi_wait_times[MAX_SFI_CLASS_ID - 1] != -1);
 #endif /* CONFIG_SCHED_SFI */
 
-	task_ledgers.cpu_time_billed_to_me = ledger_entry_add(t, "cpu_time_billed_to_me", "sched", "ns");
-	task_ledgers.cpu_time_billed_to_others = ledger_entry_add(t, "cpu_time_billed_to_others", "sched", "ns");
-	task_ledgers.physical_writes = ledger_entry_add(t, "physical_writes", "res", "bytes");
-	task_ledgers.logical_writes = ledger_entry_add(t, "logical_writes", "res", "bytes");
-	task_ledgers.logical_writes_to_external = ledger_entry_add(t, "logical_writes_to_external", "res", "bytes");
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, cpu_time_billed_to_me);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, cpu_time_billed_to_others);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, physical_writes);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, logical_writes);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, logical_writes_to_external);
 #if CONFIG_PHYS_WRITE_ACCT
-	task_ledgers.fs_metadata_writes = ledger_entry_add(t, "fs_metadata_writes", "res", "bytes");
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, fs_metadata_writes);
 #endif /* CONFIG_PHYS_WRITE_ACCT */
-	task_ledgers.energy_billed_to_me = ledger_entry_add(t, "energy_billed_to_me", "power", "nj");
-	task_ledgers.energy_billed_to_others = ledger_entry_add(t, "energy_billed_to_others", "power", "nj");
-
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, energy_billed_to_me);
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, energy_billed_to_others);
 #if CONFIG_MEMORYSTATUS
-	task_ledgers.memorystatus_dirty_time = ledger_entry_add(t, "memorystatus_dirty_time", "physmem", "ns");
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, memorystatus_dirty_time);
 #endif /* CONFIG_MEMORYSTATUS */
-
-	task_ledgers.swapins = ledger_entry_add_with_flags(t, "swapins", "physmem", "bytes",
-	    LEDGER_ENTRY_ALLOW_PANIC_ON_NEGATIVE);
-
-	if ((task_ledgers.cpu_time < 0) ||
-	    (task_ledgers.tkm_private < 0) ||
-	    (task_ledgers.tkm_shared < 0) ||
-	    (task_ledgers.phys_mem < 0) ||
-	    (task_ledgers.wired_mem < 0) ||
-	    (task_ledgers.conclave_mem < 0) ||
-	    (task_ledgers.internal < 0) ||
-	    (task_ledgers.external < 0) ||
-	    (task_ledgers.reusable < 0) ||
-	    (task_ledgers.iokit_mapped < 0) ||
-	    (task_ledgers.alternate_accounting < 0) ||
-	    (task_ledgers.alternate_accounting_compressed < 0) ||
-	    (task_ledgers.page_table < 0) ||
-	    (task_ledgers.phys_footprint < 0) ||
-	    (task_ledgers.internal_compressed < 0) ||
-	    (task_ledgers.purgeable_volatile < 0) ||
-	    (task_ledgers.purgeable_nonvolatile < 0) ||
-	    (task_ledgers.purgeable_volatile_compressed < 0) ||
-	    (task_ledgers.purgeable_nonvolatile_compressed < 0) ||
-	    (task_ledgers.tagged_nofootprint < 0) ||
-	    (task_ledgers.tagged_footprint < 0) ||
-	    (task_ledgers.tagged_nofootprint_compressed < 0) ||
-	    (task_ledgers.tagged_footprint_compressed < 0) ||
-#if CONFIG_FREEZE
-	    (task_ledgers.frozen_to_swap < 0) ||
-#endif /* CONFIG_FREEZE */
-	    (task_ledgers.network_volatile < 0) ||
-	    (task_ledgers.network_nonvolatile < 0) ||
-	    (task_ledgers.network_volatile_compressed < 0) ||
-	    (task_ledgers.network_nonvolatile_compressed < 0) ||
-	    (task_ledgers.media_nofootprint < 0) ||
-	    (task_ledgers.media_footprint < 0) ||
-	    (task_ledgers.media_nofootprint_compressed < 0) ||
-	    (task_ledgers.media_footprint_compressed < 0) ||
-	    (task_ledgers.graphics_nofootprint < 0) ||
-	    (task_ledgers.graphics_footprint < 0) ||
-	    (task_ledgers.graphics_nofootprint_compressed < 0) ||
-	    (task_ledgers.graphics_footprint_compressed < 0) ||
-	    (task_ledgers.neural_nofootprint < 0) ||
-	    (task_ledgers.neural_footprint < 0) ||
-	    (task_ledgers.neural_nofootprint_compressed < 0) ||
-	    (task_ledgers.neural_footprint_compressed < 0) ||
-	    (task_ledgers.neural_nofootprint_total < 0) ||
-	    (task_ledgers.platform_idle_wakeups < 0) ||
-	    (task_ledgers.interrupt_wakeups < 0) ||
-	    (task_ledgers.cpu_time_billed_to_me < 0) || (task_ledgers.cpu_time_billed_to_others < 0) ||
-	    (task_ledgers.physical_writes < 0) ||
-	    (task_ledgers.logical_writes < 0) ||
-	    (task_ledgers.logical_writes_to_external < 0) ||
-#if CONFIG_PHYS_WRITE_ACCT
-	    (task_ledgers.fs_metadata_writes < 0) ||
-#endif /* CONFIG_PHYS_WRITE_ACCT */
-#if CONFIG_MEMORYSTATUS
-	    (task_ledgers.memorystatus_dirty_time < 0) ||
-#endif /* CONFIG_MEMORYSTATUS */
-	    (task_ledgers.energy_billed_to_me < 0) ||
-	    (task_ledgers.energy_billed_to_others < 0) ||
-	    (task_ledgers.swapins < 0)
-	    ) {
-		panic("couldn't create entries for task ledger template");
-	}
-
-	ledger_track_credit_only(t, task_ledgers.phys_footprint);
-	ledger_track_credit_only(t, task_ledgers.internal);
-	ledger_track_credit_only(t, task_ledgers.external);
-	ledger_track_credit_only(t, task_ledgers.reusable);
-
-	ledger_track_maximum(t, task_ledgers.phys_footprint, 60);
-	ledger_track_maximum(t, task_ledgers.phys_mem, 60);
-	ledger_track_maximum(t, task_ledgers.internal, 60);
-	ledger_track_maximum(t, task_ledgers.internal_compressed, 60);
-	ledger_track_maximum(t, task_ledgers.reusable, 60);
-	ledger_track_maximum(t, task_ledgers.external, 60);
-	ledger_track_maximum(t, task_ledgers.neural_nofootprint_total, 60);
-#if MACH_ASSERT
-	if (pmap_ledgers_panic) {
-		ledger_panic_on_negative(t, task_ledgers.phys_footprint);
-		ledger_panic_on_negative(t, task_ledgers.conclave_mem);
-		ledger_panic_on_negative(t, task_ledgers.page_table);
-		ledger_panic_on_negative(t, task_ledgers.internal);
-		ledger_panic_on_negative(t, task_ledgers.iokit_mapped);
-		ledger_panic_on_negative(t, task_ledgers.alternate_accounting);
-		ledger_panic_on_negative(t, task_ledgers.alternate_accounting_compressed);
-		ledger_panic_on_negative(t, task_ledgers.purgeable_volatile);
-		ledger_panic_on_negative(t, task_ledgers.purgeable_nonvolatile);
-		ledger_panic_on_negative(t, task_ledgers.purgeable_volatile_compressed);
-		ledger_panic_on_negative(t, task_ledgers.purgeable_nonvolatile_compressed);
-#if CONFIG_PHYS_WRITE_ACCT
-		ledger_panic_on_negative(t, task_ledgers.fs_metadata_writes);
-#endif /* CONFIG_PHYS_WRITE_ACCT */
-
-		ledger_panic_on_negative(t, task_ledgers.tagged_nofootprint);
-		ledger_panic_on_negative(t, task_ledgers.tagged_footprint);
-		ledger_panic_on_negative(t, task_ledgers.tagged_nofootprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.tagged_footprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.network_volatile);
-		ledger_panic_on_negative(t, task_ledgers.network_nonvolatile);
-		ledger_panic_on_negative(t, task_ledgers.network_volatile_compressed);
-		ledger_panic_on_negative(t, task_ledgers.network_nonvolatile_compressed);
-		ledger_panic_on_negative(t, task_ledgers.media_nofootprint);
-		ledger_panic_on_negative(t, task_ledgers.media_footprint);
-		ledger_panic_on_negative(t, task_ledgers.media_nofootprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.media_footprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.graphics_nofootprint);
-		ledger_panic_on_negative(t, task_ledgers.graphics_footprint);
-		ledger_panic_on_negative(t, task_ledgers.graphics_nofootprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.graphics_footprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.neural_nofootprint);
-		ledger_panic_on_negative(t, task_ledgers.neural_footprint);
-		ledger_panic_on_negative(t, task_ledgers.neural_nofootprint_compressed);
-		ledger_panic_on_negative(t, task_ledgers.neural_footprint_compressed);
-	}
-#endif /* MACH_ASSERT */
-
-#if CONFIG_MEMORYSTATUS
-	ledger_set_callback(t, task_ledgers.phys_footprint, task_footprint_exceeded, NULL, NULL);
-	ledger_set_callback(t, task_ledgers.conclave_mem, task_conclave_mem_limit_exceeded, NULL, NULL);
-#endif /* CONFIG_MEMORYSTATUS */
-
-	ledger_set_callback(t, task_ledgers.interrupt_wakeups,
-	    task_wakeups_rate_exceeded, NULL, NULL);
-	ledger_set_callback(t, task_ledgers.physical_writes, task_io_rate_exceeded, (void *)FLAVOR_IO_PHYSICAL_WRITES, NULL);
-
-#if CONFIG_SPTM || !XNU_MONITOR
-	ledger_template_complete(t);
-#else /* CONFIG_SPTM || !XNU_MONITOR */
-	ledger_template_complete_secure_alloc(t);
-#endif /* XNU_MONITOR */
-	task_ledger_template = t;
+	LEDGER_KEY_MEMOIZE(t, task_ledgers, swapins);
 }
 
 /* Create a task, but leave the task ports disabled */
@@ -1551,12 +1399,7 @@ task_create_internal(
 	}
 
 	/* allocate with active entries */
-	assert(task_ledger_template != NULL);
-	ledger = ledger_instantiate(task_ledger_template, LEDGER_CREATE_ACTIVE_ENTRIES);
-	if (ledger == NULL) {
-		task_ref_count_fini(new_task);
-		return KERN_RESOURCE_SHORTAGE;
-	}
+	ledger = ledger_instantiate(&task_ledger_template);
 
 	counter_alloc(&(new_task->faults));
 
@@ -1610,7 +1453,7 @@ task_create_internal(
 		new_map = vm_map_create_options(pmap,
 		    (vm_map_offset_t)(VM_MIN_ADDRESS),
 		    (vm_map_offset_t)(VM_MAX_ADDRESS),
-		    VM_MAP_CREATE_PAGEABLE);
+		    VM_MAP_CREATE_DEFAULT);
 		if (parent_task) {
 			vm_map_inherit_limits(new_map, parent_task->map);
 		}
@@ -1715,7 +1558,7 @@ task_create_internal(
 	new_task->affinity_space = NULL;
 
 #if CONFIG_CPU_COUNTERS
-	new_task->t_kpc = 0;
+	new_task->t_cpc = (struct cpc_task){ 0 };
 #endif /* CONFIG_CPU_COUNTERS */
 
 	new_task->pidsuspended = FALSE;
@@ -1748,10 +1591,34 @@ task_create_internal(
 
 	new_task->task_shared_region_slide = -1;
 
-	if (parent_task != NULL) {
-		task_ro_data.task_tokens.sec_token = *task_get_sec_token(parent_task);
-		task_ro_data.task_tokens.audit_token = *task_get_audit_token(parent_task);
+	/*
+	 * Allocate and initialize task tokens.
+	 */
+	struct task_token_data *tokens;
+	security_token_t sec_token;
+	audit_token_t audit_token;
 
+	tokens = kalloc_type(struct task_token_data,
+	    Z_WAITOK | Z_NOFAIL);
+
+	if (parent_task != NULL) {
+		task_get_tokens(parent_task, &sec_token, &audit_token);
+	} else {
+		sec_token = KERNEL_SECURITY_TOKEN;
+		audit_token = KERNEL_AUDIT_TOKEN;
+	}
+
+	os_atomic_init(&tokens->tc_uids,
+	    task_token_pack(sec_token.val[0], audit_token.val[3]));
+	os_atomic_init(&tokens->tc_gids,
+	    task_token_pack(sec_token.val[1], audit_token.val[4]));
+	os_atomic_init(&tokens->tc_auid, audit_token.val[0]);
+	os_atomic_init(&tokens->tc_asid, audit_token.val[6]);
+	os_atomic_init(&tokens->tc_pid, audit_token.val[5]);
+	os_atomic_init(&tokens->tc_pidversion, audit_token.val[7]);
+	new_task->task_tokens = tokens;
+
+	if (parent_task != NULL) {
 		task_ro_data.t_flags_ro |= parent_t_flags_ro & TFRO_FILTER_MSG;
 #if CONFIG_MACF
 		if (!(t_flags & TF_CORPSE_FORK)) {
@@ -1759,15 +1626,9 @@ task_create_internal(
 			task_ro_data.task_filters.mach_kobj_filter_mask = task_get_mach_kobj_filter_mask(parent_task);
 		}
 #endif
-	} else {
-		task_ro_data.task_tokens.sec_token = KERNEL_SECURITY_TOKEN;
-		task_ro_data.task_tokens.audit_token = KERNEL_AUDIT_TOKEN;
 	}
-	/*
-	 * intentionally initialized to zero, it will be set before returning
-	 * to userspace in task_set_ctrl_port_default
-	 */
-	task_ro_data.task_control_port_options = TASK_CONTROL_PORT_OPTIONS_NONE;
+	/* set in task_set_ctrl_port_default */
+	task_ro_data.task_control_port_options = TASK_CONTROL_PORT_OPTIONS_INVALID;
 
 	/* must set before task_importance_init_from_parent: */
 	if (proc_ro != NULL) {
@@ -1840,6 +1701,40 @@ task_create_internal(
 		}
 #endif
 
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+		/*
+		 * On inherit_memory inherit sec-enabled and sec-inherit,
+		 * and enable it on the address space. The fork() case
+		 * is independent from the inheritance rules, as we must
+		 * support a parent duplicating the VA space and accessing
+		 * tagged memory in the child.
+		 */
+		if (inherit_memory) {
+			if (task_has_sec(parent_task)) {
+				task_set_sec(new_task);
+				vm_map_set_sec_enabled(get_task_map(new_task));
+			}
+			if (task_has_sec_user_data(parent_task)) {
+				task_set_sec_user_data(new_task);
+			}
+			if (task_has_sec_soft_mode(parent_task)) {
+				task_set_sec_soft_mode(new_task);
+			}
+#if DEVELOPMENT || DEBUG
+			/*
+			 * The following configuration options are only
+			 * available for debugging.
+			 */
+			if (task_has_sec_inherit(parent_task)) {
+				task_set_sec_inherit(new_task);
+			}
+			if (task_has_sec_never_check(parent_task)) {
+				task_set_sec_never_check(new_task);
+				vm_map_set_sec_disabled(get_task_map(new_task));
+			}
+#endif /* DEVELOPMENT || DEBUG */
+		}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 
 		new_task->priority = BASEPRI_DEFAULT;
 		new_task->max_priority = MAXPRI_USER;
@@ -2086,7 +1981,7 @@ task_rollup_accounting_info(task_t to_task, task_t from_task)
 	ledger_rollup_entry(to_task->ledger, from_task->ledger, task_ledgers.platform_idle_wakeups);
 	ledger_rollup_entry(to_task->ledger, from_task->ledger, task_ledgers.interrupt_wakeups);
 #if CONFIG_SCHED_SFI
-	for (sfi_class_id_t class_id = SFI_CLASS_UNSPECIFIED; class_id < MAX_SFI_CLASS_ID; class_id++) {
+	for (sfi_class_id_t class_id = SFI_CLASS_UNSPECIFIED + 1; class_id < MAX_SFI_CLASS_ID; class_id++) {
 		ledger_rollup_entry(to_task->ledger, from_task->ledger, task_ledgers.sfi_wait_times[class_id]);
 	}
 #endif
@@ -2222,10 +2117,11 @@ task_deallocate_internal(
 		restartable_ranges_release(task->t_rr_ranges);
 	}
 
+	ledger_tab_settle(&task_ledger_template, task->ledger);
 	ledger_get_entries(task->ledger, task_ledgers.interrupt_wakeups,
-	    &interrupt_wakeups, &debit);
+	    LEO_NO_SETTLE, &interrupt_wakeups, &debit);
 	ledger_get_entries(task->ledger, task_ledgers.platform_idle_wakeups,
-	    &platform_idle_wakeups, &debit);
+	    LEO_NO_SETTLE, &platform_idle_wakeups, &debit);
 
 	struct recount_times_mach sum = { 0 };
 	struct recount_times_mach p_only = { 0 };
@@ -2255,13 +2151,13 @@ task_deallocate_internal(
 	lck_spin_unlock(&dead_task_statistics_lock);
 	lck_mtx_destroy(&task->lock, &task_lck_grp);
 
-	if (!ledger_get_entries(task->ledger, task_ledgers.tkm_private, &credit,
-	    &debit)) {
+	if (!ledger_get_entries(task->ledger, task_ledgers.tkm_private,
+	    LEO_NO_SETTLE, &credit, &debit)) {
 		OSAddAtomic64(credit, (int64_t *)&tasks_tkm_private.alloc);
 		OSAddAtomic64(debit, (int64_t *)&tasks_tkm_private.free);
 	}
-	if (!ledger_get_entries(task->ledger, task_ledgers.tkm_shared, &credit,
-	    &debit)) {
+	if (!ledger_get_entries(task->ledger, task_ledgers.tkm_shared,
+	    LEO_NO_SETTLE, &credit, &debit)) {
 		OSAddAtomic64(credit, (int64_t *)&tasks_tkm_shared.alloc);
 		OSAddAtomic64(debit, (int64_t *)&tasks_tkm_shared.free);
 	}
@@ -2305,6 +2201,7 @@ task_deallocate_internal(
 	}
 
 	task_ref_count_fini(task);
+	kfree_type(struct task_token_data, task->task_tokens);
 	proc_ro_erase_task(task->bsd_info_ro);
 	task_release_proc_task_struct(task, task->bsd_info_ro);
 }
@@ -2564,24 +2461,6 @@ extern int proc_pid(struct proc *);
 extern void proc_name_kdp(struct proc *p, char *buf, int size);
 #endif /* MACH_ASSERT */
 
-static void
-__unused task_partial_reap(task_t task, __unused int pid)
-{
-	unsigned int    reclaimed_resident = 0;
-	unsigned int    reclaimed_compressed = 0;
-	uint64_t        task_page_count;
-
-	task_page_count = (get_task_phys_footprint(task) / PAGE_SIZE_64);
-
-	KDBG(VMDBG_CODE(DBG_VM_MAP_PARTIAL_REAP) | DBG_FUNC_START,
-	    pid, task_page_count);
-
-	vm_map_partial_reap(task->map, &reclaimed_resident, &reclaimed_compressed);
-
-	KDBG(VMDBG_CODE(DBG_VM_MAP_PARTIAL_REAP) | DBG_FUNC_END,
-	    pid, reclaimed_resident, reclaimed_compressed);
-}
-
 /*
  * task_mark_corpse:
  *
@@ -2736,14 +2615,18 @@ task_clear_corpse(task_t task)
  *	the task (corpse).
  */
 static void
-task_port_no_senders(ipc_port_t port, __unused mach_port_mscount_t mscount)
+task_port_no_senders(ipc_port_t port, mach_port_mscount_t mscount)
 {
-	bool   is_corpse = false;
 	task_t task;
 
 	ip_mq_lock(port);
 	task = ipc_kobject_get_locked(port, IKOT_TASK_CONTROL);
-	if (task == TASK_NULL || !task_is_a_corpse(task)) {
+	if (task == TASK_NULL ||
+	    !task_is_a_corpse(task) ||
+	    /* this is the extra check, that is not har drequired for correctness
+	     * but was added for performance (earlier bail out)
+	     */
+	    !ipc_kobject_is_mscount_current_locked(port, mscount)) {
 		task = TASK_NULL;
 	} else {
 		task_reference_mig(task);
@@ -2752,33 +2635,51 @@ task_port_no_senders(ipc_port_t port, __unused mach_port_mscount_t mscount)
 
 	/*
 	 * Task might be a corpse, we must inspect this under
-	 * the itk_lock to resolve the race with task_mark_corpse():
-	 *
-	 * If the task associated with the port is NULL under the itk_lock(),
-	 * then the port was a former IKOT_TASK_CONTROL port and we should
-	 * leave it alone.
+	 * the task_corpse_lock to make sure that it is a registered corpse.
 	 *
 	 * TODO: we should really make corpses use their own IKOT_TASK_CORPSE
 	 *       port type instead of these hacks.
 	 */
 	if (task) {
+		bool corpse_destr_required = false;
+
+		/*
+		 * There can be a concurrent request to mint new send right via
+		 * `task_identity_token_get_task_port`, which will call the
+		 * `convert_task_to_port_with_flavor`. Normally on that path the
+		 * `ipc_kobject_make_send` is called to mint the send right.
+		 * This call must be done under itk lock, hence we are disabling
+		 * the kobject (a) on the task port under itk lock to prevent it.
+		 *
+		 * All concurrent requests that has already been created before we take
+		 * the port lock - are guaranteed to fail check of mscount (b)
+		 */
 		itk_lock(task);
 		ip_mq_lock(port);
-		assert(task_is_a_corpse(task));
-		is_corpse = (ipc_kobject_get_locked(port, IKOT_TASK_CONTROL) !=
-		    TASK_NULL);
+
+		if (ipc_kobject_get_locked(port, IKOT_TASK_CONTROL) &&
+		    /* (b) Unlike previous check - this one is absolutely required here;
+		     * In case if mscount doesn't match - it means that another
+		     * send right was created concurrently, hence we are skipping the
+		     * corpse destruction cycle;
+		     */
+		    ipc_kobject_is_mscount_current_locked(port, mscount)) {
+			assert(task_is_a_corpse(task));
+			/* (a) to make sure that concurrent check will fail */
+			ipc_kobject_disable_locked(port, IKOT_TASK_CONTROL);
+			corpse_destr_required = true;
+		}
+
 		ip_mq_unlock(port);
 		itk_unlock(task);
+		if (corpse_destr_required) {
+			task_remove_from_corpse_task_list(task);
+			task_clear_corpse(task);
+			vm_map_unset_corpse_source(task->map);
+			task_terminate_internal(task);
+		}
+
 		task_deallocate_mig(task);
-	}
-
-	if (is_corpse) {
-		/* Remove the task from global corpse task list */
-		task_remove_from_corpse_task_list(task);
-
-		task_clear_corpse(task);
-		vm_map_unset_corpse_source(task->map);
-		task_terminate_internal(task);
 	}
 }
 
@@ -3211,9 +3112,6 @@ task_terminate_internal(
 
 	/* Early object reap phase */
 
-// PR-17045188: Revisit implementation
-//        task_partial_reap(task, pid);
-
 #if CONFIG_TASKWATCH
 	/*
 	 * remove all task watchers
@@ -3309,10 +3207,7 @@ task_terminate_internal(
 	thread_interrupt_level(interrupt_save);
 
 #if CONFIG_CPU_COUNTERS
-	/* force the task to release all ctrs */
-	if (task->t_kpc & TASK_KPC_FORCED_ALL_CTRS) {
-		kpc_force_all_ctrs(task, 0);
-	}
+	cpc_task_terminate(&task->t_cpc);
 #endif /* CONFIG_CPU_COUNTERS */
 
 #if CONFIG_COALITIONS
@@ -3815,6 +3710,9 @@ task_hold_and_wait(
 	//rdar://139307390, first suspension might not have done conclave suspend.
 	first_suspension = true;
 	if (suspend_conclave && first_suspension) {
+		/* before we can teardown the conclave */
+		exclaves_conclave_prepare_teardown(task);
+
 		task_unlock(task);
 		task_suspend_conclave(task);
 		task_lock(task);
@@ -4230,7 +4128,7 @@ get_task_suspended(task_t task)
  *	Implement an (old-fashioned) user-level suspension on a task.
  *
  *	Because the user isn't expecting to have to manage a suspension
- *	token, we'll track it for him in the kernel in the form of a naked
+ *	token, we'll track it for them in the kernel in the form of a naked
  *	send right to the task's resume port.  All such send rights
  *	account for a single suspension against the task (unlike task_suspend2()
  *	where each caller gets a unique suspension count represented by a
@@ -4286,15 +4184,13 @@ task_suspend(
 		kr = ipc_object_copyout(current_space(), port,
 		    MACH_MSG_TYPE_MOVE_SEND, IPC_OBJECT_COPYOUT_FLAGS_NONE,
 		    NULL, &name);
-	} else {
-		kr = KERN_SUCCESS;
-	}
-	if (kr != KERN_SUCCESS) {
-		printf("warning: %s(%d) failed to copyout suspension "
-		    "token for pid %d with error: %d\n",
-		    proc_name_address(get_bsdtask_info(current_task())),
-		    proc_pid(get_bsdtask_info(current_task())),
-		    task_pid(task), kr);
+		if (__improbable(kr != KERN_SUCCESS)) {
+			printf("warning: %s(%d) failed to copyout suspension "
+			    "token for pid %d with error: %d\n",
+			    proc_name_address(get_bsdtask_info(current_task())),
+			    proc_pid(get_bsdtask_info(current_task())),
+			    task_pid(task), kr);
+		}
 	}
 
 	return kr;
@@ -4474,12 +4370,9 @@ task_suspension_no_senders(ipc_port_t port, mach_port_mscount_t mscount)
 {
 	task_t task = convert_port_to_task_suspension_token(port);
 
-	if (task == TASK_NULL) {
-		return;
-	}
+	assert(task != kernel_task);
 
-	if (task == kernel_task) {
-		task_suspension_token_deallocate(task);
+	if (task == TASK_NULL) {
 		return;
 	}
 
@@ -4613,7 +4506,7 @@ task_pidresume(
 	task_lock(task);
 
 	if (kr == KERN_SUCCESS) {
-		task->frozen = FALSE;
+		os_atomic_store(&task->frozen, FALSE, release);
 	}
 	task->changing_freeze_state = FALSE;
 	thread_wakeup(&task->changing_freeze_state);
@@ -5155,9 +5048,10 @@ task_freeze(
 	uint32_t           dirty_budget,
 	uint32_t           *shared_count,
 	int                *freezer_error_code,
-	boolean_t          eval_only)
+	int                 opts)
 {
 	kern_return_t kr = KERN_SUCCESS;
+	bool eval_only = opts & FREEZE_EVAL_ONLY;
 
 	if (task == TASK_NULL || task == kernel_task) {
 		return KERN_INVALID_ARGUMENT;
@@ -5199,12 +5093,12 @@ task_freeze(
 	    dirty_budget,
 	    shared_count,
 	    freezer_error_code,
-	    eval_only);
+	    opts);
 
 	task_lock(task);
 
-	if ((kr == KERN_SUCCESS) && (eval_only == FALSE)) {
-		task->frozen = TRUE;
+	if ((kr == KERN_SUCCESS) && !eval_only) {
+		os_atomic_store(&task->frozen, TRUE, release);
 
 		freezer_context_global.freezer_ctx_task = NULL;
 		freezer_context_global.freezer_ctx_uncompressed_pages = 0;
@@ -5228,7 +5122,7 @@ task_freeze(
 
 	if (VM_CONFIG_COMPRESSOR_IS_PRESENT &&
 	    (kr == KERN_SUCCESS) &&
-	    (eval_only == FALSE)) {
+	    !eval_only) {
 		vm_wake_compactor_swapper();
 		/*
 		 * We do an explicit wakeup of the swapout thread here
@@ -5237,7 +5131,7 @@ task_freeze(
 		 * and so will not be evaluating whether we need to do
 		 * a wakeup there.
 		 */
-		thread_wakeup((event_t)&vm_swapout_thread);
+		vm_swapout_wakeup();
 	}
 
 	return kr;
@@ -5272,7 +5166,7 @@ task_thaw(
 		task_unlock(task);
 		return KERN_FAILURE;
 	}
-	task->frozen = FALSE;
+	os_atomic_store(&task->frozen, FALSE, release);
 
 	task_unlock(task);
 
@@ -5298,9 +5192,9 @@ task_update_frozen_to_swap_acct(task_t task, int64_t amount, freezer_acct_op_t o
 	}
 
 	if (op == CREDIT_TO_SWAP) {
-		ledger_credit_nocheck(task->ledger, task_ledgers.frozen_to_swap, amount);
+		ledger_credit(task->ledger, task_ledgers.frozen_to_swap, amount);
 	} else if (op == DEBIT_FROM_SWAP) {
-		ledger_debit_nocheck(task->ledger, task_ledgers.frozen_to_swap, amount);
+		ledger_debit(task->ledger, task_ledgers.frozen_to_swap, amount);
 	} else {
 		panic("task_update_frozen_to_swap_acct: Invalid ledger op");
 	}
@@ -5437,9 +5331,11 @@ task_info(
 				 * The "BASIC2" flavor gets the maximum resident
 				 * size instead of the current resident size...
 				 */
-				ledger_get_lifetime_max(task->ledger, task_ledgers.phys_mem, &tmp);
+				ledger_get_lifetime_max(task->ledger,
+				    task_ledgers.phys_mem, LEO_SETTLE, &tmp);
 			} else {
-				ledger_get_balance(task->ledger, task_ledgers.phys_mem, &tmp);
+				ledger_get_balance(task->ledger,
+				    task_ledgers.phys_mem, LEO_SETTLE, &tmp);
 			}
 			basic_info->resident_size = (natural_t) MIN((ledger_amount_t) UINT32_MAX, tmp);
 
@@ -5468,7 +5364,7 @@ task_info(
 		basic_info->virtual_size  = vm_map_adjusted_size(is_kernel_task ?
 		    kernel_map : task->map);
 		ledger_get_balance(task->ledger, task_ledgers.phys_mem,
-		    (ledger_amount_t *)&basic_info->resident_size);
+		    LEO_SETTLE, (ledger_amount_t *)&basic_info->resident_size);
 		basic_info->policy = is_kernel_task ? POLICY_RR : POLICY_TIMESHARE;
 		basic_info->suspend_count = task->user_stop_count;
 		_task_fill_times(task, &basic_info->user_time,
@@ -5492,7 +5388,8 @@ task_info(
 
 		basic_info->virtual_size = vm_map_adjusted_size(is_kernel_task ?
 		    kernel_map : task->map);
-		ledger_get_balance(task->ledger, task_ledgers.phys_mem, (ledger_amount_t *)&basic_info->resident_size);
+		ledger_get_balance(task->ledger, task_ledgers.phys_mem,
+		    LEO_SETTLE, (ledger_amount_t *)&basic_info->resident_size);
 		basic_info->policy = is_kernel_task ? POLICY_RR : POLICY_TIMESHARE;
 		basic_info->suspend_count = task->user_stop_count;
 		_task_fill_times(task, &basic_info->user_time,
@@ -5516,8 +5413,10 @@ task_info(
 
 		basic_info->virtual_size = vm_map_adjusted_size(is_kernel_task ?
 		    kernel_map : task->map);
-		ledger_get_balance(task->ledger, task_ledgers.phys_mem, (ledger_amount_t *) &basic_info->resident_size);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.phys_mem, (ledger_amount_t *) &basic_info->resident_size_max);
+		ledger_get_balance(task->ledger, task_ledgers.phys_mem,
+		    LEO_SETTLE, (ledger_amount_t *) &basic_info->resident_size);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.phys_mem,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &basic_info->resident_size_max);
 		basic_info->policy = is_kernel_task ? POLICY_RR : POLICY_TIMESHARE;
 		basic_info->suspend_count = task->user_stop_count;
 		_task_fill_times(task, &basic_info->user_time,
@@ -5653,6 +5552,8 @@ task_info(
 		tkm_info->total_salloc = 0;
 		tkm_info->total_sfree = 0;
 
+		ledger_tab_settle_all(&task_ledger_template);
+
 		if (task == kernel_task) {
 			/*
 			 * All shared allocs/frees from other tasks count against
@@ -5672,14 +5573,15 @@ task_info(
 			queue_iterate(&tasks, task, task_t, tasks) {
 				if (task == kernel_task) {
 					if (ledger_get_entries(task->ledger,
-					    task_ledgers.tkm_private, &credit,
-					    &debit) == KERN_SUCCESS) {
+					    task_ledgers.tkm_private, LEO_NO_SETTLE,
+					    &credit, &debit) == KERN_SUCCESS) {
 						tkm_info->total_palloc += credit;
 						tkm_info->total_pfree += debit;
 					}
 				}
 				if (!ledger_get_entries(task->ledger,
-				    task_ledgers.tkm_shared, &credit, &debit)) {
+				    task_ledgers.tkm_shared, LEO_NO_SETTLE,
+				    &credit, &debit)) {
 					tkm_info->total_palloc += credit;
 					tkm_info->total_pfree += debit;
 				}
@@ -5687,12 +5589,14 @@ task_info(
 			lck_mtx_unlock(&tasks_threads_lock);
 		} else {
 			if (!ledger_get_entries(task->ledger,
-			    task_ledgers.tkm_private, &credit, &debit)) {
+			    task_ledgers.tkm_private, LEO_NO_SETTLE,
+			    &credit, &debit)) {
 				tkm_info->total_palloc = credit;
 				tkm_info->total_pfree = debit;
 			}
 			if (!ledger_get_entries(task->ledger,
-			    task_ledgers.tkm_shared, &credit, &debit)) {
+			    task_ledgers.tkm_shared, LEO_NO_SETTLE,
+			    &credit, &debit)) {
 				tkm_info->total_salloc = credit;
 				tkm_info->total_sfree = debit;
 			}
@@ -5779,7 +5683,7 @@ task_info(
 
 		sec_token_p = (security_token_t *) task_info_out;
 
-		*sec_token_p = *task_get_sec_token(task);
+		task_get_sec_token(task, sec_token_p);
 
 		*task_info_count = TASK_SECURITY_TOKEN_COUNT;
 		break;
@@ -5796,7 +5700,7 @@ task_info(
 
 		audit_token_p = (audit_token_t *) task_info_out;
 
-		*audit_token_p = *task_get_audit_token(task);
+		task_get_audit_token(task, audit_token_p);
 
 		*task_info_count = TASK_AUDIT_TOKEN_COUNT;
 		break;
@@ -6017,18 +5921,19 @@ task_info(
 		/*
 		 * Do not hold both the task and map locks,
 		 * so convert the task lock into a map reference,
-		 * drop the task lock, then lock the map.
+		 * drop the task lock, then take the interlock on the map.
 		 */
 		if (is_kernel_task) {
 			map = kernel_map;
 			task_unlock(task);
-			/* no lock, no reference */
+			/* no reference */
 		} else {
 			map = task->map;
 			vm_map_reference(map);
 			task_unlock(task);
-			vm_map_lock_read(map);
 		}
+
+		vm_map_ilk_lock(map);
 
 		vmlp_range_event_all(map);
 
@@ -6036,26 +5941,62 @@ task_info(
 		vm_info->region_count = map->hdr.nentries;
 		vm_info->page_size = vm_map_page_size(map);
 
-		ledger_get_balance(task->ledger, task_ledgers.phys_mem, (ledger_amount_t *) &vm_info->resident_size);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.phys_mem, (ledger_amount_t *) &vm_info->resident_size_peak);
+		if (original_task_info_count >= TASK_VM_INFO_REV2_COUNT) {
+			vm_info->min_address = map->min_offset;
+			vm_info->max_address = map->max_offset;
+		}
+
+		if (is_kernel_task) {
+			/*
+			 * We have recorded every info we needed from the map in this case.
+			 * Drop the interlock early to limit contention on the kernel map.
+			 */
+			vm_map_ilk_unlock(map);
+		}
+
+		/*
+		 * In the kernel task case we no longer hold the interlock and should
+		 * not read map fields after this point.
+		 * The userspace task case still has the interlock.
+		 */
+
+		ledger_tab_settle(&task_ledger_template, task->ledger);
+		ledger_get_balance(task->ledger, task_ledgers.phys_mem,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->resident_size);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.phys_mem,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->resident_size_peak);
 
 		vm_info->device = 0;
 		vm_info->device_peak = 0;
-		ledger_get_balance(task->ledger, task_ledgers.external, (ledger_amount_t *) &vm_info->external);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.external, (ledger_amount_t *) &vm_info->external_peak);
-		ledger_get_balance(task->ledger, task_ledgers.internal, (ledger_amount_t *) &vm_info->internal);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.internal, (ledger_amount_t *) &vm_info->internal_peak);
-		ledger_get_balance(task->ledger, task_ledgers.reusable, (ledger_amount_t *) &vm_info->reusable);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.reusable, (ledger_amount_t *) &vm_info->reusable_peak);
-		ledger_get_balance(task->ledger, task_ledgers.internal_compressed, (ledger_amount_t*) &vm_info->compressed);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.internal_compressed, (ledger_amount_t*) &vm_info->compressed_peak);
-		ledger_get_entries(task->ledger, task_ledgers.internal_compressed, (ledger_amount_t*) &vm_info->compressed_lifetime, &tmp_amount);
-		ledger_get_balance(task->ledger, task_ledgers.neural_nofootprint_total, (ledger_amount_t *) &vm_info->ledger_tag_neural_nofootprint_total);
-		ledger_get_lifetime_max(task->ledger, task_ledgers.neural_nofootprint_total, (ledger_amount_t *) &vm_info->ledger_tag_neural_nofootprint_peak);
+		ledger_get_balance(task->ledger, task_ledgers.external,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->external);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.external,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->external_peak);
+		ledger_get_balance(task->ledger, task_ledgers.internal,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->internal);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.internal,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->internal_peak);
+		ledger_get_balance(task->ledger, task_ledgers.reusable,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->reusable);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.reusable,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->reusable_peak);
+		ledger_get_balance(task->ledger, task_ledgers.internal_compressed,
+		    LEO_NO_SETTLE, (ledger_amount_t*) &vm_info->compressed);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.internal_compressed,
+		    LEO_NO_SETTLE, (ledger_amount_t*) &vm_info->compressed_peak);
+		ledger_get_entries(task->ledger, task_ledgers.internal_compressed,
+		    LEO_NO_SETTLE, (ledger_amount_t*) &vm_info->compressed_lifetime, &tmp_amount);
+		ledger_get_balance(task->ledger, task_ledgers.neural_nofootprint_total,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->ledger_tag_neural_nofootprint_total);
+		ledger_get_lifetime_max(task->ledger, task_ledgers.neural_nofootprint_total,
+		    LEO_NO_SETTLE, (ledger_amount_t *) &vm_info->ledger_tag_neural_nofootprint_peak);
 
 		vm_info->purgeable_volatile_pmap = 0;
 		vm_info->purgeable_volatile_resident = 0;
 		vm_info->purgeable_volatile_virtual = 0;
+
+		*task_info_count = TASK_VM_INFO_REV0_COUNT;
+
 		if (is_kernel_task) {
 			/*
 			 * We do not maintain the detailed stats for the
@@ -6083,7 +6024,7 @@ task_info(
 			kern_return_t   kr;
 
 			if (flavor == TASK_VM_INFO_PURGEABLE) {
-				kr = vm_map_query_volatile(
+				kr = vm_map_query_volatile_and_iunlock(
 					map,
 					&volatile_virtual_size,
 					&volatile_resident_size,
@@ -6102,24 +6043,18 @@ task_info(
 					vm_info->purgeable_volatile_virtual =
 					    volatile_virtual_size;
 				}
+			} else {
+				vm_map_ilk_unlock(map);
 			}
-		}
-		*task_info_count = TASK_VM_INFO_REV0_COUNT;
-
-		if (original_task_info_count >= TASK_VM_INFO_REV2_COUNT) {
-			/* must be captured while we still have the map lock */
-			vm_info->min_address = map->min_offset;
-			vm_info->max_address = map->max_offset;
 		}
 
 		/*
-		 * Done with vm map things, can drop the map lock and reference,
-		 * and take the task lock back.
+		 * Done with vm map things, the interlock was dropped in all paths
+		 * above. Can drop the map reference, and take the task lock back.
 		 *
 		 * Re-validate that the task didn't die on us.
 		 */
 		if (!is_kernel_task) {
-			vm_map_unlock_read(map);
 			vm_map_deallocate(map);
 		}
 		map = VM_MAP_NULL;
@@ -6145,66 +6080,87 @@ task_info(
 		if (original_task_info_count >= TASK_VM_INFO_REV3_COUNT) {
 			ledger_get_lifetime_max(task->ledger,
 			    task_ledgers.phys_footprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_phys_footprint_peak);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.purgeable_nonvolatile,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_purgeable_nonvolatile);
 			ledger_get_balance(task->ledger,
-			    task_ledgers.purgeable_nonvolatile_compressed,
+			    task_ledgers.purgeable_nonvolatile_compress,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_purgeable_novolatile_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.purgeable_volatile,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_purgeable_volatile);
 			ledger_get_balance(task->ledger,
-			    task_ledgers.purgeable_volatile_compressed,
+			    task_ledgers.purgeable_volatile_compress,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_purgeable_volatile_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.network_nonvolatile,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_network_nonvolatile);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.network_nonvolatile_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_network_nonvolatile_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.network_volatile,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_network_volatile);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.network_volatile_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_network_volatile_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.media_footprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_media_footprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.media_footprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_media_footprint_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.media_nofootprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_media_nofootprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.media_nofootprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_media_nofootprint_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.graphics_footprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_graphics_footprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.graphics_footprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_graphics_footprint_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.graphics_nofootprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_graphics_nofootprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.graphics_nofootprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_graphics_nofootprint_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.neural_footprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_footprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.neural_footprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_footprint_compressed);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.neural_nofootprint,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_nofootprint);
 			ledger_get_balance(task->ledger,
 			    task_ledgers.neural_nofootprint_compressed,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_nofootprint_compressed);
 			*task_info_count = TASK_VM_INFO_REV3_COUNT;
 		}
@@ -6228,15 +6184,17 @@ task_info(
 		}
 		if (original_task_info_count >= TASK_VM_INFO_REV6_COUNT) {
 			ledger_get_balance(task->ledger, task_ledgers.swapins,
-			    &vm_info->ledger_swapins);
+			    LEO_NO_SETTLE, &vm_info->ledger_swapins);
 			*task_info_count = TASK_VM_INFO_REV6_COUNT;
 		}
 		if (original_task_info_count >= TASK_VM_INFO_REV7_COUNT) {
 			ledger_get_balance(task->ledger,
 			    task_ledgers.neural_nofootprint_total,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_nofootprint_total);
 			ledger_get_lifetime_max(task->ledger,
 			    task_ledgers.neural_nofootprint_total,
+			    LEO_NO_SETTLE,
 			    &vm_info->ledger_tag_neural_nofootprint_peak);
 			*task_info_count = TASK_VM_INFO_REV7_COUNT;
 		}
@@ -6265,10 +6223,10 @@ task_info(
 		bzero(wait_state_info->_reserved, sizeof(wait_state_info->_reserved));
 
 #if CONFIG_SCHED_SFI
-		int i, prev_lentry = -1;
+		int prev_lentry = -1;
 		int64_t  val_credit, val_debit;
 
-		for (i = 0; i < MAX_SFI_CLASS_ID; i++) {
+		for (sfi_class_id_t i = SFI_CLASS_UNSPECIFIED + 1; i < MAX_SFI_CLASS_ID; i++) {
 			val_credit = 0;
 			/*
 			 * checking with prev_lentry != entry ensures adjacent classes
@@ -6277,7 +6235,8 @@ task_info(
 			 */
 			if (prev_lentry != task_ledgers.sfi_wait_times[i] &&
 			    KERN_SUCCESS == ledger_get_entries(task->ledger,
-			    task_ledgers.sfi_wait_times[i], &val_credit, &val_debit)) {
+			    task_ledgers.sfi_wait_times[i], LEO_SETTLE,
+			    &val_credit, &val_debit)) {
 				total_sfi_ledger_val += val_credit;
 			}
 			prev_lentry = task_ledgers.sfi_wait_times[i];
@@ -6429,7 +6388,7 @@ task_info(
 		struct ipc_space *space = task->itk_space;
 		if (space) {
 			ipc_space_config->space_policy = (uint32_t)space->is_policy;
-			*task_info_count = TASK_SECURITY_CONFIG_INFO_COUNT;
+			*task_info_count = TASK_IPC_SPACE_POLICY_INFO_COUNT;
 		}
 		break;
 	}
@@ -6796,17 +6755,18 @@ task_power_info_locked(
 
 	task_lock_assert_owned(task);
 
+	ledger_tab_settle(&task_ledger_template, task->ledger);
 	ledger_get_entries(task->ledger, task_ledgers.interrupt_wakeups,
-	    (ledger_amount_t *)&info->task_interrupt_wakeups, &tmp);
+	    LEO_NO_SETTLE, (ledger_amount_t *)&info->task_interrupt_wakeups, &tmp);
 	ledger_get_entries(task->ledger, task_ledgers.platform_idle_wakeups,
-	    (ledger_amount_t *)&info->task_platform_idle_wakeups, &tmp);
+	    LEO_NO_SETTLE, (ledger_amount_t *)&info->task_platform_idle_wakeups, &tmp);
 
 	info->task_timer_wakeups_bin_1 = task->task_timer_wakeups_bin_1;
 	info->task_timer_wakeups_bin_2 = task->task_timer_wakeups_bin_2;
 
 	struct recount_usage usage = { 0 };
 	struct recount_usage usage_perf = { 0 };
-	recount_task_usage_perf_only(task, &usage, &usage_perf);
+	recount_task_usage_cpu_kinds(task, &usage, &usage_perf, NULL);
 
 	info->total_user = usage.ru_metrics[RCT_LVL_USER].rm_time_mach;
 	info->total_system = recount_usage_system_time_mach(&usage);
@@ -7370,12 +7330,12 @@ PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND(int max_footprint_mb,
 	 * For the reason string, diagnostic limit is prioritized over fatal limit,
 	 * but for the EXC_RESOURCE flavor it's the other way round.
 	 */
-	if (exception_options & EXEC_RESOURCE_DIAGNOSTIC) {
+	if (exception_options & EXC_RESOURCE_DIAGNOSTIC) {
 		reason = "diagnostics limit";
-		if (!(exception_options & EXEC_RESOURCE_FATAL)) {
+		if (!(exception_options & EXC_RESOURCE_FATAL)) {
 			flavor = FLAVOR_DIAG_MEMLIMIT;
 		}
-	} else if (exception_options & EXEC_RESOURCE_CONCLAVE) {
+	} else if (exception_options & EXC_RESOURCE_CONCLAVE) {
 		reason = "conclave limit";
 		flavor = FLAVOR_CONCLAVE_LIMIT;
 	}
@@ -7399,12 +7359,16 @@ PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND(int max_footprint_mb,
 	EXC_RESOURCE_ENCODE_TYPE(code[0], RESOURCE_TYPE_MEMORY);
 	EXC_RESOURCE_ENCODE_FLAVOR(code[0], flavor);
 	EXC_RESOURCE_HWM_ENCODE_LIMIT(code[0], max_footprint_mb);
+	if (exception_options & EXC_RESOURCE_IS_ACTIVE) {
+		code[0] |= EXC_RESOURCE_HWM_ACTIVE_BIT;
+	}
+
 	/*
 	 * Do not generate a corpse fork if the violation is a fatal one
 	 * or the process wants synchronous EXC_RESOURCE exceptions.
 	 */
-	if ((exception_options & EXEC_RESOURCE_FATAL) || send_sync_exc_resource || !exc_via_corpse_forking) {
-		if (exception_options & EXEC_RESOURCE_FATAL) {
+	if ((exception_options & EXC_RESOURCE_FATAL) || send_sync_exc_resource || !exc_via_corpse_forking) {
+		if (exception_options & EXC_RESOURCE_FATAL) {
 			vm_map_set_corpse_source(task->map);
 		}
 
@@ -7438,8 +7402,8 @@ PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND(int max_footprint_mb,
 /*
  * Callback invoked when a task exceeds its physical footprint limit.
  */
-void
-task_footprint_exceeded(int warning, __unused const void *param0, __unused const void *param1)
+static void
+task_footprint_exceeded(ledger_warning_t warning, __unused const void *param0)
 {
 	ledger_amount_t enforced_limit_mb = 0;
 	ledger_amount_t enforced_limit = 0;
@@ -7447,36 +7411,33 @@ task_footprint_exceeded(int warning, __unused const void *param0, __unused const
 	ledger_amount_t current_footprint;
 #endif /* CONFIG_DEFERRED_RECLAIM */
 	task_t task;
-	send_exec_resource_is_warning is_warning = IS_NOT_WARNING;
-	boolean_t memlimit_is_active;
-	send_exec_resource_is_fatal memlimit_is_fatal;
-	send_exec_resource_is_diagnostics is_diag_mem_threshold = IS_NOT_DIAGNOSTICS;
-	if (warning == LEDGER_WARNING_DIAG_MEM_THRESHOLD) {
-		is_diag_mem_threshold = IS_DIAGNOSTICS;
-		is_warning = IS_WARNING;
-	} else if (warning == LEDGER_WARNING_DIPPED_BELOW) {
-		/*
-		 * Task memory limits only provide a warning on the way up.
-		 */
-		return;
-	} else if (warning == LEDGER_WARNING_ROSE_ABOVE) {
-		/*
-		 * This task is in danger of violating a memory limit,
-		 * It has exceeded a percentage level of the limit.
-		 */
-		is_warning = IS_WARNING;
-	} else {
-		/*
-		 * The task has exceeded the physical footprint limit.
-		 * This is not a warning but a true limit violation.
-		 */
-		is_warning = IS_NOT_WARNING;
+	bool is_active, is_fatal;
+	bool is_warning = false;
+#if DEBUG || DEVELOPMENT
+	bool is_diag = false;
+#endif /* DEBUG || DEVELOPMENT */
+
+
+	/* Determine if this is the diag, warning, or regular limit */
+	switch (warning) {
+#if DEBUG || DEVELOPMENT
+	case LEDGER_WARNING_LEVEL_DIAG:
+		is_diag = true;
+		OS_FALLTHROUGH;
+#endif /* DEBUG || DEVELOPMENT */
+	case LEDGER_WARNING_LEVEL_WARNING:
+		is_warning = true;
+		break;
+	default:
+		break;
 	}
 
 	task = current_task();
 
+	/* Get the relevant limit value */
+	task_lock(task);
 #if DEBUG || DEVELOPMENT
-	if (is_diag_mem_threshold == IS_DIAGNOSTICS) {
+	if (is_diag) {
 		ledger_get_diag_mem_threshold(task->ledger, task_ledgers.phys_footprint, &enforced_limit);
 	} else {
 		ledger_get_limit(task->ledger, task_ledgers.phys_footprint, &enforced_limit);
@@ -7484,6 +7445,12 @@ task_footprint_exceeded(int warning, __unused const void *param0, __unused const
 #else /* DEBUG || DEVELOPMENT */
 	ledger_get_limit(task->ledger, task_ledgers.phys_footprint, &enforced_limit);
 #endif /* !(DEBUG || DEVELOPMENT) */
+	enforced_limit_mb = enforced_limit >> 20;
+	is_active = task_get_memlimit_is_active(task);
+	is_fatal = task_get_memlimit_is_fatal(task);
+	task_unlock(task);
+
+	/* If this is not a warning, try draining the reclaim ring first */
 #if CONFIG_DEFERRED_RECLAIM
 	if (!is_warning && vm_deferred_reclamation_task_has_ring(task)) {
 		/*
@@ -7491,60 +7458,60 @@ task_footprint_exceeded(int warning, __unused const void *param0, __unused const
 		 * Do a reclaim to ensure it's really over its limit.
 		 */
 		vm_deferred_reclamation_task_drain(task, RECLAIM_OPTIONS_NONE);
-		ledger_get_balance(task->ledger, task_ledgers.phys_footprint, &current_footprint);
+		ledger_get_balance(task->ledger, task_ledgers.phys_footprint,
+		    LEO_NO_SETTLE, &current_footprint);
 		if (current_footprint < enforced_limit) {
 			return;
 		}
 	}
 #endif /* CONFIG_DEFERRED_RECLAIM */
-	enforced_limit_mb = enforced_limit >> 20;
-	memlimit_is_active = task_get_memlimit_is_active(task);
-	memlimit_is_fatal = task_get_memlimit_is_fatal(task) == FALSE ? IS_NOT_FATAL : IS_FATAL;
-#if DEBUG || DEVELOPMENT
-	if (is_diag_mem_threshold == IS_NOT_DIAGNOSTICS) {
-		task_process_crossed_limit_no_diag(task, enforced_limit_mb, memlimit_is_fatal, memlimit_is_active, is_warning);
-	} else {
-		task_process_crossed_limit_diag(enforced_limit_mb);
-	}
-#else /* DEBUG || DEVELOPMENT */
-	task_process_crossed_limit_no_diag(task, enforced_limit_mb, memlimit_is_fatal, memlimit_is_active, is_warning);
-#endif /* !(DEBUG || DEVELOPMENT) */
-}
 
-/*
- * Actions to perfrom when a process has crossed watermark or is a fatal consumption */
-static inline void
-task_process_crossed_limit_no_diag(task_t task, ledger_amount_t ledger_limit_size, bool memlimit_is_fatal, bool memlimit_is_active, send_exec_resource_is_warning is_warning)
-{
 	send_exec_resource_options_t exception_options = 0;
-	if (memlimit_is_fatal) {
-		exception_options |= EXEC_RESOURCE_FATAL;
+
+	/* If we can't encode the limit in EXC_RESOURCE, log a warning */
+	if ((enforced_limit_mb & EXC_RESOURCE_HWM_LIMIT_MASK) != enforced_limit_mb) {
+		os_log_error(OS_LOG_DEFAULT, "EXC_RESOURCE limit %d above maximum-encodable limit %d; logs may be inaccurate\n",
+		    (int) enforced_limit_mb, (int) EXC_RESOURCE_HWM_LIMIT_MASK);
 	}
-	/*
-	 * If this is an actual violation (not a warning), then generate EXC_RESOURCE exception.
-	 * We only generate the exception once per process per memlimit (active/inactive limit).
-	 * To enforce this, we monitor state based on the  memlimit's active/inactive attribute
-	 * and we disable it by marking that memlimit as exception triggered.
-	 */
-	if (is_warning == IS_NOT_WARNING && task_set_exc_resource_bit(task, memlimit_is_active)) {
-		PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int)ledger_limit_size, exception_options);
-		// If it was not a diag threshold (if was a memory limit), then we do not want more signalling,
-		// however, if was a diag limit, the user may reload a different limit and signal again the violation
-		memorystatus_log_exception((int)ledger_limit_size, memlimit_is_active, memlimit_is_fatal);
+
+	if (is_active) {
+		exception_options |= EXC_RESOURCE_IS_ACTIVE;
 	}
-	memorystatus_on_ledger_footprint_exceeded(is_warning == IS_NOT_WARNING ? FALSE : TRUE, memlimit_is_active, memlimit_is_fatal);
+
+#if DEBUG || DEVELOPMENT
+	if (is_diag) {
+		exception_options |= EXC_RESOURCE_DIAGNOSTIC;
+		PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int) enforced_limit_mb, exception_options);
+		memorystatus_log_diag_threshold_exception((int) enforced_limit_mb);
+		return;
+	}
+#endif /* DEBUG || DEVELOPMENT */
+
+	if (is_fatal) {
+		exception_options |= EXC_RESOURCE_FATAL;
+	}
+
+	if (!is_warning && task_set_exc_resource_bit(task, is_active)) {
+		PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int) enforced_limit_mb, exception_options);
+		memorystatus_log_exception((int) enforced_limit_mb, is_active, is_fatal);
+	}
+
+	memorystatus_on_ledger_footprint_exceeded(is_warning, is_active, is_fatal);
 }
 
 /*
  * Callback invoked when a task exceeds its conclave memory limit.
  */
-void
-task_conclave_mem_limit_exceeded(__unused int warning, __unused const void *param0, __unused const void *param1)
+static void
+task_conclave_mem_limit_exceeded(ledger_warning_t warning, const void *param0)
 {
+#pragma unused(warning, param0)
 	ledger_amount_t max_footprint = 0;
 	ledger_amount_t max_footprint_mb = 0;
-
 	task_t task = current_task();
+
+	/* no warn level is ever set */
+	assert(warning == LEDGER_WARNING_LEVEL_CRITICAL);
 
 	ledger_get_limit(task->ledger, task_ledgers.conclave_mem, &max_footprint);
 	max_footprint_mb = max_footprint >> 20;
@@ -7554,28 +7521,11 @@ task_conclave_mem_limit_exceeded(__unused int warning, __unused const void *para
 	 * For the moment, we assume conclave memory isn't tied to process memory
 	 * and so this doesn't participate in the once-per-process rule above.
 	 */
-	PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int)max_footprint_mb, EXEC_RESOURCE_FATAL | EXEC_RESOURCE_CONCLAVE);
+	PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int)max_footprint_mb,
+	    EXC_RESOURCE_FATAL | EXC_RESOURCE_CONCLAVE);
 
 	memorystatus_on_conclave_limit_exceeded((int)max_footprint_mb);
 }
-
-#if DEBUG || DEVELOPMENT
-/**
- * Actions to take when a process has crossed the diagnostics limit
- */
-static inline void
-task_process_crossed_limit_diag(ledger_amount_t ledger_limit_size)
-{
-	/*
-	 * If this is an actual violation (not a warning), then generate EXC_RESOURCE exception.
-	 * In the case of the diagnostics thresholds, the exception will be signaled only once, but the
-	 * inhibit / rearm mechanism if performed at ledger level.
-	 */
-	send_exec_resource_options_t exception_options = EXEC_RESOURCE_DIAGNOSTIC;
-	PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND((int)ledger_limit_size, exception_options);
-	memorystatus_log_diag_threshold_exception((int)ledger_limit_size);
-}
-#endif
 
 extern int proc_check_footprint_priv(void);
 
@@ -7662,7 +7612,6 @@ task_set_phys_footprint_limit_internal(
 	diagthreshold_check_return diag_threshold_validity;
 #endif
 	ret = ledger_get_limit(task->ledger, task_ledgers.phys_footprint, &old);
-
 	if (ret != KERN_SUCCESS) {
 		return ret;
 	}
@@ -7741,8 +7690,7 @@ task_set_phys_footprint_limit_internal(
 	    (ledger_amount_t)new_limit_mb << 20, PHYS_FOOTPRINT_WARNING_LEVEL);
 
 	if (task == current_task()) {
-		ledger_check_new_balance(current_thread(), task->ledger,
-		    task_ledgers.phys_footprint);
+		ledger_check_new_balance(task->ledger, task_ledgers.phys_footprint);
 	}
 
 	task_unlock(task);
@@ -7812,8 +7760,7 @@ task_set_diag_footprint_limit_internal(
 	ledger_set_diag_mem_threshold(task->ledger, task_ledgers.phys_footprint,
 	    (ledger_amount_t)new_limit_bytes );
 	if (task == current_task()) {
-		ledger_check_new_balance(current_thread(), task->ledger,
-		    task_ledgers.phys_footprint);
+		ledger_check_new_balance(task->ledger, task_ledgers.phys_footprint);
 	}
 
 	task_unlock(task);
@@ -7893,49 +7840,84 @@ task_get_phys_footprint_limit(
 }
 #endif /* CONFIG_MEMORYSTATUS */
 
-security_token_t *
-task_get_sec_token(task_t task)
+static void
+task_fill_sec_token(uint64_t uids, uint64_t gids, security_token_t *out)
 {
-	return &task_get_ro(task)->task_tokens.sec_token;
+	out->val[0] = task_token_effective(uids);
+	out->val[1] = task_token_effective(gids);
+}
+
+static void
+task_fill_audit_token(const struct task_token_data *tokens,
+    uint64_t uids, uint64_t gids, audit_token_t *out)
+{
+	out->val[0] = os_atomic_load(&tokens->tc_auid, relaxed);
+	out->val[1] = task_token_effective(uids);
+	out->val[2] = task_token_effective(gids);
+	out->val[3] = task_token_real(uids);
+	out->val[4] = task_token_real(gids);
+	out->val[5] = os_atomic_load(&tokens->tc_pid, relaxed);
+	out->val[6] = os_atomic_load(&tokens->tc_asid, relaxed);
+	out->val[7] = os_atomic_load(&tokens->tc_pidversion, relaxed);
 }
 
 void
-task_set_sec_token(task_t task, security_token_t *token)
+task_get_sec_token(task_t task, security_token_t *out)
 {
-	zalloc_ro_update_field(ZONE_ID_PROC_RO, task_get_ro(task),
-	    task_tokens.sec_token, token);
-}
+	const struct task_token_data *tokens = task->task_tokens;
+	uint64_t uids = os_atomic_load(&tokens->tc_uids, relaxed);
+	uint64_t gids = os_atomic_load(&tokens->tc_gids, relaxed);
 
-audit_token_t *
-task_get_audit_token(task_t task)
-{
-	return &task_get_ro(task)->task_tokens.audit_token;
+	task_fill_sec_token(uids, gids, out);
 }
 
 void
-task_set_audit_token(task_t task, audit_token_t *token)
+task_get_audit_token(task_t task, audit_token_t *out)
 {
-	zalloc_ro_update_field(ZONE_ID_PROC_RO, task_get_ro(task),
-	    task_tokens.audit_token, token);
+	const struct task_token_data *tokens = task->task_tokens;
+	uint64_t uids = os_atomic_load(&tokens->tc_uids, relaxed);
+	uint64_t gids = os_atomic_load(&tokens->tc_gids, relaxed);
+
+	task_fill_audit_token(tokens, uids, gids, out);
+}
+
+void
+task_get_tokens(task_t task, security_token_t *sec_out, audit_token_t *audit_out)
+{
+	const struct task_token_data *tokens = task->task_tokens;
+	uint64_t uids = os_atomic_load(&tokens->tc_uids, relaxed);
+	uint64_t gids = os_atomic_load(&tokens->tc_gids, relaxed);
+
+	if (sec_out) {
+		task_fill_sec_token(uids, gids, sec_out);
+	}
+	if (audit_out) {
+		task_fill_audit_token(tokens, uids, gids, audit_out);
+	}
 }
 
 void
 task_set_tokens(task_t task, security_token_t *sec_token, audit_token_t *audit_token)
 {
-	struct task_token_ro_data tokens;
+	struct task_token_data *tokens = task->task_tokens;
 
-	tokens = task_get_ro(task)->task_tokens;
-	tokens.sec_token = *sec_token;
-	tokens.audit_token = *audit_token;
+	task_lock_assert_owned(task);
 
-	zalloc_ro_update_field(ZONE_ID_PROC_RO, task_get_ro(task), task_tokens,
-	    &tokens);
+	os_atomic_store(&tokens->tc_uids, task_token_pack(sec_token->val[0],
+	    audit_token->val[3]), relaxed);
+	os_atomic_store(&tokens->tc_gids, task_token_pack(sec_token->val[1],
+	    audit_token->val[4]), relaxed);
+	os_atomic_store(&tokens->tc_auid, audit_token->val[0], relaxed);
+	os_atomic_store(&tokens->tc_asid, audit_token->val[6], relaxed);
+	os_atomic_store(&tokens->tc_pid, audit_token->val[5], relaxed);
+	os_atomic_store(&tokens->tc_pidversion, audit_token->val[7], relaxed);
 }
 
 boolean_t
 task_is_privileged(task_t task)
 {
-	return task_get_sec_token(task)->val[0] == 0;
+	uint64_t uids = os_atomic_load(&task->task_tokens->tc_uids, relaxed);
+	return task_token_effective(uids) == 0;
 }
 
 #ifdef CONFIG_MACF
@@ -8001,24 +7983,19 @@ task_get_conclave_mem_limit(task_t task, uint64_t *conclave_limit)
 }
 
 kern_return_t
-task_set_conclave_mem_limit(task_t task, uint64_t conclave_limit)
+task_set_conclave_mem_limit_internal(task_t task, uint64_t conclave_limit)
 {
-	kern_return_t error;
-
-	if ((error = proc_check_footprint_priv())) {
-		(void) error;
-		/* Following task_set_phys_footprint_limit, always returns KERN_NO_ACCESS. */
-		return KERN_NO_ACCESS;
-	}
-
+	kern_return_t ret;
 	task_lock(task);
 
-	ledger_set_limit(task->ledger, task_ledgers.conclave_mem,
+	ret = ledger_set_limit(task->ledger, task_ledgers.conclave_mem,
 	    (ledger_amount_t)conclave_limit << 20, 0);
+	if (ret != KERN_SUCCESS) {
+		return ret;
+	}
 
 	if (task == current_task()) {
-		ledger_check_new_balance(current_thread(), task->ledger,
-		    task_ledgers.conclave_mem);
+		ledger_check_new_balance(task->ledger, task_ledgers.conclave_mem);
 	}
 
 	task_unlock(task);
@@ -8101,14 +8078,11 @@ current_task(void)
 	return get_threadtask(current_thread());
 }
 
-/* defined in bsd/kern/kern_prot.c */
-extern int get_audit_token_pid(audit_token_t *audit_token);
-
-int
+__mockable int
 task_pid(task_t task)
 {
 	if (task) {
-		return get_audit_token_pid(task_get_audit_token(task));
+		return (int)os_atomic_load(&task->task_tokens->tc_pid, relaxed);
 	}
 	return -1;
 }
@@ -8303,8 +8277,7 @@ task_wakeups_monitor_ctl(task_t task, uint32_t *flags, int32_t *rate_hz)
 		}
 
 #ifndef CONFIG_NOMONITORS
-		ledger_set_limit(ledger, task_ledgers.interrupt_wakeups, *rate_hz * task_wakeups_monitor_interval,
-		    (uint8_t)task_wakeups_monitor_ustackshots_trigger_pct);
+		ledger_set_limit(ledger, task_ledgers.interrupt_wakeups, *rate_hz * task_wakeups_monitor_interval, 0);
 		ledger_set_period(ledger, task_ledgers.interrupt_wakeups, task_wakeups_monitor_interval * NSEC_PER_SEC);
 		ledger_enable_callback(ledger, task_ledgers.interrupt_wakeups);
 #endif /* CONFIG_NOMONITORS */
@@ -8322,19 +8295,12 @@ task_wakeups_monitor_ctl(task_t task, uint32_t *flags, int32_t *rate_hz)
 	return KERN_SUCCESS;
 }
 
-void
-task_wakeups_rate_exceeded(int warning, __unused const void *param0, __unused const void *param1)
-{
-	if (warning == 0) {
-		SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MANY_WAKEUPS();
-	}
-}
-
 TUNABLE(bool, enable_wakeup_reports, "enable_wakeup_reports", false); /* Enable wakeup reports. */
 
-void __attribute__((noinline))
-SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MANY_WAKEUPS(void)
+static void
+task_wakeups_rate_exceeded(ledger_warning_t warning, const void *param0)
 {
+#pragma unused(warning, param0)
 	task_t                      task        = current_task();
 	int                         pid         = 0;
 	const char                  *procname   = "unknown";
@@ -8344,6 +8310,9 @@ SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MANY_WAKEUPS(void)
 	mach_exception_data_type_t  code[EXCEPTION_CODE_MAX];
 #endif /* EXC_RESOURCE_MONITORS */
 	struct ledger_entry_info    lei;
+
+	/* we never set a warning percentage */
+	assert(warning == LEDGER_WARNING_LEVEL_CRITICAL);
 
 #ifdef MACH_BSD
 	pid = proc_selfpid();
@@ -8456,12 +8425,12 @@ task_update_physical_writes(__unused task_t task, __unused task_physical_write_f
 	if (flags & TASK_BALANCE_CREDIT) {
 		if (flavor == TASK_PHYSICAL_WRITE_METADATA) {
 			OSAddAtomic64(io_size, (SInt64 *)&(task->task_fs_metadata_writes));
-			ledger_credit_nocheck(task->ledger, task_ledgers.fs_metadata_writes, io_size);
+			ledger_credit(task->ledger, task_ledgers.fs_metadata_writes, io_size);
 		}
 	} else if (flags & TASK_BALANCE_DEBIT) {
 		if (flavor == TASK_PHYSICAL_WRITE_METADATA) {
 			OSAddAtomic64(-1 * io_size, (SInt64 *)&(task->task_fs_metadata_writes));
-			ledger_debit_nocheck(task->ledger, task_ledgers.fs_metadata_writes, io_size);
+			ledger_debit(task->ledger, task_ledgers.fs_metadata_writes, io_size);
 		}
 	}
 #endif /* CONFIG_PHYS_WRITE_ACCT */
@@ -8534,7 +8503,7 @@ task_update_logical_writes(task_t task, uint32_t io_size, int flags, void *vp)
 		/* If io_telemetry_limit is 0, disable global updates and I/O telemetry */
 		needs_telemetry = global_update_logical_writes(io_delta, global_counter_to_update);
 		if (needs_telemetry && !is_external_device) {
-			act_set_io_telemetry_ast(current_thread());
+			act_set_telemetry_ast(current_thread(), TELEMETRY_AST_IO);
 		}
 	}
 }
@@ -8564,24 +8533,20 @@ task_io_monitor_ctl(task_t task, uint32_t *flags)
 	return KERN_SUCCESS;
 }
 
-void
-task_io_rate_exceeded(int warning, const void *param0, __unused const void *param1)
-{
-	if (warning == 0) {
-		SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO((int)param0);
-	}
-}
-
-void __attribute__((noinline))
-SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO(int flavor)
+static void
+task_io_rate_exceeded(ledger_warning_t warning __unused, const void *param0)
 {
 	int                             pid = 0;
+	long                            flavor = (long)param0;
 	task_t                          task = current_task();
 #ifdef EXC_RESOURCE_MONITORS
 	mach_exception_data_type_t      code[EXCEPTION_CODE_MAX];
 #endif /* EXC_RESOURCE_MONITORS */
 	struct ledger_entry_info        lei = {};
 	kern_return_t                   kr;
+
+	/* we never set a percentage for the limit */
+	assert(warning == LEDGER_WARNING_LEVEL_CRITICAL);
 
 #ifdef MACH_BSD
 	pid = proc_selfpid();
@@ -8594,6 +8559,8 @@ SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO(int flavor)
 	case FLAVOR_IO_PHYSICAL_WRITES:
 		ledger_get_entry_info(task->ledger, task_ledgers.physical_writes, &lei);
 		break;
+	default:
+		return;
 	}
 
 
@@ -8608,8 +8575,10 @@ SENDING_NOTIFICATION__THIS_PROCESS_IS_CAUSING_TOO_MUCH_IO(int flavor)
 	if (flavor == FLAVOR_IO_LOGICAL_WRITES) {
 		trace_resource_violation(RMON_LOGWRITES_VIOLATED, &lei);
 	}
-	os_log(OS_LOG_DEFAULT, "process [%d] caught causing excessive I/O (flavor: %d). Task I/O: %lld MB. [Limit : %lld MB per %lld secs]\n",
-	    pid, flavor, (lei.lei_balance / (1024 * 1024)), (lei.lei_limit / (1024 * 1024)), (lei.lei_refill_period / NSEC_PER_SEC));
+	os_log(OS_LOG_DEFAULT, "process [%d] caught causing excessive I/O (flavor: %ld). "
+	    "Task I/O: %lld MB. [Limit : %lld MB per %lld secs]\n", pid, flavor,
+	    lei.lei_balance / (1024 * 1024), lei.lei_limit / (1024 * 1024),
+	    lei.lei_refill_period / NSEC_PER_SEC);
 
 	kr = send_resource_violation(send_disk_writes_violation, task, &lei, kRNFlagsNone);
 	if (kr) {
@@ -8661,18 +8630,13 @@ task_allocate_fatal_port(void)
 static void
 task_fatal_port_no_senders(ipc_port_t port, __unused mach_port_mscount_t mscount)
 {
-	task_t task = TASK_NULL;
 	kern_return_t kr;
 
 	task_id_token_t token = ipc_kobject_get_stable(port, IKOT_TASK_FATAL);
 
 	assert(token != NULL);
 	if (token) {
-		kr = task_identity_token_get_task_grp(token, &task, TASK_GRP_KERNEL); /* takes a reference on task */
-		if (task) {
-			task_bsdtask_kill(task);
-			task_deallocate(task);
-		}
+		kr = task_identity_token_try_sigkill(token); /* takes a reference on task */
 		task_id_token_release(token); /* consumes ref given by notification */
 	}
 }
@@ -8712,14 +8676,9 @@ SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_MACH_PORTS(task_t task, uint32_t
 		EXC_RESOURCE_ENCODE_FLAVOR(code[0], FLAVOR_PORT_SPACE_FULL);
 		EXC_RESOURCE_PORTS_ENCODE_PORTS(code[0], current_size);
 
-		exception_info_t info = {
-			.os_reason = OS_REASON_PORT_SPACE,
-			.exception_type = EXC_RESOURCE,
-			.mx_code = code[0],
-			.mx_subcode = code[1]
-		};
-
-		exit_with_mach_exception(current_proc(), info, PX_DEBUG_NO_HONOR);
+		/* Perform fatal exception logic. */
+		exit_with_fatal_exception_and_notify(current_proc(), OS_REASON_PORT_SPACE,
+		    EXC_RESOURCE, code[0], code[1], PX_FLAGS_NONE);
 		return;
 	}
 
@@ -8730,7 +8689,7 @@ SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_MACH_PORTS(task_t task, uint32_t
 		task_fatal_port = task_allocate_fatal_port();
 		if (!task_fatal_port) {
 			os_log(OS_LOG_DEFAULT, "process %s[%d] Unable to create task token ident object", procname, pid);
-			task_bsdtask_kill(task);
+			task_self_sigkill(os_reason_create(OS_REASON_RESOURCES, RESOURCES_LIMIT_MACH_PORTS_EXHAUSTION));
 		}
 	} else {
 		flags |= kRNSoftLimitFlag;
@@ -8783,7 +8742,7 @@ SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_KQWORKLOOPS(task_t task, int cur
 		task_fatal_port = task_allocate_fatal_port();
 		if (task_fatal_port == MACH_PORT_NULL) {
 			os_log(OS_LOG_DEFAULT, "process %s[%d] Unable to create task token ident object", procname, pid);
-			task_bsdtask_kill(task);
+			task_self_sigkill(os_reason_create(OS_REASON_RESOURCES, RESOURCES_LIMIT_KQWORKLOOPS_EXHAUSTION));
 		}
 	} else {
 		flags |= kRNSoftLimitFlag;
@@ -8841,7 +8800,7 @@ SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_FILE_DESCRIPTORS(task_t task, in
 		task_fatal_port = task_allocate_fatal_port();
 		if (!task_fatal_port) {
 			os_log(OS_LOG_DEFAULT, "process %s[%d] Unable to create task token ident object", procname, pid);
-			task_bsdtask_kill(task);
+			task_self_sigkill(os_reason_create(OS_REASON_RESOURCES, RESOURCES_LIMIT_FILE_DESCRIPTORS_EXHAUSTION));
 		}
 	} else {
 		flags |= kRNSoftLimitFlag;
@@ -9127,7 +9086,7 @@ kdebug_trace_dyld(task_t task, uint32_t base_code,
 	}
 
 	data = CAST_DOWN(vm_offset_t, map_data);
-	mach_vm_deallocate(ipc_kernel_map, data, infos_len * sizeof(infos[0]));
+	mach_vm_deallocate_kernel(ipc_kernel_map, data, infos_len * sizeof(infos[0]));
 	return KERN_SUCCESS;
 }
 
@@ -9454,9 +9413,24 @@ task_set_exc_guard_default(
 		task->task_exc_guard = (task_exc_guard_default & TASK_EXC_GUARD_ALL);
 
 		if (1 == task_pid(task)) {
-			/* special flags for inittask - delivery every instance as corpse */
-			task->task_exc_guard = _TASK_EXC_GUARD_ALL_CORPSE;
-		} else if (task_exc_guard_default & TASK_EXC_GUARD_HONOR_NAMED_DEFAULTS) {
+			/*
+			 * special configuration for inittask: mp error as
+			 * corpses, VM guards as fatal.
+			 */
+			task->task_exc_guard = _TASK_EXC_GUARD_MP_CORPSE |
+			    _TASK_EXC_GUARD_VM_FATAL;
+		} else if (task_has_guard_objects(task)) {
+			/*
+			 * rdar://168990820: guard objects, which are
+			 * a task_get_platform_restrictions_version() >= 2 feature,
+			 * require fatal guard exceptions, otherwise this can lead
+			 * to inconsistencies in the vm map store
+			 */
+			task->task_exc_guard &= ~TASK_EXC_GUARD_VM_ALL;
+			task->task_exc_guard |= _TASK_EXC_GUARD_VM_FATAL;
+		}
+
+		if (task_exc_guard_default & TASK_EXC_GUARD_HONOR_NAMED_DEFAULTS) {
 			/* honor by-name default setting overrides */
 
 			int count = sizeof(task_exc_guard_named_defaults) / sizeof(struct task_exc_guard_named_default);
@@ -9627,7 +9601,7 @@ task_ledger_get_balance(
 {
 	ledger_amount_t amount;
 	amount = 0;
-	ledger_get_balance(ledger, ledger_idx, &amount);
+	ledger_get_balance(ledger, ledger_idx, LEO_NO_SETTLE, &amount);
 	return amount;
 }
 
@@ -9644,9 +9618,11 @@ task_ledgers_footprint(
 	*ledger_resident = 0;
 	*ledger_compressed = 0;
 
+	ledger_tab_settle(&task_ledger_template, ledger);
+
 	/* purgeable non-volatile memory */
 	*ledger_resident += task_ledger_get_balance(ledger, task_ledgers.purgeable_nonvolatile);
-	*ledger_compressed += task_ledger_get_balance(ledger, task_ledgers.purgeable_nonvolatile_compressed);
+	*ledger_compressed += task_ledger_get_balance(ledger, task_ledgers.purgeable_nonvolatile_compress);
 
 	/* "default" tagged memory */
 	*ledger_resident += task_ledger_get_balance(ledger, task_ledgers.tagged_footprint);
@@ -9668,14 +9644,6 @@ task_ledgers_footprint(
 }
 
 #if CONFIG_MEMORYSTATUS
-void
-task_ledger_settle_dirty_time(task_t t)
-{
-	task_lock(t);
-	task_ledger_settle_dirty_time_locked(t);
-	task_unlock(t);
-}
-
 /*
  * Credit any outstanding task dirty time to the ledger.
  * memstat_dirty_start is pushed forward to prevent any possibility of double
@@ -9683,11 +9651,13 @@ task_ledger_settle_dirty_time(task_t t)
  * anyone reading the ledger gets up-to-date information.
  */
 void
-task_ledger_settle_dirty_time_locked(task_t t)
+task_ledger_settle_dirty_time(task_t t)
 {
-	task_lock_assert_owned(t);
+	uint64_t start;
 
-	uint64_t start = t->memstat_dirty_start;
+	task_lock(t);
+
+	start = t->memstat_dirty_start;
 	if (start) {
 		uint64_t now = mach_absolute_time();
 
@@ -9699,6 +9669,8 @@ task_ledger_settle_dirty_time_locked(task_t t)
 
 		t->memstat_dirty_start = now;
 	}
+
+	task_unlock(t);
 }
 #endif /* CONFIG_MEMORYSTATUS */
 
@@ -9706,12 +9678,9 @@ void
 task_ledger_settle(task_t t)
 {
 #if CONFIG_MEMORYSTATUS
-	task_lock(t);
-	/* Settle memorystatus dirty time */
-	task_ledger_settle_dirty_time_locked(t);
-	task_unlock(t);
-#endif /* CONFIG_MEMORYSTATUS */
-
+	task_ledger_settle_dirty_time(t);
+#endif
+	ledger_tab_settle(&task_ledger_template, t->ledger);
 #if CONFIG_DEFERRED_RECLAIM
 	vm_deferred_reclamation_settle_ledger(t);
 #endif /* CONFIG_DEFERRED_RECLAIM */
@@ -9969,7 +9938,7 @@ task_is_translated(task_t task)
 #endif
 
 /* Task runtime security mitigations configuration. */
-#define TASK_SECURITY_CONFIG_HELPER_DEFINE(suffix, checked) \
+#define TASK_SECURITY_CONFIG_HELPER_DEFINE(suffix) \
 	bool task_has_##suffix(task_t task) \
 	{ \
 	        assert(task);   \
@@ -9995,8 +9964,17 @@ task_get_security_config(task_t task)
 	return (uint32_t)(task->security_config.value);
 }
 
-TASK_SECURITY_CONFIG_HELPER_DEFINE(hardened_heap, true)
-TASK_SECURITY_CONFIG_HELPER_DEFINE(tpro, true)
+bool
+task_has_fatal_vm_guards(task_t task)
+{
+	return task->task_exc_guard & _TASK_EXC_GUARD_VM_FATAL;
+}
+
+TASK_SECURITY_CONFIG_HELPER_DEFINE(hardened_heap)
+TASK_SECURITY_CONFIG_HELPER_DEFINE(tpro)
+TASK_SECURITY_CONFIG_HELPER_DEFINE(script_restrictions)
+TASK_SECURITY_CONFIG_HELPER_DEFINE(ipc_containment_vessel)
+TASK_SECURITY_CONFIG_HELPER_DEFINE(guard_objects)
 
 uint8_t
 task_get_platform_restrictions_version(task_t task)
@@ -10028,6 +10006,76 @@ task_set_hardened_process_version(task_t task, uint64_t version)
 	task->security_config.hardened_process_version = (uint8_t)version;
 }
 
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+/*
+ * task_has_sec() (really: task_has_mte()) means:
+ *
+ * 1. task->map allows vm_allocate(VM_FLAGS_MTE); i.e., you can create *new*
+ *    tagged memory in that map.
+ * 2. When this task is running, MTE tag checking is enabled (SCTLR.ATA0=1).
+ * 3. task is subject to VM restriction policies.
+ */
+TASK_SECURITY_CONFIG_HELPER_DEFINE(sec)
+
+#define TASK_MTE_POLICY_HELPER_DEFINE(suffix, policy)   \
+    bool task_has_sec_##suffix(task_t task) \
+	{ \
+	        if (__improbable(!task)) { \
+	                panic("NULL task in %s", __func__); \
+	} \
+	if (__improbable(task == kernel_task)) { \
+	        return false; \
+	} \
+	if (__improbable(!task_has_sec(task))) { \
+	                return false; \
+	} \
+	        return ((os_atomic_load(&task->task_sec_policy, relaxed)) & policy) != 0; \
+	} \
+	void task_set_sec_##suffix(task_t task) \
+	{ \
+	        os_atomic_or(&task->task_sec_policy, policy, relaxed); \
+	}
+
+TASK_MTE_POLICY_HELPER_DEFINE(soft_mode, TASK_SEC_POLICY_SOFT_MODE);
+TASK_MTE_POLICY_HELPER_DEFINE(user_data, TASK_SEC_POLICY_USER_DATA);
+TASK_MTE_POLICY_HELPER_DEFINE(inherit, TASK_SEC_POLICY_INHERIT);
+TASK_MTE_POLICY_HELPER_DEFINE(never_check, TASK_SEC_POLICY_NEVER_CHECK);
+TASK_MTE_POLICY_HELPER_DEFINE(restrict_receiving_aliases_to_tagged_memory, TASK_SEC_POLICY_RESTRICT_RECEIVING_ALIASES_TO_TAGGED_MEMORY);
+
+uint32_t
+task_get_sec_policy(task_t task)
+{
+	assert(task);
+	return (uint32_t)(task->task_sec_policy);
+}
+
+void
+task_clear_sec_policy(task_t task)
+{
+	os_atomic_store(&task->task_sec_policy, TASK_SEC_POLICY_NONE, relaxed);
+}
+
+void
+task_clear_sec_soft_mode(task_t task)
+{
+	os_atomic_andnot(&task->task_sec_policy, TASK_SEC_POLICY_SOFT_MODE, relaxed);
+}
+
+bool
+current_task_has_sec_enabled(void)
+{
+	task_t task = current_task_early();
+	if (!task) {
+		/* an early boot thread is always a kernel thread */
+#if CONFIG_KERNEL_TAGGING
+		return true;
+#else /* !CONFIG_KERNEL_TAGGING */
+		return false;
+#endif /* !CONFIG_KERNEL_TAGGING */
+	}
+	return task_has_sec(task);
+}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 
 
 #if __has_feature(ptrauth_calls)
@@ -10793,3 +10841,43 @@ task_best_name(task_t task)
 }
 
 
+/*
+ * Set a AST_SYNTHESIZE_MACH exception on the task.
+ * This AST will consult the saved address in the vm_map and create a proper
+ * MTE mach exception out of thin air.
+ */
+void
+task_set_ast_synthesize_async_fault_mach_exception(task_t task)
+{
+	task_lock(task);
+
+	if (!task->active) {
+		task_unlock(task);
+		return;
+	}
+
+	spl_t s = splsched();
+	/* Set an AST on each of the task's threads, sending IPIs if needed */
+	thread_t thread;
+	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+		if (thread == current_thread()) {
+			thread_ast_set(thread, AST_SYNTHESIZE_MACH);
+			ast_propagate(thread);
+		} else {
+			processor_t processor;
+
+			thread_lock(thread);
+			thread_ast_set(thread, AST_SYNTHESIZE_MACH);
+			processor = thread->last_processor;
+			if (processor != PROCESSOR_NULL &&
+			    processor->state == PROCESSOR_RUNNING &&
+			    processor->active_thread == thread) {
+				cause_ast_check(processor);
+			}
+			thread_unlock(thread);
+		}
+	};
+	splx(s);
+
+	task_unlock(task);
+}

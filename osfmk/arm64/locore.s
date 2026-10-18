@@ -26,6 +26,8 @@
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
+#define MACH_KERNEL_PRIVATE 1
+
 #include <machine/asm.h>
 #include <arm64/machine_machdep.h>
 #include <arm64/machine_routines_asm.h>
@@ -41,6 +43,7 @@
 #if __ARM_KERNEL_PROTECT__
 #include <arm/pmap.h>
 #endif
+
 
 // If __ARM_KERNEL_PROTECT__, eret is preceeded by an ISB before returning to userspace.
 // Otherwise, use BIT_ISB_PENDING flag to track that we need to issue an isb before eret if needed.
@@ -228,6 +231,14 @@ Lbegin_panic_lockdown_continue_\@:
  * This may mutate x18.
  */
 .macro BRANCH_TO_KVA_VECTOR
+#if HAS_MTE
+	/*
+	 * PSTATE.TCO (Tag Check Override) is automatically set by the architecture
+	 * whenever an exception is taken. TCO disables tag checking, so we want to
+	 * restore it ahead of servicing the exception.
+	 */
+	msr		TCO, #0
+#endif /* HAS_MTE */
 
 #if __ARM_KERNEL_PROTECT__
 	/*
@@ -247,6 +258,106 @@ Lbegin_panic_lockdown_continue_\@:
 	b		$0
 #endif /* __ARM_KERNEL_PROTECT__ */
 .endmacro
+
+/*
+ * SOP_DEBUG: Enable exception ring buffer for debugging stack overflow protection.
+ * Define and set to 1 to enable (export CFLAGS_EXTRA=-DSOP_DEBUG=1)
+ */
+
+#if SOP_DEBUG
+/*
+ * CAPTURE_EXCEPTION_RING
+ *
+ * Captures exception state to a ring buffer for debugging.
+ * This allows us to see the original exception even if nested exceptions occur
+ * and clobber ESR_EL1/FAR_EL1/ELR_EL1.
+ *
+ * Must be called very early in exception entry before any faulting memory accesses.
+ *
+ * Parameters:
+ *   sp_sel - exception source identifier:
+ *     0 = SP0 synchronous
+ *     1 = SP1 synchronous
+ *     2 = SP0 IRQ
+ *     3 = SP0 FIQ
+ *     4 = SP0 SError
+ *     5 = SPTM SP0 IRQ
+ *     6 = SPTM SP0 FIQ
+ *     7 = SP1 IRQ
+ *     8 = SP1 FIQ
+ *     9 = SP1 SError
+ *
+ * Expects:
+ *   {x0, x1} - saved on exception stack (sp)
+ *   sp - exception stack pointer
+ *
+ * Clobbers:
+ *   x0, x1, x2, x3 (x2, x3 are saved/restored internally)
+ *
+ * Returns:
+ *   x0, x1 - still saved on exception stack
+ *   x2, x3 - restored to original values
+ */
+.macro CAPTURE_EXCEPTION_RING sp_sel
+	stp		x2, x3, [sp, #-16]!					// Save x2, x3 for temporary use
+
+	/*
+	 * Write ring buffer entry using only x0-x3 as scratch.
+	 * We must NOT clobber x4+ because they hold the interrupted code's
+	 * live register values, which will be saved to the exception frame
+	 * later by SPILL_REGISTERS.
+	 *
+	 * Strategy: compute the entry pointer in x0, then re-read exception
+	 * state from system registers directly into the ring buffer entry.
+	 */
+
+	/* Compute &sop_exception_ring[index] in x0 */
+	adrp	x0, EXT(sop_exception_ring_index)@page
+	add		x0, x0, EXT(sop_exception_ring_index)@pageoff
+
+	/* Advance the index accounting for potential races */
+1:
+	ldxr		w1, [x0]						// w1 = current index
+
+	/* Increment and store updated index (modulo 16) */
+	add		w2, w1, #1
+	and		w2, w2, #SOP_EXCEPTION_RING_INDEX_MASK			// Wrap at SOP_EXCEPTION_RING_SIZE entries
+	stxr		w3, w2, [x0]						// Store updated index
+	cbnz		w3, 1b
+
+	/* Calculate entry address: base + index * sizeof(sop_exception_snapshot_t) */
+	adrp	x0, EXT(sop_exception_ring)@page
+	add		x0, x0, EXT(sop_exception_ring)@pageoff
+	mov		x2, #SOP_EXCEPTION_SNAPSHOT_SIZE
+	madd	x0, x1, x2, x0							// x0 = &sop_exception_ring[index]
+
+	/* Re-read and store exception state to ring buffer entry */
+	mrs		x1, ESR_EL1
+	str		x1, [x0, #0]						// esr
+	mrs		x1, FAR_EL1
+	str		x1, [x0, #8]						// far
+	mrs		x1, ELR_EL1
+	str		x1, [x0, #16]						// elr
+	mrs		x1, SPSR_EL1
+	str		x1, [x0, #24]						// spsr
+	mrs		x1, SP_EL0
+	str		x1, [x0, #32]						// sp
+	mrs		x1, TPIDR_EL1
+	str		x1, [x0, #40]						// tpidr (thread pointer)
+
+	/* Get timestamp */
+	isb									// Ensure instruction stream sync
+	mrs		x1, CNTVCT_EL0						// Read timer
+	str		x1, [x0, #48]						// timestamp
+
+	/* Store flags with SP selector */
+	mov		x1, #\sp_sel
+	str		x1, [x0, #56]						// flags (bit 0 = SP1)
+
+	/* Restore registers */
+	ldp		x2, x3, [sp], #16					// Restore x2, x3
+.endmacro
+#endif /* SOP_DEBUG */
 
 /*
  * CHECK_KERNEL_STACK
@@ -531,19 +642,89 @@ Lkernel_stack_valid:
 	mov		x2, #(FLEH_DISPATCH64_OPTION_SYNC_EXCEPTION)
 	b		fleh_dispatch64
 
+/*
+ * Headroom (in bytes) subtracted from SP when checking whether the exception
+ * context would cross into the unmapped redzone page.  The value was chosen
+ * empirically from analysis of core files where we overflowed the kernel stack;
+ * it accounts for additional stack growth that can occur during preemption on
+ * the exception return path.
+ */
+#define REDZONE_HEADROOM	3600
+
+/*
+ * EL1_SP0_REDZONE_CHECK
+ *
+ * Check if pushing the exception context would cross a page boundary
+ * and map the redzone page if needed. Used by IRQ and FIQ vectors to
+ * survive potential stack overflows.
+ *
+ * Fast path: if SP_EL0 and SP_EL0-REDZONE_HEADROOM are on the same 16K page,
+ * skip the redzone check entirely.
+ *
+ * Slow path: branch to fleh_check_map_redzone which saves all registers
+ * via SPILL_REGISTERS (including PAC signing) before doing any stack
+ * frame operations, then branches back to where it was called to avoid
+ * disturbing the original LR.
+ *
+ * Parameters:
+ *   sp_sel - exception source identifier for CAPTURE_EXCEPTION_RING
+ *
+ * Expects:
+ *   sp - exception stack pointer (SP1)
+ */
+.macro EL1_SP0_REDZONE_CHECK sp_sel
+	stp		x0, x1, [sp, #-16]!				// Save x0, x1 on exception stack
+
+#if SOP_DEBUG
+	CAPTURE_EXCEPTION_RING sp_sel=\sp_sel
+#endif
+
+	mrs		x0, SP_EL0					// x0 = kernel stack pointer
+	sub		x1, x0, #REDZONE_HEADROOM			// x1 = SP with preemption headroom
+	eor		x0, x0, x1					// XOR current SP with adjusted SP
+	tst		x0, #~PAGE_MASK					// Test if different pages
+	b.eq		Lel1_sp0_redzone_fastpath_\@			// Same page -> fast path
+
+	/*
+	 * Slow path: check/map redzone.
+	 * Skip redzone mapping if preemption is disabled (e.g. possibly in SPTM context)
+	 */
+	mrs		x0, TPIDR_EL1
+	ldr		w0, [x0, ACT_PREEMPT_CNT]
+	cbnz		w0, Lel1_sp0_redzone_done_\@			// Preemption disabled, skip redzone
+
+	/* Pass done-label address in x0, PAC-signed with SP as modifier */
+	adr		x0, Lel1_sp0_redzone_done_\@
+#if __has_feature(ptrauth_calls)
+	pacia		x0, sp
+#endif
+	b		EXT(fleh_check_map_redzone)
+
+Lel1_sp0_redzone_done_\@:
+	ARM64_JUMP_TARGET
+Lel1_sp0_redzone_fastpath_\@:
+	ldp		x0, x1, [sp], #16				// Restore x0, x1 from exception stack
+.endmacro
+
 el1_sp0_irq_vector_long:
+#if CONFIG_SPTM
+	EL1_SP0_REDZONE_CHECK sp_sel=2
+#endif
 	EL1_SP0_VECTOR
 	EL1_SP0_VECTOR_SWITCH_TO_INT_STACK
-	adrp	x1, EXT(fleh_irq)@page					// Load address for fleh
+	adrp		x1, EXT(fleh_irq)@page				// Load address for fleh
 	add		x1, x1, EXT(fleh_irq)@pageoff
 	mov		x2, #(FLEH_DISPATCH64_OPTION_NONE)
 	b		fleh_dispatch64
 
 el1_sp0_fiq_vector_long:
 	// ARM64_TODO write optimized decrementer
+#if CONFIG_SPTM
+	EL1_SP0_REDZONE_CHECK sp_sel=3
+#endif
 	EL1_SP0_VECTOR
 	EL1_SP0_VECTOR_SWITCH_TO_INT_STACK
-	adrp	x1, EXT(fleh_fiq)@page					// Load address for fleh
+	adrp		x1, EXT(fleh_fiq)@page				// Load address for fleh
 	add		x1, x1, EXT(fleh_fiq)@pageoff
 	mov		x2, #(FLEH_DISPATCH64_OPTION_NONE)
 	b		fleh_dispatch64
@@ -745,12 +926,24 @@ el1_sp1_serror_vector_long:
 #if HAS_ARM_FEAT_SME
 	str		x2, [sp, SS64_X2]
 	// current_thread()->machine.umatrix_hdr == NULL: this thread has never
-	// executed smstart, so no SME state to save
+	// executed a matrix instruction, so no matrix state to save
 	add		x0, x1, ACT_UMATRIX_HDR
 	ldr		x2, [x0]
 	cbz		x2, 1f
 	AUTDA_DIVERSIFIED x2, address=x0, diversifier=ACT_UMATRIX_HDR_DIVERSIFIER
 
+
+	adrp	x0, EXT(sme_version)@page
+	add		x0, x0, EXT(sme_version)@pageoff
+	ldr		w0, [x0]
+	cbz		w0, 1f
+
+	adrp	x0, EXT(sme_state_hdr)@page
+	add		x0, x0, EXT(sme_state_hdr)@pageoff
+	ldr		x0, [x0]
+	str		x0, [x2]
+	rdsvl	x0, #1
+	strh	w0, [x2, SME_SVL_B]
 	mrs		x0, SVCR
 	str		x0, [x2, SME_SVCR]
 	// SVCR.SM == 0: save SVCR only (ZA is handled during context-switch)
@@ -884,6 +1077,35 @@ fleh_dispatch64:
 
 
 2:
+#if HAS_MTE
+	/*
+	 * Exception came from userspace, so there's some gatekeeping that we
+	 * have to do for MTE. First of all, we need to generate a new seed value
+	 * for RGSR_EL1.SEED. Hidra pseudo-random generator for tags is weak, which
+	 * may allow an attacker observing a short sequence of tags to predict the
+	 * rest of it. We therefore restore it as often as possible at context
+	 * switch, reseeding it with another source of randomness.
+	 */
+#if NEEDS_MTE_IRG_RESEED
+	PACGA_IRG_RESEED x2, x3, x4
+#endif
+
+	/*
+	 * IRG default exclude mask. GCR_EL1 allows to exclude certain tags from
+	 * the selection options for any IRG execution. We want to exclude
+	 * 0 in userspace and F in the kernel as they match the canonical tags.
+	 * GCR_EL1 modifications require a CSE, but we do not want to impact
+	 * speculative performance wins here, so we simply set the register
+	 * and let the operation go. IRG calls in the kernel force the F tag
+	 * out with GMI, so this is mostly to recapture the ability to
+	 * use tag 0. In the very vast majority of cases, this path will commit
+	 * before we get to an IRG.
+	 */
+	eor		x4, x4, x4
+	mov		x4, #(GCR_EL1_RRND_ASM)
+	orr		x4, x4, #(GCR_EL1_EXCLUDE_TAGS_KERNEL)
+	msr		GCR_EL1, x4
+#endif /* HAS_MTE */
 
 	mov		x2, #0
 	mov		x3, #0
@@ -1220,6 +1442,161 @@ fleh_invalid_stack:
 	b 		.
 	UNWIND_EPILOGUE
 
+#if CONFIG_SPTM
+/*
+ * Check if we need to map the redzone stack page and map it if necessary.
+ * Branched to (not called) from IRQ/FIQ exception vectors when SP is
+ * approaching the redzone.
+ *
+ * On entry:
+ *   x0 = address of continue label to branch to on exit
+ *   sp (SP1) -> [saved_x0, saved_x1] pushed by EL1_SP0_REDZONE_CHECK
+ *
+ * On exit:
+ *   Branches to continue label with sp (SP1) -> [saved_x0, saved_x1]
+ *   (x0/x1 restored by the caller at the continue label)
+ */
+	.text
+	.align 2
+	.global EXT(fleh_check_map_redzone)
+LEXT(fleh_check_map_redzone)
+	/*
+	 * Save the continue address on SP1, then recover original x0/x1
+	 * from the macro's save area so we can spill the real register state.
+	 */
+	str		x0, [sp, #-16]!					// Push continue_addr on SP1
+	ldp		x0, x1, [sp, #16]				// Restore original x0/x1 from macro's save
+
+	/*
+	 * Save full exception state on SP1 using SPILL_REGISTERS.
+	 * This PAC-signs the thread state BEFORE any unsigned LR
+	 * is pushed to the stack, preventing a potential PAC byass.
+	 */
+	sub		sp, sp, ARM_CONTEXT_SIZE			// Allocate exception frame on SP1
+	stp		x0, x1, [sp, SS64_X0]				// Save x0, x1
+	stp		x2, x3, [sp, SS64_X2]				// Save x2, x3
+	mrs		x0, SP_EL0					// Get interrupted kernel SP
+	str		x0, [sp, SS64_SP]				// Save SP to exception frame
+	INIT_SAVED_STATE_FLAVORS sp, w0, w1
+	mov		x0, sp						// x0 = saved state pointer
+
+	/* Save all remaining registers and PAC-sign the thread state */
+	SPILL_REGISTERS KERNEL_MODE
+
+	/* x0 still points to saved state; x20 = FAR, x21 = ESR, x22 = ELR, x23 = SPSR */
+
+	/*
+	 * Use x20 as our saved-state base pointer across PUSH_FRAME,
+	 * since x20 is callee-saved and already spilled by SPILL_REGISTERS.
+	 */
+	mov		x20, x0
+
+	/* Now it is safe to create a stack frame for the C call */
+	PUSH_FRAME
+
+	/* Check if we have a valid thread */
+	mrs		x1, TPIDR_EL1
+	cbz		x1, Lfleh_check_map_redzone_skip
+
+	/* Get kernel stack bottom */
+	ldr		x2, [x1, TH_KERNEL_STACK]
+	cbz		x2, Lfleh_check_map_redzone_skip
+
+	/* Calculate redzone bounds */
+	sub		x3, x2, #PAGE_SIZE				// x3 = redzone page base
+
+	/*
+	 * Check if SP - REDZONE_HEADROOM would fall in unmapped redzone
+	 * [redzone_bottom, stack_bottom).
+	 */
+	ldr		x5, [x20, SS64_SP]				// x5 = interrupted SP (from saved state)
+	sub		x5, x5, #REDZONE_HEADROOM			// x5 = SP - headroom
+
+	cmp		x5, x3						// if (adjusted SP < redzone bottom)
+	b.lt	Lfleh_check_map_redzone_skip				//    too far down, skip
+	cmp		x5, x2						// if (adjusted SP >= stack bottom)
+	b.ge	Lfleh_check_map_redzone_skip				//    in mapped stack, skip
+
+	/* Map the redzone page */
+	mov		x0, x3						// x0 = redzone page base
+	bl		EXT(sop_try_map_redzone_page)
+
+Lfleh_check_map_redzone_skip:
+	/* Tear down the C call frame */
+	POP_FRAME_WITHOUT_LR
+
+	/*
+	 * Restore state with PAC verification.
+	 * AUTH_THREAD_STATE_IN_X0 loads and authenticates PC, CPSR, x16, x17, LR
+	 * from the saved state via ml_check_signed_state.
+	 *
+	 * Note: AUTH_THREAD_STATE_IN_X0 switches from SP1 to SP0 internally.
+	 * We must switch back to SP1 afterward since our saved state frame is there.
+	 */
+	mov		x0, sp
+	AUTH_THREAD_STATE_IN_X0 x20, x21, x22, x23, x24, x25, el0_state_allowed=1
+
+	/* Switch back to SP1 where our saved state frame lives */
+	msr		SPSel, #1
+
+	/* Restore ELR and SPSR from authenticated values */
+	msr		ELR_EL1, x1
+	msr		SPSR_EL1, x2
+
+	/* Restore NEON state */
+	ldr		w3, [x0, NS64_FPSR]
+	ldr		w4, [x0, NS64_FPCR]
+	msr		FPSR, x3
+	msr		FPCR, x4
+	ldp		q0, q1, [x0, NS64_Q0]
+	ldp		q2, q3, [x0, NS64_Q2]
+	ldp		q4, q5, [x0, NS64_Q4]
+	ldp		q6, q7, [x0, NS64_Q6]
+	ldp		q8, q9, [x0, NS64_Q8]
+	ldp		q10, q11, [x0, NS64_Q10]
+	ldp		q12, q13, [x0, NS64_Q12]
+	ldp		q14, q15, [x0, NS64_Q14]
+	ldp		q16, q17, [x0, NS64_Q16]
+	ldp		q18, q19, [x0, NS64_Q18]
+	ldp		q20, q21, [x0, NS64_Q20]
+	ldp		q22, q23, [x0, NS64_Q22]
+	ldp		q24, q25, [x0, NS64_Q24]
+	ldp		q26, q27, [x0, NS64_Q26]
+	ldp		q28, q29, [x0, NS64_Q28]
+	ldp		q30, q31, [x0, NS64_Q30]
+
+	/* Restore GPRs (x0/x1 deferred to continue label) */
+	ldp		x2, x3, [x0, SS64_X2]
+	ldp		x4, x5, [x0, SS64_X4]
+	ldp		x6, x7, [x0, SS64_X6]
+	ldp		x8, x9, [x0, SS64_X8]
+	ldp		x10, x11, [x0, SS64_X10]
+	ldp		x12, x13, [x0, SS64_X12]
+	ldp		x14, x15, [x0, SS64_X14]
+	/* x16, x17 already restored + authed by AUTH_THREAD_STATE_IN_X0 */
+	ldp		x18, x19, [x0, SS64_X18]
+	ldp		x20, x21, [x0, SS64_X20]
+	ldp		x22, x23, [x0, SS64_X22]
+	ldp		x24, x25, [x0, SS64_X24]
+	ldp		x26, x27, [x0, SS64_X26]
+	ldr		x28, [x0, SS64_X28]
+	ldr		fp, [x0, SS64_FP]
+	/* lr already restored + authed by AUTH_THREAD_STATE_IN_X0 */
+
+	/*
+	 * Deallocate exception frame and pop the continue address.
+	 * After this, sp -> [saved_x0, saved_x1] from the macro's original stp.
+	 * The continue label will restore those.
+	 */
+	add		sp, sp, ARM_CONTEXT_SIZE			// Deallocate exception frame
+	ldr		x0, [sp], #16					// x0 = PAC'd continue_addr
+#if __has_feature(ptrauth_calls)
+	braa		x0, sp						// Branch with authenticate to continue label
+#else
+	br		x0						// Branch to continue label
+#endif
+#endif /* CONFIG_SPTM */
+
 	.text
 	.align 2
 fleh_synchronous_sp1:
@@ -1432,7 +1809,11 @@ check_user_asts:
 #if MACH_ASSERT
 	ldr		w0, [x3, ACT_PREEMPT_CNT]
 	cbnz		w0, preempt_count_notzero			// Detect unbalanced enable/disable preemption
-#endif
+#if CONFIG_EXCLAVES
+	ldr		w0, [x3, TH_EXCLAVES_STATE]
+	cbnz		w0, th_exclaves_state_notzero
+#endif /* CONFIG_EXCLAVES */
+#endif /* MACH_ASSERT */
 
 	msr		DAIFSet, #DAIFSC_ALL				// Disable exceptions
 	ldr		x4, [x3, ACT_CPUDATAP]				// Get current CPU data pointer
@@ -1517,10 +1898,6 @@ no_asts:
 L_skip_user_set_debug_state:
 
 
-	ldrsh	x0, [x4, CPU_TPIDR_EL0]
-	msr		TPIDR_EL0, x0
-
-
 	b		exception_return_unint_tpidr_x3
 
 exception_return:
@@ -1543,9 +1920,10 @@ exception_return_unint_tpidr_x3:
 	 * It's also unconditionally skipped for translated threads,
 	 * as those are another use case, one where x18 must be preserved.
 	 */
-	ldr		w0, [x3, TH_ARM_MACHINE_FLAGS]
+
 	mov		x18, #0
-	tbz		w0, ARM_MACHINE_THREAD_PRESERVE_X18_SHIFT, Lexception_return_restore_registers
+	mrs		x1, TPIDR_EL0
+	tbz		x1, MACHDEP_TPIDR_FLAG_PRESERVE_X18_SHIFT, Lexception_return_restore_registers
 
 exception_return_unint_tpidr_x3_restore_x18:
 	ldr		x18, [sp, SS64_X18]
@@ -1639,6 +2017,24 @@ Lskip_restore_neon_saved_state:
 #endif
 
 
+#if HAS_MTE
+#if NEEDS_MTE_IRG_RESEED
+	PACGA_IRG_RESEED x2, x3, x4
+#endif
+	// Switch GCR_EL1 Exclude Tag Mask to the userland one.
+	mrs             x2, SPSR_EL1
+	and             x2, x2, #(PSR64_MODE_EL_MASK)
+	cmp             x2, #(PSR64_MODE_EL0)
+	bne             Lno_gcr_mask_el0_reset
+	eor		x2, x2, x2
+	mov		x2, #(GCR_EL1_RRND_ASM)
+	orr		x2, x2, #(GCR_EL1_EXCLUDE_TAGS_USER)
+	msr		GCR_EL1, x2
+#if ERET_NEEDS_ISB
+	orr		x5, x5, #(1 << BIT_ISB_PENDING)
+#endif /* ERET_NEEDS_ISB */
+Lno_gcr_mask_el0_reset:
+#endif /* HAS_MTE */
 	// If sync_on_cswitch and ERET is not a CSE, issue an ISB now. Unconditionally clear the
 	// sync_on_cswitch flag.
 	mrs		x1, TPIDR_EL1
@@ -1757,6 +2153,14 @@ preempt_count_notzero:
 	str		w0, [sp, #8]
 	adr		x0, L_preempt_count_notzero_str				// Format string
 	CALL_EXTERN panic							// Game over
+
+#if CONFIG_EXCLAVES
+th_exclaves_state_notzero:
+	PUSH_FRAME
+	bl		EXT(exclaves_assert_invalid_th_exclaves_state)
+	brk		#0
+	/* Unreachable */
+#endif /* CONFIG_EXCLAVES */
 
 L_preempt_count_notzero_str:
 	.asciz "preemption count not 0 on thread %p (%u)"

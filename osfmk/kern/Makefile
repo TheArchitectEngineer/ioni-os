@@ -39,10 +39,13 @@ PRIVATE_DATAFILES = $(sort \
 	debug.h \
 	panic_call.h \
 	ecc.h \
+	llc_error.h \
 	lock_stat.h \
 	monotonic.h \
 	remote_time.h \
 	restartable.h \
+	stackshot_kpi.h \
+	telemetry.h \
 	trustcache.h \
 	turnstile.h \
 	socd_client.h \
@@ -107,7 +110,6 @@ EXPORT_FILES = \
 	startup.h \
 	task.h \
 	task_ref.h \
-	telemetry.h \
 	trap_telemetry.h \
 	thread.h \
 	thread_call.h \
@@ -129,6 +131,7 @@ PRIVATE_EXPORT_FILES = \
 	smr.h \
 	smr_hash.h \
 	socd_client_kern.h \
+	stackshot_kpi.h \
 	task_ident.h \
 	ticket_lock.h \
 	zalloc_ro_shim.h
@@ -138,6 +141,8 @@ XNU_ONLY_EXPORTS = \
 	arcade.h \
 	btlog.h \
 	cpc.h \
+	cpc_private.h \
+	host_statistics.h \
 	iotrace.h \
 	ipc_kobject.h \
 	lock_ptr.h \
@@ -171,30 +176,6 @@ EXPORT_MI_LIST = $(sort ${INSTALL_KF_MI_LIST} ${INSTALL_KF_MI_LCL_LIST} ${XNU_ON
 
 EXPORT_MI_DIR = kern
 
-# build support for tightbeamc-generated files
-
-ifeq ($(XNU_CONFIG_TIGHTBEAM),1)
-TIGHTBEAM_FILES := \
-	exclaves_conclave_launcher.tightbeam \
-	exclaves_log.tightbeam \
-	exclaves_upcalls.tightbeam \
-	exclaves_upcalls_v2.tightbeam \
-	exclaves_frame_mint.tightbeam \
-	exclaves_xnuproxy.tightbeam
-
-TIGHTBEAM_MODULES := \
-	ExclaveIndicatorController.tbmodule \
-	StackshotTypes.tbmodule \
-	Stackshot.tbmodule \
-	SharedMemoryBase.tbmodule \
-	ExclavesCHelloServer.tbmodule \
-	HelloDriverInterrupts.tbmodule \
-	StackshotPanicSetup.tbmodule \
-	ExclaveAudioArbiter.tbmodule \
-	ExclavesMessageQueueTypes.tbmodule \
-	ExclavesMessageQueueProxy.tbmodule
-
-endif
 
 # This makes sure to not include any tbmodules which don't exist in the SDK and
 # expand the modules listed above to their full path in the SDK. The modules
@@ -221,6 +202,7 @@ $(TIGHTBEAM_COMBINED_IMPL) : $(TIGHTBEAM_FILES) $(TIGHTBEAM_MODULES)
 	$(_v)$(TIGHTBEAMC) build generate-c --output-base $@ --codegen-version 2 $^
 
 $(TIGHTBEAM_COMBINED_HDR) : $(TIGHTBEAM_COMBINED_IMPL)
+
 
 do_build_all:: $(COMP_FILES)
 

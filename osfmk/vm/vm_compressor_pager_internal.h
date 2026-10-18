@@ -67,13 +67,16 @@ __enum_closed_decl(vm_decompress_result_t, int, {
 	DECOMPRESS_NEED_BLOCK = -2,
 	DECOMPRESS_FIRST_FAIL_CODE = -3,
 	DECOMPRESS_FAILED_BAD_Q = -3,
-	DECOMPRESS_FAILED_BAD_Q_FREEZE = -4,
-	DECOMPRESS_FAILED_ALGO_ERROR = -5,
-	DECOMPRESS_FAILED_WKDMD_POPCNT = -6,
-	DECOMPRESS_FAILED_UNMODIFIED = -7,
+	DECOMPRESS_FAILED_ALGO_ERROR = -4,
+	DECOMPRESS_FAILED_WKDMD_POPCNT = -5,
+	DECOMPRESS_FAILED_UNMODIFIED = -6,
+#if HAS_MTE
+	DECOMPRESS_FAILED_TAGS = -7
+#endif /* HAS_MTE */
 });
 
 extern bool osenvironment_is_diagnostics(void);
+extern bool osenvironment_is_device_recovery(void);
 extern void vm_compressor_init(void);
 extern bool vm_compressor_is_slot_compressed(int *slot);
 extern kern_return_t vm_compressor_put(ppnum_t pn, int *slot, void **current_chead, char *scratch_buf, vm_compressor_options_t flags);

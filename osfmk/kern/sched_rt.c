@@ -44,26 +44,9 @@
 
 #include <machine/machine_routines.h>
 
-#ifdef KDBG_MACOS_RELEASE
-#define KTRC KDBG_MACOS_RELEASE
-#else
 #define KTRC KDBG_RELEASE
-#endif
 
 #pragma mark - Constants and Tunables
-
-#if (DEVELOPMENT || DEBUG || SCHED_TEST_HARNESS)
-#include <kern/startup.h>
-
-/*
- * Tunables controlling how xnu initializes the realtime matrix. CLPC can
- * override their effects with sched_perfcontrol interfaces.
- */
-
-TUNABLE(unsigned int, sched_rt_spill_policy, "sched_rt_spill_policy", 1);
-
-TUNABLE(unsigned, sched_rt_steal_policy, "sched_rt_steal_policy", 2);
-#endif /* (DEVELOPMENT || DEBUG || SCHED_TEST_HARNESS) */
 
 uint32_t rt_deadline_epsilon;
 uint32_t rt_constraint_threshold;
@@ -92,8 +75,6 @@ sched_set_rt_deadline_epsilon(int new_epsilon_us)
 }
 
 #pragma mark - Initialization
-
-static int sched_rt_max_clusters = 0;
 
 void
 sched_realtime_timebase_init(void)
@@ -129,37 +110,34 @@ sched_rt_config_pset_push(processor_set_t pset);
 static void
 rt_init_completed(void)
 {
-	/* This should be unified with sched_edge_max_clusters and moved to a common location. <rdar://145162647> */
-	sched_rt_max_clusters = ml_get_cluster_count();
-
 	/* Realtime spill/steal are only supported on platforms with the edge scheduler. */
 #if CONFIG_SCHED_EDGE
 	/* Hold sched_available_cores_lock to prevent multiple concurrent matrix updates. */
 	spl_t s = splsched();
 	simple_lock(&sched_available_cores_lock, LCK_GRP_NULL);
-	for (int src_cluster_id = 0; src_cluster_id < sched_rt_max_clusters; src_cluster_id++) {
-		processor_set_t src_pset = pset_array[src_cluster_id];
+	for (pset_id_t src_pset_id = 0; src_pset_id < sched_num_psets; src_pset_id++) {
+		processor_set_t src_pset = pset_array[src_pset_id];
 		assert3p(src_pset, !=, PROCESSOR_SET_NULL); /* all psets should be initialized */
 
 		/* For each cluster, set all its outgoing edge parameters */
-		for (int dst_cluster_id = 0; dst_cluster_id < sched_rt_max_clusters; dst_cluster_id++) {
-			if (dst_cluster_id == src_cluster_id) {
+		for (pset_id_t dst_pset_id = 0; dst_pset_id < sched_num_psets; dst_pset_id++) {
+			if (dst_pset_id == src_pset_id) {
 				continue;
 			}
-			processor_set_t dst_pset = pset_array[dst_cluster_id];
+			processor_set_t dst_pset = pset_array[dst_pset_id];
 			assert3p(dst_pset, !=, PROCESSOR_SET_NULL); /* all psets should be initialized */
 
 			bool clusters_homogenous = (src_pset->pset_type == dst_pset->pset_type);
 			if (clusters_homogenous) {
 				/* Default realtime policy: spill allowed among homogeneous psets. */
-				sched_rt_config_set((pset_id_t) src_cluster_id, (pset_id_t) dst_cluster_id, (sched_clutch_edge) {
+				sched_rt_config_set((pset_id_t) src_pset_id, (pset_id_t) dst_pset_id, (sched_clutch_edge) {
 					.sce_migration_allowed = true,
 					.sce_steal_allowed = true,
 					.sce_migration_weight = 0,
 				});
 			} else {
 				/* Default realtime policy: disallow spill among heterogeneous psets. */
-				sched_rt_config_set((pset_id_t) src_cluster_id, (pset_id_t) dst_cluster_id, (sched_clutch_edge) {
+				sched_rt_config_set((pset_id_t) src_pset_id, (pset_id_t) dst_pset_id, (sched_clutch_edge) {
 					.sce_migration_allowed = false,
 					.sce_steal_allowed = false,
 					.sce_migration_weight = 0,
@@ -168,8 +146,58 @@ rt_init_completed(void)
 		}
 	}
 
+#if HAS_MCORE
+	pset_node_t p_node = pset_node_for_pset_type(PSET_AMP_P);
+	pset_node_t m_node = pset_node_for_pset_type(PSET_AMP_M);
 
-	for (pset_id_t pset_id = 0; pset_id < sched_rt_max_clusters; pset_id++) {
+	/* Disallow spill/steal between M psets. */
+	foreach_pset_id(src_pset_id, m_node) {
+		foreach_pset_id(dst_pset_id, m_node) {
+			if (src_pset_id == dst_pset_id) {
+				continue;
+			}
+			sched_rt_config_set((pset_id_t)src_pset_id, (pset_id_t)dst_pset_id, (sched_clutch_edge) {
+				.sce_migration_allowed = false,
+				.sce_steal_allowed = false,
+				.sce_migration_weight = 0,
+			});
+		}
+	}
+
+	/* Identify a "reserve" pset for the system to run on when P-recommended
+	 * realtime threads spill. */
+	pset_id_t reserve_pset_id = PSET_ID_INVALID;
+
+	if (!pset_node_is_empty(m_node)) {
+		/* Choose an M pset to be the reserve pset. We should choose the same
+		 * pset as sched_edge_cpu_init_completed() uses for a low-M performance
+		 * island. */
+		reserve_pset_id = (pset_id_t)lsb_first(m_node->pset_map);
+	}
+
+
+	foreach_pset_id(src_pset_id, p_node) {
+		foreach_pset_id(dst_pset_id, m_node) {
+			if (dst_pset_id == reserve_pset_id) {
+				/* Spill is already disallowed because the psets are heterogeneous. */
+				continue;
+			}
+			/* Allow bi-directional steal. */
+			sched_rt_config_set((pset_id_t)src_pset_id, (pset_id_t)dst_pset_id, (sched_clutch_edge) {
+				.sce_migration_allowed = true,
+				.sce_steal_allowed = true,
+				.sce_migration_weight = 1,
+			});
+			sched_rt_config_set((pset_id_t)dst_pset_id, (pset_id_t)src_pset_id, (sched_clutch_edge) {
+				.sce_migration_allowed = true, /* allow migration so followup-spill IPIs work */
+				.sce_steal_allowed = true,
+				.sce_migration_weight = 0,
+			});
+		}
+	}
+#endif /* HAS_MCORE */
+
+	for (pset_id_t pset_id = 0; pset_id < sched_num_psets; pset_id++) {
 		sched_rt_config_pset_push(pset_array[pset_id]);
 	}
 
@@ -266,12 +294,12 @@ sched_rt_config_pset_push(processor_set_t pset)
 
 	sched_pset_search_order_sort_data_t spill_datas[MAX_PSETS - 1], steal_datas[MAX_PSETS - 1];
 	uint num_spill_datas = 0, num_steal_datas = 0;
-	for (pset_id_t other_pset_id = 0; other_pset_id < sched_rt_max_clusters; other_pset_id++) {
+	for (pset_id_t other_pset_id = 0; other_pset_id < sched_num_psets; other_pset_id++) {
 		if (pset->pset_id == other_pset_id) {
 			continue; /* No self-edges. */
 		}
 		/* Spill */
-		sched_clutch_edge out_edge = sched_rt_config_get((pset_id_t)pset->pset_cluster_id, other_pset_id);
+		sched_clutch_edge out_edge = sched_rt_config_get((pset_id_t)pset->pset_id, other_pset_id);
 		if (out_edge.sce_migration_allowed) {
 			spill_datas[num_spill_datas++] = (sched_pset_search_order_sort_data_t) {
 				.spsosd_src_pset = pset,
@@ -280,7 +308,7 @@ sched_rt_config_pset_push(processor_set_t pset)
 			};
 		}
 		/* Steal */
-		sched_clutch_edge in_edge = sched_rt_config_get(other_pset_id, (pset_id_t)pset->pset_cluster_id);
+		sched_clutch_edge in_edge = sched_rt_config_get(other_pset_id, (pset_id_t)pset->pset_id);
 		if (in_edge.sce_steal_allowed) {
 			steal_datas[num_steal_datas++] = (sched_pset_search_order_sort_data_t) {
 				.spsosd_src_pset = pset,
@@ -652,11 +680,9 @@ sched_rt_init_completed(void)
 }
 
 void
-sched_rt_queue_shutdown(processor_t processor)
+sched_rt_queue_shutdown(processor_t processor, struct pulled_thread_queue * threadq)
 {
 	processor_set_t pset = processor->processor_set;
-	thread_t        thread;
-	queue_head_t    tqueue;
 
 	pset_lock(pset);
 
@@ -666,25 +692,13 @@ sched_rt_queue_shutdown(processor_t processor)
 		return;
 	}
 
-	queue_init(&tqueue);
-
 	while (rt_runq_count(pset) > 0) {
-		thread = rt_runq_dequeue(&pset->rt_runq);
-		enqueue_tail(&tqueue, &thread->runq_links);
+		thread_t thread = rt_runq_dequeue(&pset->rt_runq);
+		pulled_thread_queue_enqueue(threadq, thread);
 	}
-	sched_update_pset_load_average(pset, 0);
+	SCHED(update_pset_load_average)(pset, 0);
 	pset_update_rt_stealable_state(pset);
 	pset_unlock(pset);
-
-	qe_foreach_element_safe(thread, &tqueue, runq_links) {
-		remqueue(&thread->runq_links);
-
-		thread_lock(thread);
-
-		thread_setrun(thread, SCHED_TAILQ);
-
-		thread_unlock(thread);
-	}
 }
 
 /*
@@ -696,7 +710,7 @@ sched_rt_runq_scan(sched_update_scan_context_t scan_context)
 {
 	thread_t        thread;
 
-	pset_node_t node = &pset_node0;
+	pset_node_t node = sched_boot_pset_node;
 	processor_set_t pset = node->psets;
 
 	spl_t s = splsched();
@@ -732,7 +746,7 @@ sched_rt_runq_scan(sched_update_scan_context_t scan_context)
 int64_t
 sched_rt_runq_count_sum(void)
 {
-	pset_node_t node = &pset_node0;
+	pset_node_t node = sched_boot_pset_node;
 	processor_set_t pset = node->psets;
 	int64_t count = 0;
 
@@ -1201,7 +1215,7 @@ rt_clear_pending_spill(processor_t processor, int reason)
 void
 check_rt_runq_consistency(rt_queue_t rt_run_queue, thread_t thread)
 {
-	bitmap_t *map = rt_run_queue->bitmap;
+	__assert_only bitmap_t *map = rt_run_queue->bitmap;
 
 	uint64_t earliest_deadline = RT_DEADLINE_NONE;
 	uint32_t constraint = RT_CONSTRAINT_NONE;

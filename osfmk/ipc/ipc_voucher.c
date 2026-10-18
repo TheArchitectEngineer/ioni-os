@@ -1188,6 +1188,13 @@ ipc_execute_voucher_recipe_command(
 		}
 		break;
 
+#ifdef __BUILDING_XNU_LIB_UNITTEST__
+	case MACH_VOUCHER_ATTR_UNIT_TEST_VECTOR_ALLOWED:
+	case MACH_VOUCHER_ATTR_UNIT_TEST_VECTOR_DISALLOWED:
+		/* Nothing to do... */
+		break;
+#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
+
 	/*
 	 * MACH_VOUCHER_ATTR_SET_VALUE_HANDLE
 	 *	Use key-privilege to set a value handle for the attribute directly,
@@ -1413,11 +1420,26 @@ ipc_create_mach_voucher_internal(
 	ipc_voucher_t prev_iv;
 	bool key_priv = false;
 	kern_return_t kr = KERN_SUCCESS;
+	ipc_space_t space = current_space();
+	ipc_space_policy_t pol = ipc_space_policy(space);
 
 	/* if nothing to do ... */
 	if (0 == recipe_size) {
 		*new_voucher = IV_NULL;
 		return KERN_SUCCESS;
+	}
+
+	/* Impose an upper bound on recipe size under ESv3 (in telemetry mode for now) */
+	if (ipc_should_apply_policy(pol, IPC_POLICY_ENHANCED_V3) &&
+	    recipe_size >= IPC_MACH_VOUCHER_RECIPE_SIZE_SOFT_LIMIT) {
+		ipc_triage_policy_violation_and_expect_continue(
+			IPC_SEC_POLICY_RESTRICT_VOUCHER_RECIPE_SIZE,
+			space,
+			0,
+			0,
+			0,
+			(int)recipe_size
+			);
 	}
 
 	/* allocate a voucher */
@@ -1446,6 +1468,23 @@ ipc_create_mach_voucher_internal(
 		if (is_user_recipe) {
 			sub_recipe_user =
 			    (mach_voucher_attr_recipe_t)(void *)&recipes[recipe_used];
+
+			/*
+			 * We'd like to restrict certain voucher operations from being used by ESv3 userspace.
+			 * As a first step towards this, emit telemetry when ESv3 userspace requests
+			 * an 'unexpected' voucher operation.
+			 */
+			if (ipc_should_apply_policy(pol, IPC_POLICY_ENHANCED_V3) &&
+			    !ipc_pol_is_user_voucher_command_permitted(sub_recipe_user->command)) {
+				ipc_triage_policy_violation_and_expect_continue(
+					IPC_SEC_POLICY_RESTRICT_VOUCHER_OPERATIONS,
+					space,
+					0,
+					0,
+					0,
+					(int)sub_recipe_user->command
+					);
+			}
 
 			if (recipe_size - recipe_used - recipe_struct_size <
 			    sub_recipe_user->content_size) {
@@ -2352,7 +2391,7 @@ mach_generate_activity_id(
 
 /* User data manager is removed on !macOS */
 #if CONFIG_VOUCHER_DEPRECATED
-#if defined(MACH_VOUCHER_ATTR_KEY_USER_DATA) || defined(MACH_VOUCHER_ATTR_KEY_TEST)
+#if defined(MACH_VOUCHER_ATTR_KEY_USER_DATA)
 
 /*
  * Build-in a simple User Data Resource Manager
@@ -2439,17 +2478,8 @@ const struct ipc_voucher_attr_manager user_data_manager = {
 };
 
 ipc_voucher_attr_control_t user_data_control;
-ipc_voucher_attr_control_t test_control;
 
-#if defined(MACH_VOUCHER_ATTR_KEY_USER_DATA) && defined(MACH_VOUCHER_ATTR_KEY_TEST)
-#define USER_DATA_ASSERT_KEY(key)                               \
-	assert(MACH_VOUCHER_ATTR_KEY_USER_DATA == (key) ||      \
-	       MACH_VOUCHER_ATTR_KEY_TEST == (key));
-#elif defined(MACH_VOUCHER_ATTR_KEY_USER_DATA)
 #define USER_DATA_ASSERT_KEY(key) assert(MACH_VOUCHER_ATTR_KEY_USER_DATA == (key))
-#else
-#define USER_DATA_ASSERT_KEY(key) assert(MACH_VOUCHER_ATTR_KEY_TEST == (key))
-#endif
 
 static void
 user_data_value_element_free(user_data_element_t elem)
@@ -2712,25 +2742,16 @@ __startup_func
 static void
 user_data_attr_manager_init(void)
 {
-#if defined(MACH_VOUCHER_ATTR_KEY_USER_DATA)
 	ipc_register_well_known_mach_voucher_attr_manager(&user_data_manager,
 	    (mach_voucher_attr_value_handle_t)0,
 	    MACH_VOUCHER_ATTR_KEY_USER_DATA,
 	    &user_data_control);
-#endif
-#if defined(MACH_VOUCHER_ATTR_KEY_TEST)
-	ipc_register_well_known_mach_voucher_attr_manager(&user_data_manager,
-	    (mach_voucher_attr_value_handle_t)0,
-	    MACH_VOUCHER_ATTR_KEY_TEST,
-	    &test_control);
-#endif
-#if defined(MACH_VOUCHER_ATTR_KEY_USER_DATA) || defined(MACH_VOUCHER_ATTR_KEY_TEST)
+
 	for (int i = 0; i < USER_DATA_HASH_BUCKETS; i++) {
 		queue_init(&user_data_bucket[i]);
 	}
-#endif
 }
 STARTUP(MACH_IPC, STARTUP_RANK_FIRST, user_data_attr_manager_init);
 
-#endif /* MACH_VOUCHER_ATTR_KEY_USER_DATA || MACH_VOUCHER_ATTR_KEY_TEST */
+#endif /* MACH_VOUCHER_ATTR_KEY_USER_DATA */
 #endif /* CONFIG_VOUCHER_DEPRECATED */

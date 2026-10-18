@@ -74,6 +74,7 @@
 #include <kern/sched_common.h>
 #include <kern/sched_urgency.h>
 #include <mach/sfi_class.h>
+#include <kern/circle_queue.h>
 #endif /* defined(MACH_KERNEL_PRIVATE) || SCHED_TEST_HARNESS */
 
 #ifdef  MACH_KERNEL_PRIVATE
@@ -156,17 +157,17 @@ typedef enum {
 } processor_state_t;
 
 typedef enum {
+#if __AMP__
+	PSET_AMP_E  = 0,
+	PSET_AMP_P  = 1,
+	PSET_AMP_M  = 2,
+#else /* !__AMP__*/
 	PSET_SMP    = 0,
-#if __AMP__
-	PSET_AMP_E  = 1,
-	PSET_AMP_P  = 2,
-#endif /* __AMP__ */
+#endif /* !__AMP__ */
 	MAX_PSET_TYPES,
-} pset_cluster_type_t;
+} pset_type_t;
 
 #if __AMP__
-
-#define MAX_AMP_CLUSTER_TYPES (MAX_PSET_TYPES - 1)
 
 typedef enum {
 	SCHED_PERFCTL_POLICY_DEFAULT,           /*  static policy: set at boot */
@@ -181,18 +182,43 @@ extern _Atomic sched_perfctl_class_policy_t sched_perfctl_policy_bg;
 
 typedef bitmap_t cpumap_t;
 
-#if __arm64__
+struct pulled_thread_queue {
+	circle_queue_head_t ptq_threadq;
+	cpumap_t ptq_needs_smr_cpu_down;
+	bool ptq_queue_active;
+};
 
-extern cluster_type_t pset_cluster_type_to_cluster_type(pset_cluster_type_t pset_cluster_type);
-extern pset_cluster_type_t cluster_type_to_pset_cluster_type(cluster_type_t cluster_type);
+extern __result_use_check struct pulled_thread_queue *
+pulled_thread_queue_prepare(void);
+
+/* Ensure the correct caller is blamed for preemption hygiene panics */
+__not_tail_called
+extern void
+pulled_thread_queue_flush(struct pulled_thread_queue * threadq);
+
+extern void
+pulled_thread_queue_enqueue(
+	struct pulled_thread_queue * threadq,
+	thread_t thread);
+
+extern void
+pulled_thread_queue_needs_smr_cpu_down(
+	struct pulled_thread_queue * threadq,
+	int cpu_id);
+
+#if __AMP__
+extern pset_type_t cluster_type_to_pset_type(cluster_type_t cluster_type);
+#endif /* __AMP__ */
+
+#if __arm64__
 
 /*
  * pset_execution_time_t
  *
  * The pset_execution_time_t type is used to maintain the average
- * execution time of threads on a pset. Since the avg. execution time is
- * updated from contexts where the pset lock is not held, it uses a
- * double-wide RMW loop to update these values atomically.
+ * execution time of threads on a pset, in us. Since the avg. execution
+ * time is updated from contexts where the pset lock is not held, it uses
+ * a double-wide RMW loop to update these values atomically.
  */
 typedef union {
 	struct {
@@ -205,22 +231,25 @@ typedef union {
 #endif /* __arm64__ */
 
 struct processor_set {
-	int                     pset_id;
+	pset_id_t               pset_id;    /* unique */
+	uint32_t                cluster_id;
 	int                     online_processor_count;
-	int                     cpu_set_low, cpu_set_hi;
-	int                     cpu_set_count;
+	/* Note: cpu_set_low, cpu_set_hi, and cpu_set_count are initialized late (in
+	 * processor_init()) and should not be used during boot. On AMP platforms,
+	 * cpu_bitmask is accurate at initialization. */
+	int                     cpu_set_low, cpu_set_hi, cpu_set_count;
 	int                     last_chosen;
 
 #if CONFIG_SCHED_EDGE
-	uint64_t                pset_load_average[TH_BUCKET_SCHED_MAX];
+	uint32_t                pset_load_average[TH_BUCKET_SCHED_MAX];
 	/*
 	 * Count of threads running or enqueued on the cluster (not including threads enqueued in a processor-bound runq).
 	 * Updated atomically per scheduling bucket, around the same time as pset_load_average
 	 */
 	uint32_t                pset_runnable_depth[TH_BUCKET_SCHED_MAX];
-#else /* !CONFIG_SCHED_EDGE */
-	uint64_t                load_average;
-#endif /* CONFIG_SCHED_EDGE */
+#elif __AMP__
+	int                     load_average;
+#endif /* !CONFIG_SCHED_EDGE && __AMP__ */
 	uint64_t                pset_load_last_update;
 	cpumap_t                cpu_bitmask;
 	cpumap_t                recommended_bitmask;
@@ -259,7 +288,7 @@ struct processor_set {
 
 	/* CPUs that have been sent an unacknowledged remote AST for scheduling purposes */
 	cpumap_t                pending_AST_URGENT_cpu_mask;
-	cpumap_t                pending_AST_PREEMPT_cpu_mask;
+	_Atomic cpumap_t        pending_AST_PREEMPT_cpu_mask;
 #if defined(CONFIG_SCHED_DEFERRED_AST)
 	/*
 	 * A separate mask, for ASTs that we may be able to cancel.  This is dependent on
@@ -282,37 +311,49 @@ struct processor_set {
 
 	processor_set_t         pset_list;              /* chain of associated psets */
 	pset_node_t             node;
-	uint32_t                pset_cluster_id;
 
 	/*
-	 * Currently the scheduler uses a mix of pset_cluster_type_t & cluster_type_t
-	 * for recommendations etc. It might be useful to unify these as a single type.
-	 */
-	pset_cluster_type_t     pset_cluster_type;
-	/*
-	 * For scheduler use only:
 	 * The type that this pset will be treated like for scheduling purposes
 	 */
-	cluster_type_t          pset_type;
+	pset_type_t             pset_type;
 
 #if CONFIG_SCHED_EDGE
-	cpumap_t                cpu_running_foreign;
-	cpumap_t                cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_COUNT];
-	sched_bucket_t          cpu_running_buckets[MAX_CPUS];
-
+	/*
+	 * Fields used by Clutch/Edge scheduler are protected by a combination of
+	 * atomics and the pset lock.
+	 * See the legend of field annotations below:
+	 *
+	 * (P): Reads/writes protected by the pset lock.
+	 * (A): Reads/writes done atomically.
+	 * (I): Safe to read unprotected because values are not updated
+	 *      after initialization.
+	 * (W): Reads/writes done atomically, but writes are only
+	 *      published with the pset lock held.
+	 */
+	/* (A) Map of CPUs running threads considered "foreign" relative to their current pset */
+	_Atomic cpumap_t        cpu_running_foreign;
+	/* (A) Map of CPUs running threads tagged as shared resource */
+	_Atomic cpumap_t        cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_COUNT];
+	/* (A) sched_bucket running on each CPU, as last observed by that CPU */
+	_Atomic sched_bucket_t          cpu_running_buckets[MAX_CPUS];
+	/* (I) Map of psets considered "foreign" relative to this pset */
 	bitmap_t                foreign_psets[BITMAP_LEN(MAX_PSETS)];
+	/* (I) Map of psets considered "native" relative to this pset */
 	bitmap_t                native_psets[BITMAP_LEN(MAX_PSETS)];
+	/* (I) Map of psets local on the same die as this pset */
 	bitmap_t                local_psets[BITMAP_LEN(MAX_PSETS)];
+	/* (I) Map of psets positioned on a remote die relative to this pset */
 	bitmap_t                remote_psets[BITMAP_LEN(MAX_PSETS)];
+	/* (A) Moving avg. execution time in ns for threads of each sched bucket that recently ran on this pset  */
 	pset_execution_time_t   pset_execution_time[TH_BUCKET_SCHED_MAX];
 	uint64_t                pset_cluster_shared_rsrc_load[CLUSTER_SHARED_RSRC_TYPE_COUNT];
+	/* (A) Edge matrix graph, encoding inter-pset migration policy */
 	_Atomic sched_clutch_edge       sched_edges[MAX_PSETS][TH_BUCKET_SCHED_MAX];
+	/* (A) Order in which to search other psets and break ties for spill policy */
 	sched_pset_search_order_t       spill_search_order[TH_BUCKET_SCHED_MAX];
-	/*
-	 * Recommended width of threads (one per core) or shared resource threads
-	 * (one per cluster), if this is the preferred pset.
-	 */
+	/* (I) Recommended width of threads (one per core) if this is the preferred pset */
 	uint8_t                 max_parallel_cores[TH_BUCKET_SCHED_MAX];
+	/* (I) Recommended width of shared resource threads (one per cluster) if this is the preferred pset */
 	uint8_t                 max_parallel_clusters[TH_BUCKET_SCHED_MAX];
 #endif /* CONFIG_SCHED_EDGE */
 
@@ -336,9 +377,6 @@ struct processor_set {
 #endif /* CONFIG_SCHED_SMT */
 };
 
-/* Boot (and default) pset */
-extern struct processor_set     pset0;
-
 typedef bitmap_t pset_map_t;
 
 struct pset_node {
@@ -346,9 +384,12 @@ struct pset_node {
 
 	pset_node_t             node_list;              /* chain of associated nodes */
 
-	pset_cluster_type_t     pset_cluster_type;      /* Same as the type of all psets in this node */
+	pset_type_t             pset_type;              /* Same as the type of all psets in this node */
 
 	pset_map_t              pset_map;               /* map of associated psets */
+
+	cpumap_t                cpu_map;                /* map of associated processors */
+
 	_Atomic pset_map_t      pset_idle_map;          /* psets with at least one IDLE CPU */
 	_Atomic pset_map_t      pset_non_rt_map;        /* psets with at least one available CPU not running a realtime thread */
 #if CONFIG_SCHED_SMT
@@ -357,22 +398,13 @@ struct pset_node {
 	_Atomic pset_map_t      pset_recommended_map;   /* psets with at least one recommended processor */
 };
 
-/* Boot pset node and head of the pset node linked list */
-extern struct pset_node pset_node0;
-
-#if __AMP__
+/* Returns true if the node contains no psets. */
+extern bool pset_node_is_empty(pset_node_t node);
 
 /* Boot pset node */
-#define pset_node0 (pset_nodes[0])
-extern struct pset_node pset_nodes[MAX_AMP_CLUSTER_TYPES];
-extern pset_node_t pset_node_for_pset_cluster_type(pset_cluster_type_t pset_cluster_type);
+extern pset_node_t sched_boot_pset_node;
 
-#else /* !__AMP__ */
-
-/* Boot pset node and head of the pset node linked list */
-extern struct pset_node pset_node0;
-
-#endif /* !__AMP__ */
+extern pset_node_t pset_node_for_pset_type(pset_type_t pset_type);
 
 extern queue_head_t tasks, threads, corpse_tasks;
 extern int tasks_count, terminated_tasks_count, threads_count, terminated_threads_count;
@@ -461,9 +493,9 @@ struct processor {
 	sfi_class_id_t          current_sfi_class;      /* SFI class of current thread */
 	perfcontrol_class_t     current_perfctl_class;  /* Perfcontrol class for current thread */
 	/*
-	 * The cluster type recommended for the current thread, used by AMP scheduler
+	 * The pset type recommended for the current thread, used by AMP scheduler
 	 */
-	pset_cluster_type_t     current_recommended_pset_type;
+	pset_type_t             current_recommended_pset_type;
 	thread_urgency_t        current_urgency;        /* cached urgency of current thread */
 
 #if CONFIG_THREAD_GROUPS
@@ -484,6 +516,7 @@ struct processor {
 
 	bool                    must_idle;              /* Needs to be forced idle as next selected thread is allowed on this processor */
 	bool                    next_idle_short;        /* Expecting a response IPI soon, so the next idle period is likely very brief */
+	uint64_t                next_idle_short_wfe_deadline;  /* Pending deadline to stop a WFE spin, when expecting a thread to rebalance here */
 
 #if !SCHED_TEST_HARNESS
 	bool                    running_timers_active;  /* whether the running timers should fire */
@@ -514,6 +547,9 @@ struct processor {
 	processor_reason_t      last_recommend_reason;
 	processor_reason_t      last_derecommend_reason;
 
+	struct pulled_thread_queue processor_threadq;   /* queue of threads pulled from runq */
+	struct pulled_thread_queue processor_threadq_interrupt;   /* queue of threads pulled from runq when in an interrupt handler */
+
 	/* locked by processor_start_state_lock */
 	bool                    processor_instartup;     /* between dostartup and up */
 
@@ -535,8 +571,7 @@ struct processor {
 extern bool sched_all_cpus_offline(void);
 extern void sched_assert_not_last_online_cpu(int cpu_id);
 
-extern processor_t processor_list;
-decl_simple_lock_data(extern, processor_list_lock);
+extern processor_t processor_list; /* finalized during startup by the boot processor */
 
 decl_simple_lock_data(extern, processor_start_state_lock);
 
@@ -544,9 +579,33 @@ decl_simple_lock_data(extern, processor_start_state_lock);
  * Maximum number of CPUs supported by the scheduler.  bits.h bitmap macros
  * need to be used to support greater than 64.
  */
-#define MAX_SCHED_CPUS          64
-extern processor_t     __single processor_array[MAX_SCHED_CPUS];    /* array indexed by cpuid */
-extern processor_set_t __single pset_array[MAX_PSETS];           /* array indexed by pset_id */
+static_assert(MAX_CPUS <= 64, "The scheduler cannot support more than 64 CPUs.");
+
+extern processor_t     __single processor_array[MAX_CPUS];    /* array indexed by cpuid */
+extern processor_set_t __single pset_array[MAX_PSETS];              /* array indexed by pset_id */
+#if CONFIG_SCHED_EDGE
+extern pset_id_t                cluster_id_to_pset_id[MAX_CPU_CLUSTERS] /* array indexed by cluster_id */;
+#endif /* CONFIG_SCHED_EDGE */
+
+/* Returns the processor set for the given ID, asserting on its existence. */
+processor_set_t
+pset_for_id_checked(pset_id_t id);
+
+/* Returns the processor set for the given ID. */
+OS_INLINE
+processor_set_t
+pset_for_id(pset_id_t id)
+{
+	extern struct processor_set pset_array_actual[MAX_PSETS];
+	return &pset_array_actual[id];
+}
+
+#if __AMP__
+bool pset_is_primary(pset_id_t);
+#endif /* __AMP__ */
+
+/* Boot (and default) pset */
+extern processor_set_t          sched_boot_pset;
 
 extern uint32_t                 processor_avail_count;
 extern uint32_t                 processor_avail_count_user;
@@ -560,7 +619,7 @@ extern uint32_t                 primary_processor_avail_count_user;
 	     cpu_id = lsb_next((cpumap), cpu_id))
 
 #define foreach_node(node) \
-	for (pset_node_t node = &pset_node0; node != NULL; node = node->node_list)
+	for (pset_node_t node = sched_boot_pset_node; node != NULL; node = node->node_list)
 
 #define foreach_pset_id(pset_id, node) \
 	for (int pset_id = lsb_first((node)->pset_map); \
@@ -568,6 +627,8 @@ extern uint32_t                 primary_processor_avail_count_user;
 	    pset_id = lsb_next((node)->pset_map, pset_id))
 
 cpumap_t pset_available_cpumap(processor_set_t pset);
+
+unsigned int pset_cluster_id(processor_set_t);
 
 /*
  * All of the operations on a processor that change the processor count
@@ -615,9 +676,11 @@ change_locked_pset(processor_set_t current_pset, processor_set_t new_pset)
 	return new_pset;
 }
 
-extern lck_spin_t       pset_node_lock;
-
 #endif /* !SCHED_TEST_HARNESS */
+
+extern void             pset_node_add_pset(
+	pset_node_t             node,
+	processor_set_t         pset);
 
 extern void             processor_bootstrap(void);
 
@@ -676,6 +739,29 @@ extern kern_return_t sched_processor_start_user(processor_t processor);
 extern bool sched_mark_processor_online(processor_t processor, processor_reason_t reason);
 extern void sched_mark_processor_offline(processor_t processor, bool is_final_system_sleep);
 
+extern processor_set_t  processor_pset(
+	processor_t             processor);
+
+#if __AMP__
+/* Create one or more psets for the given cluster. Can only be called at startup. */
+extern void
+psets_create_for_cluster(
+	uint32_t                  cluster_id,
+	const ml_topology_info_t *topology);
+#endif /* __AMP__ */
+#if __x86_64__
+extern processor_set_t  pset_create_smp(
+	int                     pset_id);
+#endif /* __x86_64__ */
+
+extern void             pset_init(
+	processor_set_t         pset);
+
+#if __AMP__
+extern processor_set_t  pset_find_for_cpu_id(
+	uint32_t                cpu_id);
+#endif /* __AMP__ */
+
 #if !SCHED_TEST_HARNESS
 
 extern lck_mtx_t cluster_powerdown_lock;
@@ -686,24 +772,6 @@ extern bool sched_is_cpu_init_completed(void);
 
 extern void             processor_queue_shutdown(
 	processor_t             processor);
-
-extern processor_set_t  processor_pset(
-	processor_t             processor);
-
-extern pset_node_t      pset_node_root(void);
-
-extern processor_set_t  pset_create(
-	cluster_type_t          cluster_type,
-	uint32_t                pset_cluster_id,
-	int                     pset_id);
-
-extern void             pset_init(
-	processor_set_t         pset,
-	pset_node_t             node);
-
-extern processor_set_t  pset_find(
-	uint32_t                cluster_id,
-	processor_set_t         default_pset);
 
 extern kern_return_t    processor_info_count(
 	processor_flavor_t      flavor,
@@ -734,142 +802,34 @@ next_pset(processor_set_t pset)
 		pset_id = lsb_first(map);
 	}
 
-	return pset_array[pset_id];
+	return pset_for_id((pset_id_t)pset_id);
 }
 
 #define PSET_THING_TASK         0
 #define PSET_THING_THREAD       1
 
-extern pset_cluster_type_t recommended_pset_type(
+extern pset_type_t      recommended_pset_type(
 	thread_t                thread);
 
 extern void             processor_state_update_idle(
 	processor_t             processor);
 
-extern void             processor_state_update_from_thread(
+extern void             processor_state_update_from_new_thread(
 	processor_t             processor,
 	thread_t                thread,
-	boolean_t               pset_lock_held);
+	bool                    pset_lock_held);
 
-#define PSET_LOAD_NUMERATOR_SHIFT   16
-#define PSET_LOAD_FRACTIONAL_SHIFT   4
+extern void             processor_state_update_from_running_thread(
+	processor_t             processor,
+	thread_t                thread,
+	bool                    pset_lock_held);
 
 #if CONFIG_SCHED_EDGE
-
-extern cluster_type_t pset_type_for_id(uint32_t cluster_id);
-extern uint64_t sched_pset_cluster_shared_rsrc_load(processor_set_t pset, cluster_shared_rsrc_type_t shared_rsrc_type);
-
-/*
- * The Edge scheduler uses average scheduling latency as the metric for making
- * thread migration decisions. One component of avg scheduling latency is the load
- * average on the cluster.
- *
- * Load Average Fixed Point Arithmetic
- *
- * The load average is maintained as a 24.8 fixed point arithmetic value for precision.
- * When multiplied by the average execution time, it needs to be rounded up (based on
- * the most significant bit of the fractional part) for better accuracy. After rounding
- * up, the whole number part of the value is used as the actual load value for
- * migrate/steal decisions.
- */
-#define SCHED_PSET_LOAD_EWMA_FRACTION_BITS 8
-#define SCHED_PSET_LOAD_EWMA_ROUND_BIT     (1 << (SCHED_PSET_LOAD_EWMA_FRACTION_BITS - 1))
-#define SCHED_PSET_LOAD_EWMA_FRACTION_MASK ((1 << SCHED_PSET_LOAD_EWMA_FRACTION_BITS) - 1)
-
-inline static int
-sched_get_pset_load_average(processor_set_t pset, sched_bucket_t sched_bucket)
-{
-	uint64_t load_average = os_atomic_load(&pset->pset_load_average[sched_bucket], relaxed);
-	uint64_t avg_execution_time = os_atomic_load(&pset->pset_execution_time[sched_bucket].pset_avg_thread_execution_time, relaxed);
-	/*
-	 * Since a load average of 0 indicates an idle cluster, don't allow an average
-	 * execution time less than 1us to cause a cluster to appear idle.
-	 */
-	avg_execution_time = MAX(avg_execution_time, 1ULL);
-	return (int)(((load_average + SCHED_PSET_LOAD_EWMA_ROUND_BIT) >> SCHED_PSET_LOAD_EWMA_FRACTION_BITS) * avg_execution_time);
-}
-
-#else /* CONFIG_SCHED_EDGE */
-inline static int
-sched_get_pset_load_average(processor_set_t pset, __unused sched_bucket_t sched_bucket)
-{
-	return (int)pset->load_average >> (PSET_LOAD_NUMERATOR_SHIFT - PSET_LOAD_FRACTIONAL_SHIFT);
-}
+extern pset_type_t pset_type_for_id(pset_id_t pset_id);
 #endif /* CONFIG_SCHED_EDGE */
 
-extern void sched_update_pset_load_average(processor_set_t pset, uint64_t curtime);
-extern void sched_update_pset_avg_execution_time(processor_set_t pset, uint64_t delta, uint64_t curtime, sched_bucket_t sched_bucket);
-
-inline static void
-pset_update_processor_state(processor_set_t pset, processor_t processor, uint new_state)
-{
-	pset_assert_locked(pset);
-
-	uint old_state = processor->state;
-	uint cpuid = (uint)processor->cpu_id;
-
-	assert(processor->processor_set == pset);
-	assert(bit_test(pset->cpu_bitmask, cpuid));
-
-	assert(old_state < PROCESSOR_STATE_LEN);
-	assert(new_state < PROCESSOR_STATE_LEN);
-
-	processor->state = new_state;
-
-	bit_clear(pset->cpu_state_map[old_state], cpuid);
-	bit_set(pset->cpu_state_map[new_state], cpuid);
-
-	if (bit_test(pset->cpu_available_map, cpuid) && (new_state < PROCESSOR_IDLE)) {
-		/* No longer available for scheduling */
-		bit_clear(pset->cpu_available_map, cpuid);
-	} else if (!bit_test(pset->cpu_available_map, cpuid) && (new_state >= PROCESSOR_IDLE)) {
-		/* Newly available for scheduling */
-		bit_set(pset->cpu_available_map, cpuid);
-	}
-
-	if ((old_state == PROCESSOR_RUNNING) || (new_state == PROCESSOR_RUNNING)) {
-		sched_update_pset_load_average(pset, 0);
-		if (new_state == PROCESSOR_RUNNING) {
-			assert(processor == current_processor());
-		}
-	}
-	if ((old_state == PROCESSOR_IDLE) || (new_state == PROCESSOR_IDLE)) {
-		if (new_state == PROCESSOR_IDLE) {
-			bit_clear(pset->realtime_map, cpuid);
-		}
-
-		pset_node_t node = pset->node;
-
-		if (bit_count(node->pset_map) == 1) {
-			/* Node has only a single pset, so skip node pset map updates */
-			return;
-		}
-
-		if (new_state == PROCESSOR_IDLE) {
-#if CONFIG_SCHED_SMT
-			if (processor->processor_primary == processor) {
-				if (!bit_test(atomic_load(&node->pset_non_rt_primary_map), pset->pset_id)) {
-					atomic_bit_set(&node->pset_non_rt_primary_map, pset->pset_id, memory_order_relaxed);
-				}
-			}
-#endif /* CONFIG_SCHED_SMT */
-			if (!bit_test(atomic_load(&node->pset_non_rt_map), pset->pset_id)) {
-				atomic_bit_set(&node->pset_non_rt_map, pset->pset_id, memory_order_relaxed);
-			}
-			if (!bit_test(atomic_load(&node->pset_idle_map), pset->pset_id)) {
-				atomic_bit_set(&node->pset_idle_map, pset->pset_id, memory_order_relaxed);
-			}
-		} else {
-			cpumap_t idle_map = pset->cpu_state_map[PROCESSOR_IDLE];
-			if (idle_map == 0) {
-				/* No more IDLE CPUs */
-				if (bit_test(atomic_load(&node->pset_idle_map), pset->pset_id)) {
-					atomic_bit_clear(&node->pset_idle_map, pset->pset_id, memory_order_relaxed);
-				}
-			}
-		}
-	}
-}
+extern void
+pset_update_processor_state(processor_set_t pset, processor_t processor, uint new_state);
 
 decl_simple_lock_data(extern, sched_available_cores_lock);
 

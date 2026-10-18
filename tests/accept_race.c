@@ -11,6 +11,14 @@
 
 #include "net_test_lib.h"
 
+
+T_GLOBAL_META(
+	T_META_NAMESPACE("xnu.net"),
+	T_META_RADAR_COMPONENT_NAME("xnu"),
+	T_META_RADAR_COMPONENT_VERSION("networking"),
+	T_META_OWNER("rpaulo")
+	);
+
 #define BASE_PORT 2020
 
 static int port = BASE_PORT;
@@ -51,9 +59,10 @@ server(void *arg __unused)
 	laddr.sin_port = htons(port);
 	laddr.sin_addr.s_addr = 0;
 	int res = bind(sock, (struct sockaddr *)&laddr, sizeof(laddr));
-	if (res == -1 && errno == EADDRNOTAVAIL) {
+	if (res == -1 && (errno == EADDRNOTAVAIL || errno == EADDRINUSE)) {
 		port = BASE_PORT;
 		port += arc4random_uniform(512);
+		laddr.sin_port = htons(port);
 		res = bind(sock, (struct sockaddr *)&laddr, sizeof(laddr));
 	}
 	T_ASSERT_POSIX_SUCCESS(res, "bind");
@@ -73,7 +82,9 @@ server(void *arg __unused)
 
 T_DECL(accept_race,
     "Exercises a race condition between socantrcvmore() and accept()",
-    T_META_CHECK_LEAKS(false), T_META_TAG_VM_NOT_PREFERRED)
+    T_META_CHECK_LEAKS(false),
+    T_META_ENABLED(!TARGET_OS_BRIDGE),
+    T_META_TAG_VM_NOT_PREFERRED)
 {
 	// Pick a random port
 	port += arc4random_uniform(1024);

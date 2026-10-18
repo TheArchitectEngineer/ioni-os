@@ -31,6 +31,7 @@
 #include <dev/random/randomdev.h>
 
 #include <net/if.h>
+#include <net/droptap.h>
 #include <net/classq/classq.h>
 #include <net/pktsched/pktsched.h>
 #include <net/pktsched/pktsched_netem.h>
@@ -1124,7 +1125,8 @@ nlc_enqueue(struct netem *ne, classq_pkt_t *p, bool *pdrop)
 			NETEM_LOG(LOG_WARNING,
 			    "| heap_insert p %p err(%d), freeing pkt",
 			    p->cp_mbuf, ret);
-			pktsched_free_pkt(&pkt);
+			pktsched_drop_pkt(&pkt, ne->netem_ifp,
+			    DROP_REASON_NETEM_HEAP_FULL, __func__, __LINE__, 0);
 			goto done;
 		}
 		NETEM_LOG(LOG_DEBUG, "| %p enqueued TTS %llu",
@@ -1147,7 +1149,8 @@ done:
 	return ret;
 
 done_no_output:
-	pktsched_free_pkt(&pkt);
+	pktsched_drop_pkt(&pkt, ne->netem_ifp, DROP_REASON_NETEM_DROP,
+	    __func__, __LINE__, 0);
 	*pdrop = true;
 	NETEM_MTX_UNLOCK(ne);
 	NETEM_LOG(LOG_DEBUG, "└ %p end", p->cp_mbuf);
@@ -1390,7 +1393,8 @@ netem_destroy(struct netem *ne)
 	lck_mtx_destroy(&ne->netem_lock, &netem_lock_group);
 
 	while ((ret = heap_extract(ne->netem_heap, &key, &pkt)) == 0) {
-		pktsched_free_pkt(&pkt);
+		pktsched_drop_pkt(&pkt, ne->netem_ifp, DROP_REASON_NETEM_TEARDOWN,
+		    __func__, __LINE__, 0);
 	}
 	heap_destroy(ne->netem_heap);
 
@@ -1477,6 +1481,13 @@ netem_check_params(const struct if_netem_params *p)
 		return EINVAL;
 	}
 
+	if (p->ifnetem_reordering_ms > 1000) {
+		NETEM_LOG(LOG_ERR,
+		    "| error: reordering delay %dms too big (> 1 sec)",
+		    p->ifnetem_reordering_ms);
+		return EINVAL;
+	}
+
 	if (p->ifnetem_output_ival_ms > 1000) {
 		NETEM_LOG(LOG_ERR,
 		    "| error: output interval %dms too big",
@@ -1539,6 +1550,7 @@ netem_set_params(struct netem *ne, __unused struct ifnet *ifp,
 
 	struct reordering *r = &ne->netem_reordering_model;
 	r->reordering_p = p->ifnetem_reordering_p;
+	r->reordering_ms = p->ifnetem_reordering_ms;
 
 	if (p->ifnetem_output_ival_ms != 0) {
 		ne->netem_output_ival_ms = p->ifnetem_output_ival_ms;
@@ -1612,6 +1624,7 @@ netem_get_params(struct netem *ne, struct if_netem_params *p)
 
 	struct reordering *r = &ne->netem_reordering_model;
 	p->ifnetem_reordering_p = r->reordering_p;
+	p->ifnetem_reordering_ms = r->reordering_ms;
 
 	NETEM_MTX_UNLOCK(ne);
 }

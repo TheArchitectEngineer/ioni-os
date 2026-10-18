@@ -73,8 +73,13 @@ extern uint16_t vm_object_pagein_throttle;
  * pageout_scan try getting the object lock if it's trying to
  * reclaim pages from that object (see vm_pageout_scan_wants_object).
  */
+/*
+ * This is also used by the fill thread when reclaiming tag storage
+ * pages because we don't want to block while holding the page queues lock.
+ */
 #define vm_object_lock_try_scan(object) _vm_object_lock_try(object)
 
+#define vm_object_is_contended_for_kdbg(object) lck_rw_is_contended_for_kdbg(&(object)->Lock)
 /*
  * CAUTION: the following vm_object_lock_assert_held*() macros merely
  * check if anyone is holding the lock, but the holder may not necessarily
@@ -88,6 +93,8 @@ extern uint16_t vm_object_pagein_throttle;
 	LCK_RW_ASSERT(&(object)->Lock, LCK_RW_ASSERT_EXCLUSIVE)
 #define vm_object_lock_assert_notheld(object) \
 	LCK_RW_ASSERT(&(object)->Lock, LCK_RW_ASSERT_NOTHELD)
+#define vm_object_assert_not_owned(object) \
+	LCK_RW_ASSERT(&(object)->Lock, LCK_RW_ASSERT_NOT_OWNED)
 
 
 static inline void
@@ -279,10 +286,10 @@ __private_extern__ void         vm_object_bootstrap(void);
 
 __private_extern__ void         vm_object_reaper_init(void);
 
-__private_extern__ vm_object_t  vm_object_allocate(vm_object_size_t size,
+__exported_hidden vm_object_t   vm_object_allocate(vm_object_size_t size,
     vm_map_serial_t provenance);
 
-__private_extern__ void    _vm_object_allocate(vm_object_size_t size,
+__exported_hidden void     _vm_object_allocate(vm_object_size_t size,
     vm_object_t object, vm_map_serial_t provenance);
 
 __private_extern__ void vm_object_set_size(
@@ -304,24 +311,22 @@ vm_object_reference_shared(vm_object_t object)
 	os_ref_retain_raw(&object->ref_count, &vm_object_refgrp);
 }
 
-__private_extern__ void         vm_object_reference(
-	vm_object_t     object);
+/*
+ *	vm_object_reference:
+ *
+ *	Gets another reference to the given object.
+ */
+static inline void
+vm_object_reference(vm_object_t object)
+{
+	if (object) {
+		vm_object_lock_shared(object);
+		vm_object_reference_shared(object);
+		vm_object_unlock(object);
+	}
+}
 
-#if     !MACH_ASSERT
-
-#define vm_object_reference(object)                     \
-MACRO_BEGIN                                             \
-	vm_object_t RObject = (object);                 \
-	if (RObject) {                                  \
-	        vm_object_lock_shared(RObject);         \
-	        vm_object_reference_shared(RObject);    \
-	        vm_object_unlock(RObject);              \
-	}                                               \
-MACRO_END
-
-#endif  /* MACH_ASSERT */
-
-__private_extern__ void         vm_object_deallocate(
+__exported_hidden void          vm_object_deallocate(
 	vm_object_t     object);
 
 __private_extern__ void         vm_object_pmap_protect(
@@ -387,7 +392,7 @@ __private_extern__ kern_return_t vm_object_get_page_counts(
 	uint64_t                *dirty_page_count,
 	uint64_t                *swapped_page_count);
 
-__private_extern__ boolean_t    vm_object_coalesce(
+__exported_hidden boolean_t    vm_object_coalesce(
 	vm_object_t             prev_object,
 	vm_object_t             next_object,
 	vm_object_offset_t      prev_offset,
@@ -395,7 +400,7 @@ __private_extern__ boolean_t    vm_object_coalesce(
 	vm_object_size_t        prev_size,
 	vm_object_size_t        next_size);
 
-__private_extern__ boolean_t    vm_object_shadow(
+__exported_hidden  boolean_t    vm_object_shadow(
 	vm_object_t             *object,
 	vm_object_offset_t      *offset,
 	vm_object_size_t        length,
@@ -427,6 +432,9 @@ __private_extern__ kern_return_t        vm_object_copy_slowly(
 	vm_object_offset_t      src_offset,
 	vm_object_size_t        size,
 	boolean_t               interruptible,
+#if HAS_MTE
+	bool                    create_mte_object,
+#endif /* HAS_MTE */
 	vm_object_t             *_result_object);
 
 __private_extern__ vm_object_t  vm_object_copy_delayed(
@@ -527,7 +535,7 @@ __private_extern__ kern_return_t vm_object_populate_with_private(
 
 __private_extern__ void vm_object_change_wimg_mode(
 	vm_object_t             object,
-	unsigned int            wimg_mode);
+	uint8_t                 wimg_mode);
 
 extern kern_return_t vm_object_page_op(
 	vm_object_t             object,
@@ -547,13 +555,15 @@ __private_extern__ void vm_object_set_chead_hint(
 	vm_object_t     object);
 
 
-__private_extern__ void         vm_object_reap_pages(
-	vm_object_t object,
-	int     reap_type);
-#define REAP_REAP       0
-#define REAP_TERMINATE  1
-#define REAP_PURGEABLE  2
-#define REAP_DATA_FLUSH 3
+__private_extern__ void vm_object_reap_pages(
+	vm_object_t             object,
+	int                     reap_type);
+
+#define REAP_REAP               0
+#define REAP_TERMINATE          1
+#define REAP_PURGEABLE          2
+#define REAP_DATA_FLUSH         3
+#define REAP_DATA_FLUSH_CLEAN   4
 
 #if CONFIG_FREEZE
 
@@ -566,16 +576,18 @@ vm_object_compressed_freezer_done(
 	void);
 
 #endif /* CONFIG_FREEZE */
+#if MACH_ASSERT
 
-__private_extern__ void
-vm_object_pageout(
+__private_extern__ void vm_object_pageout(
 	vm_object_t     object);
+
+#endif /* MACH_ASSERT */
 
 /*
  *	Event waiting handling
  */
 __enum_closed_decl(vm_object_wait_reason_t, uint8_t, {
-	VM_OBJECT_EVENT_PAGER_INIT = 0,
+	VM_OBJECT_EVENT_PL_REQ_IN_PROGRESS = 0,
 	VM_OBJECT_EVENT_PAGER_READY = 1,
 	VM_OBJECT_EVENT_PAGING_IN_PROGRESS = 2,
 	VM_OBJECT_EVENT_MAPPING_IN_PROGRESS = 3,
@@ -646,6 +658,29 @@ extern void vm_object_wakeup(
 #endif  /* VM_PIP_DEBUG */
 
 static inline void
+vm_object_pl_req_begin(vm_object_t object)
+{
+	vm_object_lock_assert_exclusive(object);
+//	VM_PIP_DEBUG_BEGIN(object);
+	if (os_inc_overflow(&object->vmo_pl_req_in_progress)) {
+		panic("vm_object_pl_req_begin(%p): overflow\n", object);
+	}
+}
+
+static inline void
+vm_object_pl_req_end(vm_object_t object)
+{
+	vm_object_lock_assert_exclusive(object);
+	if (os_dec_overflow(&object->vmo_pl_req_in_progress)) {
+		panic("vm_object_pl_req_end(%p): underflow\n", object);
+	}
+	if (object->vmo_pl_req_in_progress == 0) {
+		vm_object_wakeup((object),
+		    VM_OBJECT_EVENT_PL_REQ_IN_PROGRESS);
+	}
+}
+
+static inline void
 vm_object_activity_begin(vm_object_t object)
 {
 	vm_object_lock_assert_exclusive(object);
@@ -705,6 +740,7 @@ vm_object_paging_end(vm_object_t object)
 	}
 }
 
+extern wait_result_t vm_object_pl_req_wait(vm_object_t object, wait_interrupt_t interruptible);
 /* Wait for *all* paging and activities on this object to complete */
 extern wait_result_t vm_object_paging_wait(vm_object_t object, wait_interrupt_t interruptible);
 /* Wait for *all* paging on this object to complete */
@@ -751,16 +787,25 @@ extern int      vm_object_cache_evict(int, int);
 	    ? kernel_task /* disowned -> kernel */                      \
 	    : (object)->vo_owner)) /* explicit owner */                 \
 
+static inline ledger_t
+VM_OBJECT_LEDGER(vm_object_t object)
+{
+	task_t owner = VM_OBJECT_OWNER(object);
 
-extern void     vm_object_ledger_tag_ledgers(
-	vm_object_t object,
-	int *ledger_idx_volatile,
-	int *ledger_idx_nonvolatile,
-	int *ledger_idx_volatile_compressed,
-	int *ledger_idx_nonvolatile_compressed,
-	int *ledger_idx_composite,
-	int *ledger_idx_external_wired,
-	boolean_t *do_footprint);
+	return owner ? owner->ledger : LEDGER_NULL;
+}
+
+typedef struct {
+	ledger_entry_id_t vmo_volatile;
+	ledger_entry_id_t vmo_nonvolatile;
+	ledger_entry_id_t vmo_volatile_compressed;
+	ledger_entry_id_t vmo_nonvolatile_compressed;
+	ledger_entry_id_t vmo_footprint;
+	ledger_entry_id_t vmo_external_wired;
+} vmo_ledgers_t;
+
+extern vmo_ledgers_t vm_object_ledger_tag_ledgers(
+	vm_object_t             object);
 
 extern kern_return_t vm_object_ownership_change(
 	vm_object_t object,
@@ -769,6 +814,9 @@ extern kern_return_t vm_object_ownership_change(
 	int new_ledger_flags,
 	boolean_t task_objq_locked);
 
+extern bool vm_object_no_shadowing(
+	vm_object_t object,
+	bool caller_owns_one_ref);
 
 // LP64todo: all the current tools are 32bit, obviously never worked for 64b
 // so probably should be a real 32b ID vs. ptr.
@@ -787,6 +835,37 @@ VM_OBJECT_COPY_SET(
 	}
 }
 
+/*
+ * The share type here is just best effort and shouldn't be considered for security policy
+ * This is used by vm_map_region_walk, which just uses this as a best effort for debugging.
+ */
+__enum_closed_decl(vm_object_share_type_t, uint32_t, {
+	VM_SHARE_TYPE_PERMANENT = 1,
+	VM_SHARE_TYPE_TRANSIENT = 2
+});
+
+static inline void
+vm_object_mark_shared(vm_object_t object, vm_object_share_type_t share_type)
+{
+	vm_object_lock_assert_exclusive(object);
+	if (share_type == VM_SHARE_TYPE_PERMANENT) {
+		object->has_been_shared_permanently = true;
+	}
+}
+
+static inline bool
+vm_object_has_been_permanently_shared(vm_object_t object)
+{
+	return object->has_been_shared_permanently;
+}
+
+static inline void
+vm_object_mark_clipped_unlocked(vm_object_t object)
+{
+	vm_object_lock(object);
+	object->has_been_clipped = true;
+	vm_object_unlock(object);
+}
 #endif /* XNU_KERNEL_PRIVATE */
 
 #endif  /* _VM_VM_OBJECT_INTERNAL_H_ */

@@ -35,9 +35,74 @@
 __BEGIN_DECLS
 #ifdef XNU_KERNEL_PRIVATE
 
-PERCPU_DECL(unsigned int, start_color);
+/*!
+ * @abstract
+ * The type for per-cpu free queues and related info.
+ *
+ * @field start_color
+ * The next color to allocate a page for on this CPU.
+ *
+ * @field free_pages
+ * The per-cpu free list of pages.
+ * Pages on this list have the @c VM_PAGE_ON_FREE_LOCAL_Q state.
+ * This list is only accessed by the current CPU with preemption disabled.
+ */
+#if HAS_MTE
+/*
+ *
+ * @field free_tagged_pages
+ * The per-cpu free list of tagged pages.
+ * Pages on this list have the @c VM_PAGE_ON_FREE_LOCAL_Q state.
+ * Their associated cell will have state @c MTE_STATE_ACTIVE.
+ * This list is only accessed by the current CPU with preemption disabled.
+ *
+ * @field free_claimed_pages
+ * The per-cpu free queue of claimed pages.
+ * Pages on this list have the @c VM_PAGE_ON_FREE_LOCAL_Q state.
+ * Their associated cell will have state @c MTE_STATE_CLAIMED.
+ * Access to this queue is protected by the @c free_claimed_lock.
+ *
+ * @field free_claimed_lock
+ * The lock protecting the per-cpu free queue of claimed pages.
+ * This allows for the refill thread to steal claimed pages from this queue.
+ *
+ * @field deactivate_suspend
+ * Per-cpu marker that suspends page deactivations until the current CPU
+ * has finished some untagging (see mteinfo_tag_storage_deactivate_barrier()).
+ */
+#endif
+typedef struct vm_page_pcpu {
+#if HAS_MTE
+	vm_page_queue_head_t   free_claimed_pages VM_PAGE_PACKED_ALIGNED;
+	lck_ticket_t           free_claimed_lock;
+	uint32_t               deactivate_suspend;
+	vm_page_t              free_tagged_zero_page;
+	vm_page_t              free_tagged_pages;
+#endif
+	vm_page_t              free_zero_page;
+	vm_page_t              free_pages;
+	unsigned int           start_color;
+} *vm_page_pcpu_t;
+PERCPU_DECL(struct vm_page_pcpu, vm_page_pcpu);
+
 
 extern struct vm_page_free_queue vm_page_queue_free;
+
+/*
+ * @var vm_page_deactivate_behind
+ * @brief Whether the system should proactively deactivate pages in large
+ *        sequential vm-objects/xfers to prevent file-cache/compressor
+ *        thrashing.
+ */
+extern bool vm_page_deactivate_behind;
+
+/*
+ * @var vm_page_deactivate_behind_min_resident_ratio
+ * @brief The minimum size of an xfer/vm-object at which proactive deactivation
+ *        should be engaged to prevent file-cache/compressor thrashing.
+ */
+extern uint32_t vm_page_deactivate_behind_min_resident_ratio;
+
 
 /*!
  * @abstract
@@ -405,7 +470,6 @@ vm_page_queue_enter_clump(
 #endif /* __x86_64__ */
 #endif /* __LP64__ */
 
-
 /*!
  * @abstract
  * The number of pages to try to free/process at once while under
@@ -517,6 +581,7 @@ extern void vm_page_free_queue_remove(
  * Most clients should use a wrapper (typically vm_page_grab_options())
  * around this function and not call it directly.
  *
+ * @param vmp_pcpu      The per-cpu vm page structure for the current CPU.
  * @param options       The grab options.
  * @param mem_class     The memory class to allocate from.
  * @param num_pages     The number of pages to grab.
@@ -526,6 +591,7 @@ extern void vm_page_free_queue_remove(
  * A list of pages; the list will be num_pages long.
  */
 extern vm_page_list_t vm_page_free_queue_grab(
+	vm_page_pcpu_t          vmp_pcpu,
 	vm_grab_options_t       options,
 	vm_memory_class_t       mem_class,
 	unsigned int            num_pages,
@@ -681,6 +747,31 @@ extern void             vm_page_make_private(vm_page_t m, ppnum_t base_page);
  */
 extern void             vm_page_reset_private(vm_page_t m);
 
+#if HAS_MTE
+
+/*!
+ * @abstract
+ * Returns whether the specified physical page number is actual tag storage.
+ *
+ * @discussion
+ * This returns fails for pages in the tag storage range that is recursive or
+ * unmanaged, unlike pmap_in_tag_storage_range().
+ *
+ * Note that it might return "true" for pages that the MTE Info data structure
+ * considers covering "unmanaged" memory.
+ *
+ * @param page          A canonical VM page.
+ * @param pnum          The page physical number for @c page.
+ */
+extern bool vm_page_is_tag_storage_pnum(vm_page_t page, ppnum_t pnum) __pure2;
+
+static inline bool
+vm_page_is_tag_storage(vm_page_t page)
+{
+	return vm_page_is_tag_storage_pnum(page, VM_PAGE_GET_PHYS_PAGE(page));
+}
+
+#endif /* HAS_MTE */
 
 extern bool             vm_pool_low(void);
 
@@ -712,6 +803,21 @@ vm_page_grab(void)
  * Returns the proper grab options for the specified object.
  */
 extern vm_grab_options_t vm_page_grab_options_for_object(vm_object_t object);
+
+/*!
+ * @absstract
+ * Prime the per-cpu vm page data structure
+ *
+ * @discussion
+ * This function quickly makes sure that there is a zerofilled page ready to go,
+ * as well as free pages on the per-CPU queue.
+ *
+ * This is meant to be used for scenarios when the VM code knows it's committing
+ * to a path that is likely to allocate a page (typically the faulting path),
+ * so that at the time a page is grabbed, the fastpath is taken and no slow
+ * operation happens with VM map or VM object locks held.
+ */
+extern void vm_page_grab_prime(void);
 
 #if XNU_VM_HAS_LOPAGE
 extern vm_page_t vm_page_grablo(vm_grab_options_t options);
@@ -747,8 +853,7 @@ extern void             vm_page_free(
 	vm_page_t       page);
 
 extern void             vm_page_free_unlocked(
-	vm_page_t       page,
-	boolean_t       remove_from_hash);
+	vm_page_t       page);
 
 
 extern void             vm_page_balance_inactive(
@@ -783,6 +888,40 @@ extern void             vm_page_rename(
 	vm_object_t             new_object,
 	vm_object_offset_t      new_offset);
 
+extern void             vm_page_hash_insert(
+	vm_page_t               page,
+	vm_object_t             object,
+	vm_object_offset_t      offset);
+
+struct vmpi_acct {
+	uint32_t                vmpi_inserted;
+	uint32_t                vmpi_nonvolatile;
+	uint32_t                vmpi_volatile;
+	uint32_t                vmpi_external_wired;
+};
+
+__options_closed_decl(vmpi_flags_t, uint32_t, {
+	VMPI_NONE               = 0x0000,
+	VMPI_Q_LOCKED           = 0x0001, /* vm page queues are locked   */
+	VMPI_REPLACE            = 0x0002, /* page is replaced,
+	                                   * incompatible with VMPI_DELAY_HASH
+	                                   */
+	VMPI_BATCH_PMAP_OP      = 0x0004, /* pmap operations are delayed */
+	VMPI_DELAY_HASH         = 0x0008, /* delay hash insertion        */
+});
+
+extern void             vm_page_insert_internal(
+	vm_page_t               page,
+	vm_object_t             object,
+	vm_object_offset_t      offset,
+	vm_tag_t                tag,
+	vmpi_flags_t            flags,
+	struct vmpi_acct       *delayed_acct);
+
+extern void vm_page_insert_flush_accounting(
+	vm_object_t             object,
+	struct vmpi_acct       *delayed_acct);
+
 extern void             vm_page_insert(
 	vm_page_t               page,
 	vm_object_t             object,
@@ -794,29 +933,16 @@ extern void             vm_page_insert_wired(
 	vm_object_offset_t      offset,
 	vm_tag_t                tag);
 
-
-extern void             vm_page_insert_internal(
-	vm_page_t               page,
-	vm_object_t             object,
-	vm_object_offset_t      offset,
-	vm_tag_t                tag,
-	boolean_t               queues_lock_held,
-	boolean_t               insert_in_hash,
-	boolean_t               batch_pmap_op,
-	boolean_t               delayed_accounting,
-	uint64_t                *delayed_ledger_update);
-
 extern void             vm_page_replace(
 	vm_page_t               mem,
 	vm_object_t             object,
 	vm_object_offset_t      offset);
 
 extern void             vm_page_remove(
-	vm_page_t       page,
-	boolean_t       remove_from_hash);
+	vm_page_t               page);
 
 extern void             vm_page_zero_fill(
-	vm_page_t       page);
+	vm_page_t               page);
 
 extern void             vm_page_part_zero_fill(
 	vm_page_t       m,
@@ -870,8 +996,7 @@ extern void             vm_page_free_prepare_queues(
 	vm_page_t       page);
 
 extern void             vm_page_free_prepare_object(
-	vm_page_t       page,
-	boolean_t       remove_from_hash);
+	vm_page_t               page);
 
 extern wait_result_t    vm_page_sleep(
 	vm_object_t        object,
@@ -939,11 +1064,8 @@ extern bool             vm_page_is_restricted(
 	        MACRO_END
 #endif /* !XNU_TARGET_OS_OSX */
 
-#define VM_PAGE_FREE(p)                         \
-	        MACRO_BEGIN                     \
-	        vm_page_free_unlocked(p, TRUE); \
-	        MACRO_END
-
+#define VM_PAGE_FREE(p) \
+	vm_page_free_unlocked(p)
 
 #define VM_PAGE_WAIT()          ((void)vm_page_wait(THREAD_UNINT))
 
@@ -1082,6 +1204,13 @@ extern kern_return_t pmap_enter_check(
 #define DW_VM_PAGE_QUEUES_REMOVE        0x2000
 #define DW_enqueue_cleaned              0x4000
 #define DW_vm_phantom_cache_update      0x8000
+#if HAS_MTE
+/*
+ * Wake up a tag storage page if it's done being used
+ * in a UPL. This requires the page queues lock.
+ */
+#define DW_vm_page_wakeup_tag_storage   0x10000
+#endif /* HAS_MTE */
 #define DW_vm_page_iopl_wire            0x20000
 #define DW_vm_page_iopl_wire_write      0x40000
 

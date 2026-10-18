@@ -83,6 +83,7 @@
 #include <net/if_types.h>
 #include <net/route.h>
 #include <net/dlil.h>
+#include <net/dlil_var_private.h>
 #include <net/droptap.h>
 #include <net/net_api_stats.h>
 
@@ -239,6 +240,35 @@ struct pr_usrreqs udp_usrreqs = {
 
 struct mem_acct *udp_memacct;
 
+static LCK_ATTR_DECLARE(udp_port_unreach_rlc_attr, 0, 0);
+static LCK_GRP_DECLARE(udp_port_unreach_rlc_mtx_grp, "udp_port_unreach_rlc");
+static LCK_MTX_DECLARE_ATTR(udp_port_unreach_rlc_mtx_data, &udp_port_unreach_rlc_mtx_grp, &udp_port_unreach_rlc_attr);
+static lck_mtx_t  * const udp_port_unreach_rlc_mtx = &udp_port_unreach_rlc_mtx_data;
+
+struct in_endpoints     udp_port_unreach_rlc_state;
+uint32_t                udp_port_unreach_rlc_ts;
+static uint32_t         udp_port_unreach_rlc_cnt = 0;
+
+static int udp_port_unreach_rlc_enable = 1;
+SYSCTL_INT(_net_inet_udp, OID_AUTO, port_unreach_rlc_enable, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &udp_port_unreach_rlc_enable, 1, "Enable ICMP port unreachable run-length-compression");
+
+static int udp_port_unreach_rlc_bucket_ms = 100;
+SYSCTL_INT(_net_inet_udp, OID_AUTO, port_unreach_rlc_bucket_ms, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &udp_port_unreach_rlc_bucket_ms, 100, "Duration of RLC bucket in milliseconds for the ICMP port unreachable run-length-compression");
+
+static int udp_port_unreach_rlc_use_ts = 1;
+SYSCTL_INT(_net_inet_udp, OID_AUTO, port_unreach_rlc_use_ts, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &udp_port_unreach_rlc_use_ts, 0, "Include timestamp in ICMP port unreachable run-length-compression");
+
+static int udp_port_unreach_rlc_verbose = 0;
+SYSCTL_INT(_net_inet_udp, OID_AUTO, port_unreach_rlc_verbose, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &udp_port_unreach_rlc_verbose, 0, "Verbose output: 0: no output; 1: log whenever the ICMP port unreachable RLC buffer changes");
+
+static bool
+udp_port_unreach_rlc_compress(struct in_addr src_addr, in_port_t src_port,
+    struct in_addr dst_addr, in_port_t dst_port);
+
 void
 udp_init(struct protosw *pp, struct domain *dp)
 {
@@ -271,6 +301,8 @@ udp_init(struct protosw *pp, struct domain *dp)
 		os_log(OS_LOG_DEFAULT, "udp_init: set udp_log_enable_flags to 0x%x", udp_log_enable_flags);
 	}
 
+	bzero(&udp_port_unreach_rlc_state, sizeof(struct in_endpoints));
+
 	LIST_INIT(&udb);
 	udbinfo.ipi_listhead = &udb;
 	hashinit_counted_by(UDBHASHSIZE, udbinfo.ipi_hashbase,
@@ -293,6 +325,26 @@ udp_init(struct protosw *pp, struct domain *dp)
 
 	udbinfo.ipi_gc = udp_gc;
 	in_pcbinfo_attach(&udbinfo);
+
+	udp_log_handle = os_log_create("com.apple.xnu.net.udp", "");
+	inp_log_init();
+}
+
+/*
+ * In the data path don't inline function that are unlikely
+ */
+__attribute__((noinline))
+static void
+udp_proto_process_lpw_packet(struct mbuf *m, struct inpcb *inp, const char *reason)
+{
+	struct ifnet *ifp = m->m_pkthdr.rcvif;
+
+	if (inp != NULL) {
+		UDP_LOG(inp, "%s", reason);
+	}
+
+	if_ports_used_match_mbuf(ifp, PF_INET, m);
+	if_exit_lpw(ifp, reason);
 }
 
 void
@@ -300,7 +352,7 @@ udp_input(struct mbuf *m, int iphlen)
 {
 	struct ip *ip;
 	struct udphdr *uh;
-	struct inpcb *inp;
+	struct inpcb *inp = NULL;
 	mbuf_ref_t opts = NULL;
 	int len, isbroadcast;
 	struct ip save_ip;
@@ -319,6 +371,7 @@ udp_input(struct mbuf *m, int iphlen)
 	boolean_t is_wake_pkt = false;
 	boolean_t check_cfil = cfil_filter_present();
 	drop_reason_t drop_reason = DROP_REASON_UNSPECIFIED;
+	bool is_magic_packet = false;
 
 	SOCKADDR_ZERO(&udp_in, sizeof(udp_in));
 	udp_in.sin_len = sizeof(struct sockaddr_in);
@@ -407,6 +460,16 @@ udp_input(struct mbuf *m, int iphlen)
 	if (udp_input_checksum(m, uh, iphlen, len)) {
 		drop_reason = DROP_REASON_UDP_BAD_CHECKSUM;
 		goto bad;
+	}
+
+	/*
+	 * Transition to full wake for a magic packet wether the packet is for
+	 * an open or closed port.
+	 */
+	if (__improbable(if_is_lpw_enabled(ifp))) {
+		if ((is_magic_packet = packet_has_magic_pattern(m))) {
+			udp_proto_process_lpw_packet(m, inp, "LPW UDP magic packet");
+		}
 	}
 
 	isbroadcast = in_broadcast(ip->ip_dst, ifp);
@@ -566,6 +629,7 @@ udp_input(struct mbuf *m, int iphlen)
 				    &udp_in, &udp_in6, &udp_ip6, ifp);
 				mcast_delivered++;
 
+
 				m = n;
 			}
 			if (is_wake_pkt) {
@@ -609,6 +673,7 @@ udp_input(struct mbuf *m, int iphlen)
 			udpstat.udps_noportbcast++;
 			IF_UDP_STATINC(ifp, port_unreach);
 			drop_reason = DROP_REASON_UDP_PORT_UNREACHEABLE;
+
 			goto bad;
 		}
 
@@ -669,6 +734,7 @@ udp_input(struct mbuf *m, int iphlen)
 				ip = mtod(m, struct ip *);
 				uh = (struct udphdr *)(void *)((caddr_t)ip + iphlen);
 			}
+
 			/* Check for NAT keepalive packet */
 			if (payload_len == 1 && *(u_int8_t *)
 			    ((caddr_t)uh + sizeof(struct udphdr)) == 0xFF) {
@@ -726,6 +792,11 @@ udp_input(struct mbuf *m, int iphlen)
 			drop_reason = DROP_REASON_UDP_PORT_UNREACHEABLE;
 			goto bad;
 		}
+		if (udp_port_unreach_rlc_compress(ip->ip_src, uh->uh_sport,
+		    ip->ip_dst, uh->uh_dport) == true) {
+			drop_reason = DROP_REASON_UDP_PORT_UNREACHEABLE;
+			goto bad;
+		}
 		if (blackhole) {
 			if (ifp && ifp->if_type != IFT_LOOP) {
 				drop_reason = DROP_REASON_UDP_PORT_UNREACHEABLE;
@@ -737,6 +808,15 @@ udp_input(struct mbuf *m, int iphlen)
 			IF_UDP_STATINC(ifp, linkheur_stealthdrop);
 			goto bad;
 		}
+
+		if (is_magic_packet) {
+			/*
+			 * Silently drop magic packet for a closed port
+			 */
+			drop_reason = DROP_REASON_UDP_PORT_UNREACHEABLE;
+			goto bad;
+		}
+
 		*ip = save_ip;
 		ip->ip_len += iphlen;
 		icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_PORT, 0, 0);
@@ -750,6 +830,17 @@ udp_input(struct mbuf *m, int iphlen)
 		IF_UDP_STATINC(ifp, cleanup);
 		drop_reason = DROP_REASON_UDP_SOCKET_CLOSING;
 		goto bad;
+	}
+
+	/*
+	 * Transition to full wake for an UDP packet to an open port.
+	 * Unlike TCP, UDP has no idle connection concept — any packet
+	 * to an open port triggers a full AP wake unless SO_NOWAKEFROMSLEEP is set
+	 */
+	if (__improbable(if_is_lpw_enabled(ifp) && !is_magic_packet)) {
+		if ((inp->inp_socket->so_options & SO_NOWAKEFROMSLEEP) == 0) {
+			udp_proto_process_lpw_packet(m, inp, "LPW UDP unicast");
+		}
 	}
 #if NECP
 	if (!necp_socket_is_allowed_to_send_recv_v4(inp, uh->uh_dport,
@@ -787,6 +878,7 @@ udp_input(struct mbuf *m, int iphlen)
 			goto bad;
 		}
 	}
+
 	m_adj(m, iphlen + sizeof(struct udphdr));
 
 	KERNEL_DEBUG(DBG_LAYER_IN_END, uh->uh_dport, uh->uh_sport,
@@ -2109,14 +2201,28 @@ udp_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr,
 		INP_ADD_TXSTAT(inp, ifnet_count_type, 1, len);
 	}
 
-	if (flowadv && (adv->code == FADV_FLOW_CONTROLLED ||
-	    adv->code == FADV_SUSPENDED)) {
-		/*
-		 * return a hint to the application that
-		 * the packet has been dropped
-		 */
-		error = ENOBUFS;
-		inp_set_fc_state(inp, adv->code);
+	if (flowadv) {
+		switch (adv->code) {
+		case FADV_SUSPENDED:
+			/*
+			 * return a hint to the application that
+			 * the packet has been dropped
+			 */
+			error = ENOBUFS;
+			OS_FALLTHROUGH;
+		case FADV_FLOW_CONTROLLED:
+			/*
+			 * AQM drops from head of Q but this packet got
+			 * added to tail so don't return error to application.
+			 * If it continues to send while flow controlled,
+			 * the INP_WAIT_FOR_IF_FEEDBACK check above will be
+			 * hit and it will get the error.
+			 */
+			inp_set_fc_state(inp, adv->code);
+			break;
+		default:
+			break;
+		}
 	}
 
 	/* Synchronize PCB cached route */
@@ -3206,4 +3312,88 @@ udp_defunct(struct socket *so)
 	}
 
 	return 0;
+}
+
+static bool
+udp_port_unreach_rlc_common(struct in_endpoints *flow)
+{
+	bool should_throttle = false;
+	uint32_t last_udp_port_unreach_rlc_cnt = 0;
+	in_port_t last_dport = 0;
+	in_port_t last_sport = 0;
+	struct timeval ts;
+	uint32_t now;
+
+	microuptime(&ts);
+	now = (uint32_t)ts.tv_sec * 1000 + ts.tv_usec / 1000;
+
+	lck_mtx_lock(udp_port_unreach_rlc_mtx);
+	if (__improbable((udp_port_unreach_rlc_use_ts == false || now - udp_port_unreach_rlc_ts < udp_port_unreach_rlc_bucket_ms) &&
+	    bcmp(flow, &udp_port_unreach_rlc_state, sizeof(struct in_endpoints)) == 0)) {
+		/*
+		 * The rst rlc state hasn't changed changed, we should throttle.
+		 */
+		should_throttle = true;
+		udp_port_unreach_rlc_cnt++;
+		udpstat.udps_port_unreach_dup_suppressed++;
+	} else {
+		should_throttle = false;
+		last_udp_port_unreach_rlc_cnt = udp_port_unreach_rlc_cnt;
+		last_sport = udp_port_unreach_rlc_state.ie_lport;
+		last_dport = udp_port_unreach_rlc_state.ie_fport;
+		bcopy(flow, &udp_port_unreach_rlc_state, sizeof(struct in_endpoints));
+		udp_port_unreach_rlc_cnt = 0;
+		udp_port_unreach_rlc_ts = now;
+		udpstat.udps_port_unreach_not_suppressed++;
+	}
+	lck_mtx_unlock(udp_port_unreach_rlc_mtx);
+
+	if (udp_port_unreach_rlc_verbose) {
+		if (last_udp_port_unreach_rlc_cnt != 0) {
+			os_log(OS_LOG_DEFAULT, "UDP port unreachable RLC compression: compressed %u ICMP packets [%hu:%hu]",
+			    last_udp_port_unreach_rlc_cnt, ntohs(last_sport), ntohs(last_dport));
+		}
+	}
+
+	return should_throttle;
+}
+
+static bool
+udp_port_unreach_rlc_compress(struct in_addr src_addr, in_port_t src_port,
+    struct in_addr dst_addr, in_port_t dst_port)
+{
+	struct in_endpoints flow;
+
+	if (udp_port_unreach_rlc_enable == 0) {
+		return false;
+	}
+
+	bzero(&flow, sizeof(struct in_endpoints));
+
+	flow.ie_lport = src_port;
+	flow.ie_fport = dst_port;
+	bcopy(&src_addr, &flow.ie_laddr, sizeof(struct in_addr));
+	bcopy(&dst_addr, &flow.ie_faddr, sizeof(struct in_addr));
+
+	return udp_port_unreach_rlc_common(&flow);
+}
+
+bool
+udp6_port_unreach_rlc_compress(struct in6_addr *src_addr, in_port_t src_port,
+    struct in6_addr *dst_addr, in_port_t dst_port)
+{
+	struct in_endpoints flow;
+
+	if (udp_port_unreach_rlc_enable == 0) {
+		return false;
+	}
+
+	bzero(&flow, sizeof(struct in_endpoints));
+
+	flow.ie_lport = src_port;
+	flow.ie_fport = dst_port;
+	bcopy(src_addr, &flow.ie6_laddr, sizeof(struct in6_addr));
+	bcopy(dst_addr, &flow.ie6_faddr, sizeof(struct in6_addr));
+
+	return udp_port_unreach_rlc_common(&flow);
 }

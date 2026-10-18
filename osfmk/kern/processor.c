@@ -60,6 +60,10 @@
  *	processor.c: processor and processor_set manipulation routines.
  */
 
+#include <kern/processor.h>
+
+#if !SCHED_TEST_HARNESS
+
 #include <mach/boolean.h>
 #include <mach/policy.h>
 #include <mach/processor.h>
@@ -74,8 +78,9 @@
 #include <kern/kern_types.h>
 #include <kern/machine.h>
 #include <kern/misc_protos.h>
-#include <kern/processor.h>
+#include <kern/sched_common.h>
 #include <kern/sched.h>
+#include <kern/startup.h>
 #include <kern/smr.h>
 #include <kern/task.h>
 #include <kern/thread.h>
@@ -101,45 +106,32 @@
 #include <mach/processor_set_server.h>
 #include <san/kcov.h>
 
-#if __AMP__
+#endif /* !SCHED_TEST_HARNESS */
 
 /*
  * For AMP platforms, all psets of the same type are part of
  * the same pset_node. This allows for easier CPU selection logic.
- *
- * The nodes in pset_nodes are indexed in pset boot order and
- * initialization is protected by pset_node_lock.
  */
-struct pset_node            pset_nodes[MAX_AMP_CLUSTER_TYPES];
-static int                  next_pset_node_index = 1;
-static _Atomic pset_node_t  pset_nodes_by_cluster_type[MAX_AMP_CLUSTER_TYPES];
-
-/* pset_node_lock must be held */
-static void
-pset_node_set_for_pset_cluster_type(pset_node_t node, pset_cluster_type_t pset_cluster_type)
-{
-	assert3p(os_atomic_load(&pset_nodes_by_cluster_type[pset_cluster_type - 1], relaxed), ==, PSET_NODE_NULL);
-	os_atomic_store(&pset_nodes_by_cluster_type[pset_cluster_type - 1], node, release);
-}
+struct pset_node        pset_nodes[MAX_PSET_TYPES];
 
 pset_node_t
-pset_node_for_pset_cluster_type(pset_cluster_type_t pset_cluster_type)
+pset_node_for_pset_type(pset_type_t pset_type)
 {
-	assert3u(pset_cluster_type, !=, PSET_SMP);
-	return os_atomic_load(&pset_nodes_by_cluster_type[pset_cluster_type - 1], acquire);
+	return &pset_nodes[pset_type];
 }
 
-#else /* !__AMP__ */
-
-/* The boot node */
-struct pset_node        pset_node0;
-
-#endif /* !__AMP__ */
+bool
+pset_node_is_empty(pset_node_t node)
+{
+	return node->psets == PROCESSOR_SET_NULL;
+}
 
 /* The boot pset */
-struct processor_set    pset0;
+SECURITY_READ_ONLY_LATE(processor_set_t) sched_boot_pset = PROCESSOR_SET_NULL;
+/* The boot node */
+SECURITY_READ_ONLY_LATE(pset_node_t)     sched_boot_pset_node = PSET_NODE_NULL;
 
-LCK_SPIN_DECLARE(pset_node_lock, LCK_GRP_NULL);
+#if !SCHED_TEST_HARNESS
 
 LCK_GRP_DECLARE(pset_lck_grp, "pset");
 
@@ -157,10 +149,11 @@ LCK_ATTR_DECLARE(task_lck_attr, 0, 0);
 LCK_MTX_DECLARE_ATTR(tasks_threads_lock, &task_lck_grp, &task_lck_attr);
 LCK_MTX_DECLARE_ATTR(tasks_corpse_lock, &task_lck_grp, &task_lck_attr);
 
-processor_t             processor_list;
-unsigned int            processor_count;
-static processor_t      processor_list_tail;
-SIMPLE_LOCK_DECLARE(processor_list_lock, 0);
+#endif /* !SCHED_TEST_HARNESS */
+
+SECURITY_READ_ONLY_LATE(processor_t)             processor_list;
+SECURITY_READ_ONLY_LATE(unsigned int)            processor_count;
+SECURITY_READ_ONLY_LATE(static processor_t)      processor_list_tail;
 SIMPLE_LOCK_DECLARE(processor_start_state_lock, 0);
 
 uint32_t                processor_avail_count;
@@ -181,12 +174,46 @@ TUNABLE(bool, enable_processor_exit, "processor_exit", true);
 TUNABLE(bool, enable_processor_exit, "processor_exit", false);
 #endif
 
-SECURITY_READ_ONLY_LATE(int)    master_cpu = 0;
+SECURITY_READ_ONLY_LATE(int)              boot_cpu_id = 0;
+SECURITY_READ_ONLY_LATE(processor_t)      processor_array[MAX_CPUS] = { 0 };
+SECURITY_READ_ONLY_LATE(processor_set_t)  pset_array[MAX_PSETS] = { 0 };
+static_assert(MAX_PSETS < PSET_ID_INVALID, "Can store pset ids within 8 bits");
+
+#if CONFIG_SCHED_EDGE
+/* Mapping from cluster ID to the corresponding pset ID. */
+SECURITY_READ_ONLY_LATE(pset_id_t)        cluster_id_to_pset_id[MAX_CPU_CLUSTERS] = { 0 };
+#endif /* CONFIG_SCHED_EDGE */
+
+struct processor_set                      pset_array_actual[MAX_PSETS] = { 0 };
+
+__private_extern__
+processor_set_t
+pset_for_id_checked(pset_id_t id)
+{
+#if __AMP__
+	/* sched_num_psets only exists on AMP platforms, but it should be valid
+	 * before accessing pset_array entries. */
+	assert3u(sched_num_psets, >, 0);
+	assert3u(sched_num_psets, <=, MAX_PSETS);
+	assert3u(id, <, sched_num_psets);
+#else /* !__AMP__ */
+	assert3u(id, <, MAX_PSETS);
+#endif /* !__AMP__ */
+	assert(pset_array[id] != PROCESSOR_SET_NULL); /* check if pset is initialized */
+	return pset_for_id(id);
+}
+
+#if __AMP__
+bool
+pset_is_primary(pset_id_t pset_id)
+{
+	return pset_id < ml_get_cluster_count();
+}
+#endif /* __AMP__ */
+
+#if !SCHED_TEST_HARNESS
 
 struct processor        PERCPU_DATA(processor);
-processor_t             processor_array[MAX_SCHED_CPUS] = { 0 };
-processor_set_t         pset_array[MAX_PSETS] = { 0 };
-
 static timer_call_func_t running_timer_funcs[] = {
 	[RUNNING_TIMER_QUANTUM] = thread_quantum_expire,
 	[RUNNING_TIMER_PREEMPT] = thread_preempt_expire,
@@ -229,6 +256,8 @@ ipi_test()
 
 int sched_enable_smt = 1;
 
+#endif /* !SCHED_TEST_HARNESS */
+
 cpumap_t processor_offline_state_map[PROCESSOR_OFFLINE_MAX];
 
 void
@@ -261,6 +290,102 @@ processor_update_offline_state(processor_t processor,
 	splx(s);
 }
 
+#if __AMP__
+
+void
+psets_create_for_cluster(
+	uint32_t                  cluster_id,
+	const ml_topology_info_t *topology)
+{
+	/* Accessing pset_map after lockdown should fault. */
+	static __startup_data uint64_t pset_map = 0ULL;
+	cpumap_t cluster_cpu_map = topology->clusters[cluster_id].cpu_mask;
+	cpumap_t cluster_cpus_by_type[MAX_PSET_TYPES] = {0};
+	for (int cpu_id = lsb_first(cluster_cpu_map); cpu_id >= 0; cpu_id = lsb_next(cluster_cpu_map, cpu_id)) {
+		cluster_type_t cpu_type = topology->cpus[cpu_id].cluster_type;
+		pset_type_t pset_type = cluster_type_to_pset_type(cpu_type);
+		bit_set(cluster_cpus_by_type[pset_type], cpu_id);
+	}
+
+	/* Create the psets. */
+#if CONFIG_SCHED_EDGE
+	cluster_id_to_pset_id[cluster_id] = PSET_ID_INVALID;
+#endif /* CONFIG_SCHED_EDGE */
+
+	const pset_type_t pset_type_order[MAX_PSET_TYPES] = {
+		PSET_AMP_P,
+		PSET_AMP_M,
+		PSET_AMP_E,
+	};
+
+	/* Iterate in order of decreasing perf */
+	for (int i = 0; i < MAX_PSET_TYPES; i++) {
+		pset_type_t pset_type = pset_type_order[i];
+		if (cluster_cpus_by_type[pset_type] == 0) {
+			continue;
+		}
+
+		/* Compute a pset ID. */
+		pset_id_t pset_id;
+		if (bit_test(pset_map, cluster_id) == false) {
+			pset_id = (pset_id_t)cluster_id;
+		} else {
+			pset_id = (pset_id_t)MAX(topology->num_clusters, bit_first(pset_map));
+		}
+		assert3u(pset_id, <, MAX_PSETS);
+		assert3p(pset_array[pset_id], ==, PROCESSOR_SET_NULL);
+
+		/* Mark the ID as taken. */
+		bit_set(pset_map, pset_id);
+
+#if CONFIG_SCHED_EDGE
+		if (cluster_id_to_pset_id[cluster_id] == PSET_ID_INVALID) {
+			cluster_id_to_pset_id[cluster_id] = pset_id;
+		}
+#endif /* CONFIG_SCHED_EDGE */
+
+		/* Do some very basic initialization. */
+		processor_set_t pset = &pset_array_actual[pset_id];
+		pset->pset_type = pset_type;
+		pset->pset_id = pset_id;
+		pset->cluster_id = cluster_id;
+		/* On AMP systems, cpu_bitmask is initialized early. */
+		pset->cpu_bitmask = cluster_cpus_by_type[pset_type];
+
+		/* Initialize the rest of the pset. */
+		pset_init(pset);
+
+		/* And on to the next one... */
+	}
+
+	/* Update sched_num_psets. */
+	sched_num_psets = (uint8_t)bit_count(pset_map);
+	assert3u(sched_num_psets, >, 0);
+	assert3u(sched_num_psets, <=, MAX_PSETS);
+}
+
+#endif /* __AMP__ */
+
+void
+pset_node_add_pset(pset_node_t node, processor_set_t pset)
+{
+	if (node->psets == PROCESSOR_SET_NULL) {
+		/* Initialize the node. */
+		node->pset_type = pset->pset_type;
+		/* Insert into the pset list. */
+		node->psets = pset;
+	} else {
+		/* Insert into the pset list. */
+		processor_set_t tail;
+		for (tail = node->psets; tail->pset_list != PROCESSOR_SET_NULL; tail = tail->pset_list) {
+		}
+		tail->pset_list = pset;
+	}
+	bit_set(node->pset_map, pset->pset_id);
+	bitmap_or(&node->cpu_map, &node->cpu_map, &pset->cpu_bitmask, MAX_CPUS);
+	pset->node = node;
+}
+
 void
 processor_bootstrap(void)
 {
@@ -269,33 +394,38 @@ processor_bootstrap(void)
 
 	/* Initialize boot pset and node */
 #if __AMP__
-	/*
-	 * Since this is an AMP system, fill up cluster type and ID information; this should do the
-	 * same kind of initialization done via ml_processor_register()
-	 */
 	const ml_topology_info_t *topology_info = ml_get_topology_info();
-	ml_topology_cluster_t *boot_cluster = topology_info->boot_cluster;
-	pset_cluster_type_t boot_cluster_type = cluster_type_to_pset_cluster_type(boot_cluster->cluster_type);
-	pset0.pset_id = boot_cluster->cluster_id;
-	pset0.pset_cluster_id = boot_cluster->cluster_id;
-	pset_node0.pset_cluster_type = boot_cluster_type;
-	pset0.pset_cluster_type = boot_cluster_type;
-	pset_node_set_for_pset_cluster_type(&pset_node0, boot_cluster_type);
+
+	assert3u(sched_num_psets, ==, UINT8_MAX);
+	sched_num_psets = 0;
+	/* Create virtual psets for the boot cluster. */
+	psets_create_for_cluster(topology_info->boot_cluster->cluster_id, topology_info);
+	assert3u(sched_num_psets, >, 0);
+
+	/* Identify the boot pset and boot pset node. */
+	sched_boot_pset = pset_find_for_cpu_id(boot_cpu_id);
+	sched_boot_pset_node = pset_node_for_pset_type(sched_boot_pset->pset_type);
 #else /* !__AMP__ */
-	pset0.pset_id = 0;
-	pset0.pset_cluster_id = 0;
-	pset_node0.pset_cluster_type = PSET_SMP;
-	pset0.pset_cluster_type = PSET_SMP;
+	sched_num_psets = 1;
+	sched_boot_pset = pset_for_id(0);
+	sched_boot_pset_node = pset_node_for_pset_type(PSET_SMP);
+	sched_boot_pset->pset_id = 0;
+	sched_boot_pset_node->pset_type = PSET_SMP;
+	sched_boot_pset->pset_type = PSET_SMP;
 #endif /* !__AMP__ */
 
-	pset_init(&pset0, &pset_node0);
+	pset_init(sched_boot_pset);
+	pset_node_add_pset(sched_boot_pset_node, sched_boot_pset);
+
+#if !SCHED_TEST_HARNESS
 	queue_init(&tasks);
 	queue_init(&terminated_tasks);
 	queue_init(&threads);
 	queue_init(&terminated_threads);
 	queue_init(&corpse_tasks);
+#endif /* !SCHED_TEST_HARNESS */
 
-	processor_init(master_processor, master_cpu, &pset0);
+	processor_init(master_processor, boot_cpu_id, sched_boot_pset);
 }
 
 /*
@@ -311,13 +441,18 @@ processor_init(
 {
 	spl_t           s;
 
-	assert(cpu_id < MAX_SCHED_CPUS);
+	assert(cpu_id < MAX_CPUS);
 	processor->cpu_id = cpu_id;
 
+#if !SCHED_TEST_HARNESS
+	/* for debugging, log the processor association */
+	kprintf("[%s] processor %d belongs to processor set %u of type %u\n", __FUNCTION__, cpu_id, pset->pset_id, pset->pset_type);
+#endif /* !SCHED_TEST_HARNESS */
+
 	if (processor != master_processor) {
-		/* Scheduler state for master_processor initialized in sched_init() */
+		/* Scheduler state for the boot processor gets initialized directly in
+		 * ml_bootstrap_processors(). */
 		SCHED(processor_init)(processor);
-		smr_cpu_init(processor);
 	}
 
 	processor->state = PROCESSOR_OFF_LINE;
@@ -338,19 +473,21 @@ processor_init(
 	processor->processor_list = NULL;
 	processor->must_idle = false;
 	processor->next_idle_short = false;
+	processor->next_idle_short_wfe_deadline = UINT64_MAX;
 	processor->last_startup_reason = REASON_SYSTEM;
 	processor->last_shutdown_reason = REASON_NONE;
 	processor->shutdown_temporary = false;
 	processor->processor_inshutdown = false;
 	processor->processor_instartup = false;
 	processor->last_derecommend_reason = REASON_NONE;
+#if !SCHED_TEST_HARNESS
 	processor->running_timers_active = false;
 	for (int i = 0; i < RUNNING_TIMER_MAX; i++) {
 		timer_call_setup(&processor->running_timers[i],
 		    running_timer_funcs[i], processor);
 		running_timer_clear(processor, i);
 	}
-	recount_processor_init(processor);
+#endif /* !SCHED_TEST_HARNESS */
 
 #if CONFIG_SCHED_EDGE
 	os_atomic_init(&processor->stir_the_pot_inbox_cpu, -1);
@@ -360,7 +497,12 @@ processor_init(
 	simple_lock(&sched_available_cores_lock, LCK_GRP_NULL);
 
 	pset_lock(pset);
+#if __AMP__
+	/* On AMP platforms, the pset cpu_bitmask is set by processor_bootstrap(). */
+	assert(bit_test(pset->cpu_bitmask, cpu_id));
+#else /* !__AMP__ */
 	bit_set(pset->cpu_bitmask, cpu_id);
+#endif /* __AMP__ */
 	bit_set(pset->recommended_bitmask, cpu_id);
 	atomic_bit_set(&pset->node->pset_recommended_map, pset->pset_id, memory_order_relaxed);
 #if CONFIG_SCHED_SMT
@@ -388,7 +530,6 @@ processor_init(
 	simple_unlock(&sched_available_cores_lock);
 	splx(s);
 
-	simple_lock(&processor_list_lock, LCK_GRP_NULL);
 	if (processor_list == NULL) {
 		processor_list = processor;
 	} else {
@@ -396,7 +537,6 @@ processor_init(
 	}
 	processor_list_tail = processor;
 	processor_count++;
-	simple_unlock(&processor_list_lock);
 	processor_array[cpu_id] = processor;
 }
 
@@ -455,41 +595,19 @@ pset_available_cpumap(processor_set_t pset)
 	return pset->cpu_available_map & pset->recommended_bitmask;
 }
 
+unsigned int
+pset_cluster_id(processor_set_t pset)
+{
+	return pset->cluster_id;
+}
+
 #if CONFIG_SCHED_EDGE
 
 /* Returns the scheduling type for the pset */
-cluster_type_t
-pset_type_for_id(uint32_t cluster_id)
+pset_type_t
+pset_type_for_id(pset_id_t pset_id)
 {
-	return pset_array[cluster_id]->pset_type;
-}
-
-/*
- * Processor foreign threads
- *
- * With the Edge scheduler, each pset maintains a bitmap of processors running threads
- * which are foreign to the pset/cluster. A thread is defined as foreign for a cluster
- * if its of a different type than its preferred cluster type (E/P). The bitmap should
- * be updated every time a new thread is assigned to run on a processor. Cluster shared
- * resource intensive threads are also not counted as foreign threads since these
- * threads should not be rebalanced when running on non-preferred clusters.
- *
- * This bitmap allows the Edge scheduler to quickly find CPUs running foreign threads
- * for rebalancing.
- */
-static void
-processor_state_update_running_foreign(processor_t processor, thread_t thread)
-{
-	cluster_type_t current_processor_type = pset_type_for_id(processor->processor_set->pset_cluster_id);
-	cluster_type_t thread_type = pset_type_for_id(sched_edge_thread_preferred_cluster(thread));
-
-	boolean_t non_rt_thr = (processor->current_pri < BASEPRI_RTQUEUES);
-	boolean_t non_bound_thr = (thread->bound_processor == PROCESSOR_NULL);
-	if (non_rt_thr && non_bound_thr && (current_processor_type != thread_type)) {
-		bit_set(processor->processor_set->cpu_running_foreign, processor->cpu_id);
-	} else {
-		bit_clear(processor->processor_set->cpu_running_foreign, processor->cpu_id);
-	}
+	return pset_array[pset_id]->pset_type;
 }
 
 /*
@@ -505,25 +623,26 @@ static void
 processor_state_update_running_cluster_shared_rsrc(processor_t processor, thread_t thread)
 {
 	if (thread_shared_rsrc_policy_get(thread, CLUSTER_SHARED_RSRC_TYPE_RR)) {
-		bit_set(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id);
+		atomic_bit_set(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id, memory_order_relaxed);
 	} else {
-		bit_clear(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id);
+		atomic_bit_clear(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id, memory_order_relaxed);
 	}
 	if (thread_shared_rsrc_policy_get(thread, CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST)) {
-		bit_set(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id);
+		atomic_bit_set(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id, memory_order_relaxed);
 	} else {
-		bit_clear(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id);
+		atomic_bit_clear(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id, memory_order_relaxed);
 	}
 }
 
 #endif /* CONFIG_SCHED_EDGE */
 
+/* Must be called with processor as current_processor() */
 void
 processor_state_update_idle(processor_t processor)
 {
 	processor->current_pri = IDLEPRI;
 	processor->current_sfi_class = SFI_CLASS_KERNEL;
-	processor->current_recommended_pset_type = PSET_SMP;
+	processor->current_recommended_pset_type = MAX_PSET_TYPES;
 #if CONFIG_THREAD_GROUPS
 	processor->current_thread_group = NULL;
 #endif
@@ -536,27 +655,33 @@ processor_state_update_idle(processor_t processor)
 	processor->current_is_eagerpreempt = false;
 #if CONFIG_SCHED_EDGE
 	os_atomic_store(&processor->processor_set->cpu_running_buckets[processor->cpu_id], TH_BUCKET_SCHED_MAX, relaxed);
-	bit_clear(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id);
-	bit_clear(processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id);
+	atomic_bit_clear(&processor->processor_set->cpu_running_foreign, processor->cpu_id, memory_order_relaxed);
+	atomic_bit_clear(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_RR], processor->cpu_id, memory_order_relaxed);
+	atomic_bit_clear(&processor->processor_set->cpu_running_cluster_shared_rsrc_thread[CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST], processor->cpu_id, memory_order_relaxed);
 	sched_edge_stir_the_pot_clear_registry_entry();
 #endif /* CONFIG_SCHED_EDGE */
-	sched_update_pset_load_average(processor->processor_set, 0);
+	SCHED(update_pset_load_average)(processor->processor_set, 0);
 }
 
-void
-processor_state_update_from_thread(processor_t processor, thread_t thread, boolean_t pset_lock_held)
+/* Called with processor as current_processor() */
+static void
+processor_state_update_from_thread(processor_t processor, thread_t thread,
+    bool pset_lock_held, bool thread_is_new)
 {
+	assert3p(processor, ==, current_processor());
 	processor->current_pri = thread->sched_pri;
 	processor->current_sfi_class = thread->sfi_class;
 	processor->current_recommended_pset_type = recommended_pset_type(thread);
 #if CONFIG_SCHED_EDGE
-	processor_state_update_running_foreign(processor, thread);
+	sched_edge_update_running_foreign_state(processor, thread);
 	processor_state_update_running_cluster_shared_rsrc(processor, thread);
 	/* Since idle and bound threads are not tracked by the edge scheduler, ignore when those threads go on-core */
 	sched_bucket_t bucket = ((thread->state & TH_IDLE) || (thread->bound_processor != PROCESSOR_NULL)) ? TH_BUCKET_SCHED_MAX : thread->th_sched_bucket;
 	os_atomic_store(&processor->processor_set->cpu_running_buckets[processor->cpu_id], bucket, relaxed);
-	sched_edge_stir_the_pot_update_registry_state(thread);
-#endif /* CONFIG_SCHED_EDGE */
+	sched_edge_stir_the_pot_update_registry_state(thread, thread_is_new);
+#else /* !CONFIG_SCHED_EDGE */
+	(void)thread_is_new;
+#endif /* !CONFIG_SCHED_EDGE */
 
 #if CONFIG_THREAD_GROUPS
 	processor->current_thread_group = thread_group_get(thread);
@@ -570,60 +695,49 @@ processor_state_update_from_thread(processor_t processor, thread_t thread, boole
 	processor->current_is_eagerpreempt = thread_is_eager_preempt(thread);
 	if (pset_lock_held) {
 		/* Only update the pset load average when the pset lock is held */
-		sched_update_pset_load_average(processor->processor_set, 0);
+		SCHED(update_pset_load_average)(processor->processor_set, 0);
 	}
 }
 
-pset_node_t
-pset_node_root(void)
+/* Must be called with processor as current_processor() */
+void
+processor_state_update_from_new_thread(processor_t processor, thread_t thread, bool pset_lock_held)
 {
-	return &pset_node0;
+	assert3p(thread, !=, processor->active_thread);
+	processor_state_update_from_thread(processor, thread, pset_lock_held, true);
+}
+
+/* Must be called with processor as current_processor() */
+void
+processor_state_update_from_running_thread(processor_t processor, thread_t thread, bool pset_lock_held)
+{
+	assert3p(thread, ==, processor->active_thread);
+	processor_state_update_from_thread(processor, thread, pset_lock_held, false);
 }
 
 #if __AMP__
-
 /*
- * Only need to dynamically initialize pset nodes when
- * there are multiple cluster types.
+ *	Find processor set for the given cpu_id.
  */
-static pset_node_t
-pset_node_create(cluster_type_t cluster_type)
-{
-	lck_spin_lock(&pset_node_lock);
-	assert3u(cluster_type, !=, CLUSTER_TYPE_SMP);
-
-	pset_node_t node;
-	pset_cluster_type_t pset_cluster_type = cluster_type_to_pset_cluster_type(cluster_type);
-	/*
-	 * Check if we raced with another booting pset of the same type,
-	 * and this node has already been created.
-	 */
-	if ((node = pset_node_for_pset_cluster_type(pset_cluster_type)) != PSET_NODE_NULL) {
-		lck_spin_unlock(&pset_node_lock);
-		return node;
-	}
-
-	assert3u(next_pset_node_index, <, MAX_AMP_CLUSTER_TYPES);
-	node = &pset_nodes[next_pset_node_index++];
-	node->psets = PROCESSOR_SET_NULL;
-	node->pset_cluster_type = pset_cluster_type;
-	/* Insert into node linked list */
-	pset_nodes[next_pset_node_index - 2].node_list = node;
-	pset_node_set_for_pset_cluster_type(node, pset_cluster_type);
-
-	lck_spin_unlock(&pset_node_lock);
-	return node;
-}
-
-#endif /* __AMP__*/
-
-LCK_GRP_DECLARE(pset_create_grp, "pset_create");
-LCK_MTX_DECLARE(pset_create_lock, &pset_create_grp);
-
 processor_set_t
-pset_create(
-	cluster_type_t cluster_type,
-	uint32_t pset_cluster_id,
+pset_find_for_cpu_id(
+	uint32_t cpu_id)
+{
+	/* This is called early in boot, before all psets are initialized. We need to
+	 * be careful not to check uninitialized psets. */
+	for (pset_id_t pset_id = 0; pset_id < MAX_PSETS; pset_id++) {
+		processor_set_t pset = pset_for_id(pset_id);
+		if (pset != PROCESSOR_SET_NULL && bit_test(pset->cpu_bitmask, cpu_id)) {
+			return pset;
+		}
+	}
+	return PROCESSOR_SET_NULL;
+}
+#endif /* !__AMP__ */
+
+#if __x86_64__
+processor_set_t
+pset_create_smp(
 	int      pset_id)
 {
 	/* some schedulers do not support multiple psets */
@@ -631,81 +745,35 @@ pset_create(
 		return processor_pset(master_processor);
 	}
 
-	pset_node_t node;
-	pset_cluster_type_t pset_cluster_type;
-#if __AMP__
-	pset_cluster_type = cluster_type_to_pset_cluster_type(cluster_type);
-	node = pset_node_for_pset_cluster_type(pset_cluster_type);
-	if (node == PSET_NODE_NULL) {
-		/* First pset of this cluster type */
-		node = pset_node_create(cluster_type);
-	}
-#else /* !__AMP__ */
-	pset_cluster_type = PSET_SMP;
-	node = &pset_node0;
-	(void)cluster_type;
-#endif /* !__AMP__ */
-
-	processor_set_t pset = zalloc_permanent_type(struct processor_set);
-	if (pset == PROCESSOR_SET_NULL) {
-		panic("Failed to allocate struct processor_set");
-	}
-	pset->pset_cluster_type = pset_cluster_type;
-	pset->pset_cluster_id = pset_cluster_id;
-	pset->pset_id = pset_id;
-	pset_init(pset, node);
+	assert3u(pset_id, <, MAX_PSETS);
+	assert3p(pset_array[pset_id], ==, PROCESSOR_SET_NULL);
+	processor_set_t pset = &pset_array_actual[pset_id];
+	pset->pset_type = PSET_SMP;
+	pset->pset_id = (pset_id_t)pset_id;
+	pset->cluster_id = pset_id; /* on SMP systems, pset_id is 1-to-1 with cluster_id */
+	pset_init(pset);
 
 	return pset;
 }
-
-/*
- *	Find processor set with specified cluster_id.
- *	Returns default_pset if not found.
- */
-processor_set_t
-pset_find(
-	uint32_t cluster_id,
-	processor_set_t default_pset)
-{
-	lck_spin_lock(&pset_node_lock);
-	pset_node_t node = &pset_node0;
-	processor_set_t pset = NULL;
-
-	do {
-		pset = node->psets;
-		while (pset != NULL) {
-			if (pset->pset_cluster_id == cluster_id) {
-				break;
-			}
-			pset = pset->pset_list;
-		}
-	} while (pset == NULL && (node = node->node_list) != NULL);
-	lck_spin_unlock(&pset_node_lock);
-	if (pset == NULL) {
-		return default_pset;
-	}
-	return pset;
-}
+#endif /* __x86_64__ */
 
 /*
  *	Initialize the given processor_set structure.
  */
 void
 pset_init(
-	processor_set_t         pset,
-	pset_node_t                     node)
+	processor_set_t         pset)
 {
 	pset->online_processor_count = 0;
 #if CONFIG_SCHED_EDGE
 	bzero(&pset->pset_load_average, sizeof(pset->pset_load_average));
 	bzero(&pset->pset_runnable_depth, sizeof(pset->pset_runnable_depth));
-#else /* !CONFIG_SCHED_EDGE */
+#elif __AMP__
 	pset->load_average = 0;
-#endif /* CONFIG_SCHED_EDGE */
+#endif /* !CONFIG_SCHED_EDGE && __AMP__ */
 	pset->cpu_set_low = pset->cpu_set_hi = 0;
 	pset->cpu_set_count = 0;
 	pset->last_chosen = -1;
-	pset->cpu_bitmask = 0;
 	pset->recommended_bitmask = 0;
 #if CONFIG_SCHED_SMT
 	pset->primary_map = 0;
@@ -717,7 +785,7 @@ pset_init(
 		pset->cpu_state_map[i] = 0;
 	}
 	pset->pending_AST_URGENT_cpu_mask = 0;
-	pset->pending_AST_PREEMPT_cpu_mask = 0;
+	bitmap_zero((bitmap_t *)&pset->pending_AST_PREEMPT_cpu_mask, MAX_CPUS);
 #if defined(CONFIG_SCHED_DEFERRED_AST)
 	pset->pending_deferred_AST_cpu_mask = 0;
 #endif
@@ -732,9 +800,9 @@ pset_init(
 #endif /* CONFIG_SCHED_SMT */
 #if CONFIG_SCHED_EDGE
 	bzero(&pset->pset_execution_time, sizeof(pset->pset_execution_time));
-	pset->cpu_running_foreign = 0;
+	bitmap_zero((bitmap_t *)&pset->cpu_running_foreign, MAX_CPUS);
 	for (cluster_shared_rsrc_type_t shared_rsrc_type = CLUSTER_SHARED_RSRC_TYPE_MIN; shared_rsrc_type < CLUSTER_SHARED_RSRC_TYPE_COUNT; shared_rsrc_type++) {
-		pset->cpu_running_cluster_shared_rsrc_thread[shared_rsrc_type] = 0;
+		bitmap_zero((bitmap_t *)&pset->cpu_running_cluster_shared_rsrc_thread[shared_rsrc_type], MAX_CPUS);
 		pset->pset_cluster_shared_rsrc_load[shared_rsrc_type] = 0;
 	}
 #endif /* CONFIG_SCHED_EDGE */
@@ -747,36 +815,19 @@ pset_init(
 	pset->perfcontrol_cpu_migration_bitmask = 0;
 	pset->cpu_preferred_last_chosen = -1;
 
-	if (pset != &pset0) {
+	if (pset != sched_boot_pset) {
 		/*
 		 * Scheduler runqueue initialization for non-boot psets.
-		 * This initialization for pset0 happens in sched_init().
+		 * This initialization for the boot pset happens in sched_init().
 		 */
 		SCHED(pset_init)(pset);
 		SCHED(rt_init_pset)(pset);
 	}
 
-	/*
-	 * Because the pset_node_lock is not taken by every client of the pset_map,
-	 * we need to make sure that the initialized pset contents are visible to any
-	 * client that loads a non-NULL value from pset_array.
-	 */
-	os_atomic_store(&pset_array[pset->pset_id], pset, release);
-
-	lck_spin_lock(&pset_node_lock);
-
-	/* Initialize pset node state regarding this pset */
-	bit_set(node->pset_map, pset->pset_id);
-	pset->node = node;
-
-	processor_set_t *prev = &node->psets;
-	while (*prev != PROCESSOR_SET_NULL) {
-		prev = &(*prev)->pset_list;
-	}
-	*prev = pset;
-
-	lck_spin_unlock(&pset_node_lock);
+	pset_array[pset->pset_id] = pset;
 }
+
+#if !SCHED_TEST_HARNESS
 
 kern_return_t
 processor_info_count(
@@ -897,6 +948,81 @@ processor_info(
 		return result;
 	}
 }
+
+#endif /* !SCHED_TEST_HARNESS */
+
+void
+pset_update_processor_state(processor_set_t pset, processor_t processor, uint new_state)
+{
+	pset_assert_locked(pset);
+
+	uint old_state = processor->state;
+	uint cpuid = (uint)processor->cpu_id;
+
+	assert(processor->processor_set == pset);
+	assert(bit_test(pset->cpu_bitmask, cpuid));
+
+	assert(old_state < PROCESSOR_STATE_LEN);
+	assert(new_state < PROCESSOR_STATE_LEN);
+
+	processor->state = new_state;
+
+	bit_clear(pset->cpu_state_map[old_state], cpuid);
+	bit_set(pset->cpu_state_map[new_state], cpuid);
+
+	if (bit_test(pset->cpu_available_map, cpuid) && (new_state < PROCESSOR_IDLE)) {
+		/* No longer available for scheduling */
+		bit_clear(pset->cpu_available_map, cpuid);
+	} else if (!bit_test(pset->cpu_available_map, cpuid) && (new_state >= PROCESSOR_IDLE)) {
+		/* Newly available for scheduling */
+		bit_set(pset->cpu_available_map, cpuid);
+	}
+
+	if ((old_state == PROCESSOR_RUNNING) || (new_state == PROCESSOR_RUNNING)) {
+		SCHED(update_pset_load_average)(pset, 0);
+		if (new_state == PROCESSOR_RUNNING) {
+			assert(processor == current_processor());
+		}
+	}
+	if ((old_state == PROCESSOR_IDLE) || (new_state == PROCESSOR_IDLE)) {
+		if (new_state == PROCESSOR_IDLE) {
+			bit_clear(pset->realtime_map, cpuid);
+		}
+
+		pset_node_t node = pset->node;
+
+		if (bit_count(node->pset_map) == 1) {
+			/* Node has only a single pset, so skip node pset map updates */
+			return;
+		}
+
+		if (new_state == PROCESSOR_IDLE) {
+#if CONFIG_SCHED_SMT
+			if (processor->processor_primary == processor) {
+				if (!bit_test(atomic_load(&node->pset_non_rt_primary_map), pset->pset_id)) {
+					atomic_bit_set(&node->pset_non_rt_primary_map, pset->pset_id, memory_order_relaxed);
+				}
+			}
+#endif /* CONFIG_SCHED_SMT */
+			if (!bit_test(atomic_load(&node->pset_non_rt_map), pset->pset_id)) {
+				atomic_bit_set(&node->pset_non_rt_map, pset->pset_id, memory_order_relaxed);
+			}
+			if (!bit_test(atomic_load(&node->pset_idle_map), pset->pset_id)) {
+				atomic_bit_set(&node->pset_idle_map, pset->pset_id, memory_order_relaxed);
+			}
+		} else {
+			cpumap_t idle_map = pset->cpu_state_map[PROCESSOR_IDLE];
+			if (idle_map == 0) {
+				/* No more IDLE CPUs */
+				if (bit_test(atomic_load(&node->pset_idle_map), pset->pset_id)) {
+					atomic_bit_clear(&node->pset_idle_map, pset->pset_id, memory_order_relaxed);
+				}
+			}
+		}
+	}
+}
+
+#if !SCHED_TEST_HARNESS
 
 /*
  * Now that we're enforcing all CPUs actually boot, we may need a way to
@@ -1326,7 +1452,7 @@ processor_get_assignment(
 		return KERN_FAILURE;
 	}
 
-	*pset = &pset0;
+	*pset = sched_boot_pset;
 
 	return KERN_SUCCESS;
 }
@@ -1472,7 +1598,7 @@ processor_set_statistics(
 	processor_set_info_t    info,
 	mach_msg_type_number_t  *count)
 {
-	if (pset == PROCESSOR_SET_NULL || pset != &pset0) {
+	if (pset == PROCESSOR_SET_NULL || pset != sched_boot_pset) {
 		return KERN_INVALID_PROCESSOR_SET;
 	}
 
@@ -1526,7 +1652,7 @@ processor_set_things(
 	mach_port_array_t addr, newaddr;
 	vm_size_t count, count_needed;
 
-	if (pset == PROCESSOR_SET_NULL || pset != &pset0) {
+	if (pset == PROCESSOR_SET_NULL || pset != sched_boot_pset) {
 		return KERN_INVALID_ARGUMENT;
 	}
 
@@ -1795,51 +1921,9 @@ processor_set_tasks_with_flavor(
 	}
 }
 
-/*
- *	processor_set_threads:
- *
- *	List all threads in the processor set.
- */
-#if defined(SECURE_KERNEL)
-kern_return_t
-processor_set_threads(
-	__unused processor_set_t         pset,
-	__unused thread_act_array_t     *thread_list,
-	__unused mach_msg_type_number_t *count)
-{
-	return KERN_FAILURE;
-}
-#elif !defined(XNU_TARGET_OS_OSX)
-kern_return_t
-processor_set_threads(
-	__unused processor_set_t         pset,
-	__unused thread_act_array_t     *thread_list,
-	__unused mach_msg_type_number_t *count)
-{
-	return KERN_NOT_SUPPORTED;
-}
-#else
-kern_return_t
-processor_set_threads(
-	processor_set_t         pset,
-	thread_act_array_t      *thread_list,
-	mach_msg_type_number_t  *count)
-{
-	kern_return_t ret;
+#endif /* !SCHED_TEST_HARNESS */
 
-	ret = processor_set_things(pset, thread_list, count,
-	    PSET_THING_THREAD, TASK_FLAVOR_CONTROL);
-	if (ret != KERN_SUCCESS) {
-		return ret;
-	}
-
-	/* do the conversion that Mig should handle */
-	convert_thread_array_to_ports(*thread_list, *count, TASK_FLAVOR_CONTROL);
-	return KERN_SUCCESS;
-}
-#endif
-
-pset_cluster_type_t
+pset_type_t
 recommended_pset_type(thread_t thread)
 {
 	/* Only used by the AMP scheduler policy */
@@ -1855,7 +1939,7 @@ recommended_pset_type(thread_t thread)
 	if (enable_task_set_cluster_type && (task->t_flags & TF_USE_PSET_HINT_CLUSTER_TYPE)) {
 		processor_set_t pset_hint = task->pset_hint;
 		if (pset_hint) {
-			return pset_hint->pset_cluster_type;
+			return pset_hint->pset_type;
 		}
 	}
 
@@ -1864,8 +1948,8 @@ recommended_pset_type(thread_t thread)
 	}
 #endif
 
-	if (thread->th_bound_cluster_id != THREAD_BOUND_CLUSTER_NONE) {
-		return pset_array[thread->th_bound_cluster_id]->pset_cluster_type;
+	if (thread->th_bound_pset_id != THREAD_BOUND_PSET_NONE) {
+		return pset_array[thread->th_bound_pset_id]->pset_type;
 	}
 
 	if (thread->base_pri <= MAXPRI_THROTTLE) {
@@ -1893,48 +1977,29 @@ recommended_pset_type(thread_t thread)
 		return PSET_AMP_P;
 	}
 #else /* !CONFIG_THREAD_GROUPS || !__AMP__ || CONFIG_SCHED_EDGE */
-	(void)thread;
-	return PSET_SMP;
+#pragma unused(thread)
+	return MAX_PSET_TYPES;
 #endif /* !CONFIG_THREAD_GROUPS || !__AMP__ || CONFIG_SCHED_EDGE */
 }
 
-#if __arm64__
-
-cluster_type_t
-pset_cluster_type_to_cluster_type(pset_cluster_type_t pset_cluster_type)
-{
-	switch (pset_cluster_type) {
 #if __AMP__
-	case PSET_AMP_E:
-		return CLUSTER_TYPE_E;
-	case PSET_AMP_P:
-		return CLUSTER_TYPE_P;
-#endif /* __AMP__ */
-	case PSET_SMP:
-		return CLUSTER_TYPE_SMP;
-	default:
-		panic("Unexpected pset cluster type %d", pset_cluster_type);
-	}
-}
 
-pset_cluster_type_t
-cluster_type_to_pset_cluster_type(cluster_type_t cluster_type)
+pset_type_t
+cluster_type_to_pset_type(cluster_type_t cluster_type)
 {
 	switch (cluster_type) {
-#if __AMP__
 	case CLUSTER_TYPE_E:
 		return PSET_AMP_E;
+	case CLUSTER_TYPE_M:
+		return PSET_AMP_M;
 	case CLUSTER_TYPE_P:
 		return PSET_AMP_P;
-#endif /* __AMP__ */
-	case CLUSTER_TYPE_SMP:
-		return PSET_SMP;
 	default:
 		panic("Unexpected cluster type %d", cluster_type);
 	}
 }
 
-#endif /* __arm64__ */
+#endif /* __AMP__ */
 
 #if CONFIG_THREAD_GROUPS && __AMP__ && !CONFIG_SCHED_EDGE
 

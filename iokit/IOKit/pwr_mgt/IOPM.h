@@ -794,6 +794,7 @@ enum {
 // PM settings work. Those keys are defined in IOPMLibPrivate.h.
 #define kIOPMSettingWakeOnRingKey                   "Wake On Modem Ring"
 #define kIOPMSettingRestartOnPowerLossKey           "Automatic Restart On Power Loss"
+#define kIOPMSettingRestartOnPowerConnectKey        "Automatic Restart On Power Connect"
 #define kIOPMSettingWakeOnACChangeKey               "Wake On AC Change"
 #define kIOPMSettingSleepOnPowerButtonKey           "Sleep On Power Button"
 #define kIOPMSettingWakeOnClamshellKey              "Wake On Clamshell Open"
@@ -981,5 +982,6 @@ enum {
 	kIOPMSystemCapabilityNetwork    = 0x08,
 	kIOPMSystemCapabilityAOT        = 0x10,
 };
+
 
 #endif /* ! _IOKIT_IOPM_H */

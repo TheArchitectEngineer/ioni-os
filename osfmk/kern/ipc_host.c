@@ -143,12 +143,12 @@ ipc_host_init(void)
 		realhost.exc_actions[i].behavior = 0;
 		realhost.exc_actions[i].flavor = 0;
 		realhost.exc_actions[i].privileged = FALSE;
-	} /* for */
+	}
 
 	/*
 	 *	Set up ipc for default processor set.
 	 */
-	ipc_pset_init(&pset0);
+	ipc_pset_init(sched_boot_pset);
 
 	/*
 	 *	And for master processor
@@ -226,7 +226,7 @@ processor_set_default(
 		return KERN_INVALID_ARGUMENT;
 	}
 
-	*pset = &pset0;
+	*pset = sched_boot_pset;
 
 	return KERN_SUCCESS;
 }

@@ -37,6 +37,10 @@
 #include <sys/param.h>
 #include <sys/xattr.h>
 #include <sys/clonefile.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 #include <darwintest.h>
 #include <darwintest/utils.h>
@@ -44,34 +48,6 @@
 static char template[MAXPATHLEN];
 static char *testdir = NULL;
 static int testdir_fd = -1, test_fd = -1;
-
-#ifndef ENOTCAPABLE
-#define ENOTCAPABLE             107
-#endif
-
-#ifndef O_RESOLVE_BENEATH
-#define O_RESOLVE_BENEATH       0x1000
-#endif
-
-#ifndef AT_RESOLVE_BENEATH
-#define AT_RESOLVE_BENEATH      0x2000
-#endif
-
-#ifndef XATTR_RESOLVE_BENEATH
-#define XATTR_RESOLVE_BENEATH   0x0080
-#endif
-
-#ifndef CLONE_RESOLVE_BENEATH
-#define CLONE_RESOLVE_BENEATH   0x0010
-#endif
-
-#ifndef RENAME_RESOLVE_BENEATH
-#define RENAME_RESOLVE_BENEATH  0x0020
-#endif
-
-#ifndef FSOPT_RESOLVE_BENEATH
-#define FSOPT_RESOLVE_BENEATH   0x1000
-#endif
 
 #define TEST_DIR "test_dir"
 #define NESTED_DIR "test_dir/nested"
@@ -150,9 +126,7 @@ cleanup(void)
 		unlinkat(testdir_fd, OUTSIDE_FILE, 0);
 
 		close(testdir_fd);
-		if (rmdir(testdir)) {
-			T_FAIL("Unable to remove the test directory (%s)", testdir);
-		}
+		rmdir(testdir);
 	}
 }
 
@@ -1185,3 +1159,4 @@ T_DECL(resolve_beneath_setattrlist,
 
 	T_EXPECT_POSIX_SUCCESS(close(fd), "Closing %s", INSIDE_FILE);
 }
+

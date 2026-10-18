@@ -4932,6 +4932,21 @@ sysctl_vfs_ctlbyfsid(__unused struct sysctl_oid *oidp, void *arg1, int arg2,
 		goto out;
 	}
 	gotref = 1;
+
+#if CONFIG_MACF
+	vnode_t cvp = vfs_vnodecovered(mp);
+	if (cvp == NULLVP) {
+		error = ENOENT;
+		goto out;
+	}
+
+	error = mac_vnode_check_lookup_preflight(ctx, cvp, ".", 1);
+	vnode_put(cvp);
+	if (error != 0) {
+		goto out;
+	}
+#endif /* CONFIG_MACF */
+
 	/* reset so that the fs specific code can fetch it. */
 	req->newidx = 0;
 	/*
@@ -4959,6 +4974,7 @@ sysctl_vfs_ctlbyfsid(__unused struct sysctl_oid *oidp, void *arg1, int arg2,
 			goto out;
 		}
 	}
+
 	switch (name[0]) {
 	case VFS_CTL_UMOUNT:
 #if CONFIG_MACF
@@ -5721,7 +5737,8 @@ retry:
 #endif /* CONFIG_JETSAM */
 
 	if (((numvnodes - deadvnodes + deadvnodes_noreuse) < desiredvnodes) ||
-	    force_alloc || force_alloc_freeable) {
+	    force_alloc || force_alloc_freeable ||
+	    (numvnodes < numvnodes_max && can_free && (deadvnodes > deadvnodes_noreuse))) {
 		struct timespec ts;
 		uint32_t vflag = 0;
 
@@ -5794,7 +5811,7 @@ retry:
 		nanouptime(&ts);
 		vp->v_id = (uint32_t)ts.tv_nsec;
 		vp->v_flag = VSTANDARD | vflag;
-		if (force_alloc_freeable) {
+		if (force_alloc_freeable || ((numvnodes > desiredvnodes) && !force_alloc)) {
 			/* This vnode should be recycled and freed immediately */
 			vp->v_lflag = VL_MARKTERM;
 			vp->v_listflag = VLIST_NO_REUSE;
@@ -5913,29 +5930,30 @@ retry:
 		}
 	}
 
-	//
-	// if we don't have a vnode and the walk_count is >= MAX_WALK_COUNT
-	// then we're trying to create a vnode on behalf of a
-	// process like diskimages-helper that has file systems
-	// mounted on top of itself (and thus we can't reclaim
-	// vnodes in the file systems on top of us).  if we can't
-	// find a vnode to reclaim then we'll just have to force
-	// the allocation.
-	//
-	if (vp == NULL && walk_count >= MAX_WALK_COUNT) {
-		force_alloc = 1;
-		vnode_list_unlock();
-		goto retry;
-	}
-
 	if (vp == NULL) {
 		if (can_free && (vn_dealloc_level > DEALLOC_VNODE_NONE) &&
 		    (numvnodes >= force_alloc_min) && (numvnodes < numvnodes_max)) {
 			force_alloc_freeable = true;
-			vnode_list_unlock();
+		}
+
+		//
+		// if we don't have a vnode and the walk_count is >= MAX_WALK_COUNT
+		// then we're trying to create a vnode on behalf of a
+		// process like diskimages-helper that has file systems
+		// mounted on top of itself (and thus we can't reclaim
+		// vnodes in the file systems on top of us).  if we can't
+		// find a vnode to reclaim then we'll just have to force
+		// the allocation.
+		//
+		if (!force_alloc_freeable && walk_count >= MAX_WALK_COUNT) {
+			force_alloc = 1;
+		}
+
+		vnode_list_unlock();
+
+		if (force_alloc_freeable || force_alloc) {
 			goto retry;
 		}
-		vnode_list_unlock();
 
 		/*
 		 * we've reached the system imposed maximum number of vnodes
@@ -6521,12 +6539,12 @@ vnode_usecount(vnode_t vp)
 int
 vnode_iocount(vnode_t vp)
 {
-	if (!(vp->v_ext_flag & VE_LINKCHANGE)) {
+	if (!(os_atomic_load(&vp->v_ext_flag, relaxed) & VE_LINKCHANGE)) {
 		return vp->v_iocount;
 	} else {
 		int iocount = 0;
 		vnode_lock_spin(vp);
-		if (!(vp->v_ext_flag & VE_LINKCHANGE)) {
+		if (!(os_atomic_load(&vp->v_ext_flag, relaxed) & VE_LINKCHANGE)) {
 			iocount = vp->v_iocount;
 		} else {
 			/* the "link lock" takes its own iocount */
@@ -6823,7 +6841,6 @@ void
 vnode_reclaim_internal(struct vnode * vp, int locked, int reuse, int flags)
 {
 	int isfifo = 0;
-	bool clear_tty_revoke = false;
 
 	if (!locked) {
 		vnode_lock(vp);
@@ -6846,17 +6863,10 @@ vnode_reclaim_internal(struct vnode * vp, int locked, int reuse, int flags)
 	if (vnode_istty(vp) && (flags & REVOKEALL) && (vp->v_iocount > 1)) {
 		vnode_unlock(vp);
 		VNOP_IOCTL(vp, TIOCREVOKE, (caddr_t)NULL, 0, vfs_context_kernel());
-		clear_tty_revoke = true;
 		vnode_lock(vp);
 	}
 
 	vnode_drain(vp);
-
-	if (clear_tty_revoke) {
-		vnode_unlock(vp);
-		VNOP_IOCTL(vp, TIOCREVOKECLEAR, (caddr_t)NULL, 0, vfs_context_kernel());
-		vnode_lock(vp);
-	}
 
 #if CONFIG_FILE_LEASES
 	/*
@@ -7425,8 +7435,8 @@ void
 vnode_link_lock(vnode_t vp)
 {
 	vnode_lock_spin(vp);
-	while (vp->v_ext_flag & VE_LINKCHANGE) {
-		vp->v_ext_flag |= VE_LINKCHANGEWAIT;
+	while (os_atomic_load(&vp->v_ext_flag, relaxed) & VE_LINKCHANGE) {
+		os_atomic_or(&vp->v_ext_flag, VE_LINKCHANGEWAIT, relaxed);
 		msleep(&vp->v_ext_flag, &vp->v_lock, PVFS | PSPIN,
 		    "vnode_link_lock_wait", 0);
 	}
@@ -7434,7 +7444,7 @@ vnode_link_lock(vnode_t vp)
 		panic("%s called without an iocount on the vnode", __FUNCTION__);
 	}
 	vnode_get_locked(vp);
-	vp->v_ext_flag |= VE_LINKCHANGE;
+	os_atomic_or(&vp->v_ext_flag, VE_LINKCHANGE, relaxed);
 	vnode_unlock(vp);
 }
 
@@ -7445,10 +7455,10 @@ vnode_link_unlock(vnode_t vp)
 	bool do_vnode_put = false;
 
 	vnode_lock_spin(vp);
-	if (vp->v_ext_flag & VE_LINKCHANGEWAIT) {
+	if (os_atomic_load(&vp->v_ext_flag, relaxed) & VE_LINKCHANGEWAIT) {
 		do_wakeup = true;
 	}
-	vp->v_ext_flag &= ~(VE_LINKCHANGE | VE_LINKCHANGEWAIT);
+	os_atomic_andnot(&vp->v_ext_flag, VE_LINKCHANGE | VE_LINKCHANGEWAIT, relaxed);
 	if ((vp->v_usecount > 0) || (vp->v_iocount > 1)) {
 		vnode_put_locked(vp);
 	} else {
@@ -8740,7 +8750,7 @@ vn_authorize_renamex_with_paths(struct vnode *fdvp, struct vnode *fvp, struct co
 			    (uintptr_t)fvp,
 			    (uintptr_t)to_path);
 		}
-		if (vnode_isdir(fvp)) {
+		if (vnode_isdir(fvp) && moving) {
 			if ((error = vnode_authorize(fvp, fdvp, KAUTH_VNODE_DELETE | KAUTH_VNODE_ADD_SUBDIRECTORY, ctx)) != 0) {
 				goto out;
 			}
@@ -13452,7 +13462,8 @@ vnode_hasmultipath(vnode_t vp)
 	vnode_link_lock(vp);
 	link_locked = true;
 
-	if (is_local_volume && (vp->v_ext_flag & VE_NOT_HARDLINK)) {
+	if (is_local_volume &&
+	    (os_atomic_load(&vp->v_ext_flag, relaxed) & VE_NOT_HARDLINK)) {
 		goto out;
 	}
 
@@ -13477,9 +13488,7 @@ vnode_hasmultipath(vnode_t vp)
 	}
 
 	if (has_multipath == 0) {
-		vnode_lock_spin(vp);
-		vp->v_ext_flag |= VE_NOT_HARDLINK;
-		vnode_unlock(vp);
+		os_atomic_or(&vp->v_ext_flag, VE_NOT_HARDLINK, relaxed);
 	}
 
 out:
@@ -13488,4 +13497,10 @@ out:
 	}
 
 	return has_multipath;
+}
+
+bool
+vnode_isappendonly(vnode_t vp)
+{
+	return os_atomic_load(&vp->v_ext_flag, relaxed) & VE_APPENDONLY;
 }

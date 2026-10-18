@@ -26,11 +26,12 @@
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
-/* compile: xcrun -sdk macosx.internal clang -ldarwintest -o statfs_ext statfs_ext.c -g -Weverything */
+/* compile: xcrun -sdk macosx.internal clang -arch arm64e -arch x86_64 -lsandbox -ldarwintest -o statfs_ext statfs_ext.c */
 
 #include <stdlib.h>
 #include <fcntl.h>
 #include <System/sys/mount.h>
+#include <sandbox/libsandbox.h>
 #include <sys/stat.h>
 
 #include <darwintest.h>
@@ -41,6 +42,8 @@
 #define FSTYPE_DEVFS "devfs"
 static char template[MAXPATHLEN];
 static char *testdir = NULL;
+static sandbox_params_t params = NULL;
+static sandbox_profile_t profile = NULL;
 
 #define TEST_MODE_STATFS  0
 #define TEST_MODE_FSTATFS 1
@@ -55,13 +58,17 @@ T_GLOBAL_META(
 	T_META_NAMESPACE("xnu.vfs"),
 	T_META_RADAR_COMPONENT_NAME("xnu"),
 	T_META_RADAR_COMPONENT_VERSION("vfs"),
-	T_META_ASROOT(false),
-	T_META_ENABLED(RUN_TEST),
 	T_META_CHECK_LEAKS(false));
 
 static void
 cleanup(void)
 {
+	if (profile) {
+		sandbox_free_profile(profile);
+	}
+	if (params) {
+		sandbox_free_params(params);
+	}
 	if (testdir) {
 		unmount(testdir, MNT_FORCE);
 		rmdir(testdir);
@@ -72,7 +79,7 @@ static void
 statfs_compare(const char *path, struct statfs *sfs_ext, int mode, int flag, int expected_err)
 {
 	int fd;
-	struct statfs sfs;
+	struct statfs sfs = {};
 
 	T_LOG("Testing: path %s, sfs_ext %p, mode %s, flag 0x%x, expected_err %d", path, (void *) sfs_ext, mode_name[mode], (unsigned int)flag, expected_err);
 
@@ -85,8 +92,8 @@ statfs_compare(const char *path, struct statfs *sfs_ext, int mode, int flag, int
 		if (expected_err) {
 			T_ASSERT_POSIX_FAILURE(statfs_ext(path, sfs_ext, flag), expected_err, "Verifying that statfs_ext() fails with %d (%s)", expected_err, strerror(expected_err));
 		} else {
-			T_ASSERT_POSIX_SUCCESS(statfs(path, &sfs), "Calling stafs()");
 			T_ASSERT_POSIX_SUCCESS(statfs_ext(path, sfs_ext, flag), "Calling statfs_ext() using the %s flag", flag_name[flag]);
+			T_ASSERT_POSIX_SUCCESS(statfs(path, &sfs), "Calling stafs()");
 		}
 		break;
 	case TEST_MODE_FSTATFS:
@@ -107,29 +114,21 @@ statfs_compare(const char *path, struct statfs *sfs_ext, int mode, int flag, int
 		return;
 	}
 
-	switch (flag) {
-	case 0:
-		T_ASSERT_EQ(memcmp(&sfs, sfs_ext, sizeof(struct statfs)), 0, "Validating statfs structure");
-		break;
-	case STATFS_EXT_NOBLOCK:
-		T_ASSERT_EQ(sfs.f_fsid.val[0], sfs_ext->f_fsid.val[0], "Validating f_fsid.val[0]");
-		T_ASSERT_EQ(sfs.f_fsid.val[1], sfs_ext->f_fsid.val[1], "Validating f_fsid.val[1]");
-		T_ASSERT_EQ(sfs.f_owner, sfs_ext->f_owner, "Validating f_owner");
-		T_ASSERT_EQ(sfs.f_type, sfs_ext->f_type, "Validating f_type");
-		T_ASSERT_EQ(sfs.f_flags, sfs_ext->f_flags, "Validating f_flags");
-		T_ASSERT_EQ(sfs.f_fssubtype, sfs_ext->f_fssubtype, "Validating f_fssubtype");
-		T_ASSERT_EQ_STR(sfs.f_fstypename, sfs_ext->f_fstypename, "Validating f_fstypename");
-		T_ASSERT_EQ_STR(sfs.f_mntonname, sfs_ext->f_mntonname, "Validating f_mntonname");
-		T_ASSERT_EQ_STR(sfs.f_mntfromname, sfs_ext->f_mntfromname, "Validating f_mntfromname");
-		T_ASSERT_EQ(sfs.f_flags_ext, sfs_ext->f_flags_ext, "Validating f_flags_ext");
-		break;
-	default:
-		T_FAIL("Unknown flag");
-	}
+	T_ASSERT_EQ(sfs.f_fsid.val[0], sfs_ext->f_fsid.val[0], "Validating f_fsid.val[0]");
+	T_ASSERT_EQ(sfs.f_fsid.val[1], sfs_ext->f_fsid.val[1], "Validating f_fsid.val[1]");
+	T_ASSERT_EQ(sfs.f_owner, sfs_ext->f_owner, "Validating f_owner");
+	T_ASSERT_EQ(sfs.f_type, sfs_ext->f_type, "Validating f_type");
+	T_ASSERT_EQ(sfs.f_flags, sfs_ext->f_flags, "Validating f_flags");
+	T_ASSERT_EQ(sfs.f_fssubtype, sfs_ext->f_fssubtype, "Validating f_fssubtype");
+	T_ASSERT_EQ_STR(sfs.f_fstypename, sfs_ext->f_fstypename, "Validating f_fstypename");
+	T_ASSERT_EQ_STR(sfs.f_mntonname, sfs_ext->f_mntonname, "Validating f_mntonname");
+	T_ASSERT_EQ_STR(sfs.f_mntfromname, sfs_ext->f_mntfromname, "Validating f_mntfromname");
+	T_ASSERT_EQ(sfs.f_flags_ext, sfs_ext->f_flags_ext, "Validating f_flags_ext");
 }
 
 T_DECL(statfs_ext,
-    "test statfs_ext and fstatfs_ext")
+    "test statfs_ext and fstatfs_ext",
+    T_META_ENABLED(RUN_TEST), T_META_ASROOT(false))
 {
 #if (!RUN_TEST)
 	T_SKIP("Not macOS");
@@ -165,4 +164,103 @@ T_DECL(statfs_ext,
 	statfs_compare("/dev", &sfs_ext, TEST_MODE_STATFS, STATFS_EXT_NOBLOCK, 0);
 	statfs_compare("/private/var/tmp", &sfs_ext, TEST_MODE_FSTATFS, STATFS_EXT_NOBLOCK, 0);
 	statfs_compare(testdir, &sfs_ext, TEST_MODE_FSTATFS, STATFS_EXT_NOBLOCK, 0);
+}
+
+static void
+create_profile_string_SYS_fgetattrlist(char *buff, size_t size)
+{
+	snprintf(buff, size, "(version 1) \n\
+                          (allow default) \n\
+                          (import \"system.sb\") \n\
+                          (deny syscall-unix (syscall-number SYS_getattrlist) (syscall-number SYS_fgetattrlist)) \n");
+}
+
+T_DECL(statfs_ext_sandbox_SYS_getattrlist,
+    "test statfs_ext and fstatfs_ext when the sandbox profile denies getattrlist/fgetattrlist",
+    T_META_ENABLED(false), T_META_ASROOT(true))
+{
+#if (!RUN_TEST)
+	T_SKIP("Not macOS");
+#endif
+
+	struct statfs sfs_ext;
+	char *sberror = NULL;
+	char profile_string[1000];
+
+#if (!RUN_TEST)
+	T_SKIP("Not macOS");
+#endif
+
+	if (geteuid() != 0) {
+		T_SKIP("Test should run as root");
+	}
+
+	T_ATEND(cleanup);
+	T_SETUPBEGIN;
+
+	/* Create sandbox variables */
+	T_ASSERT_POSIX_NOTNULL(params = sandbox_create_params(), "Creating Sandbox params object");
+	create_profile_string_SYS_fgetattrlist(profile_string, sizeof(profile_string));
+	T_ASSERT_POSIX_NOTNULL(profile = sandbox_compile_string(profile_string, params, &sberror), "Creating Sandbox profile object");
+
+	T_SETUPEND;
+
+	/* Apply sandbox profile */
+	T_ASSERT_POSIX_SUCCESS(sandbox_apply(profile), "Applying Sandbox profile");
+
+	/* Test fstatfs_ext() with zero flags */
+	statfs_compare("/", &sfs_ext, TEST_MODE_STATFS, STATFS_EXT_NOBLOCK, 0);
+
+	/* Test fstatfs_ext() with the STATFS_EXT_NOBLOCK flag */
+	statfs_compare("/private/var/tmp", &sfs_ext, TEST_MODE_FSTATFS, STATFS_EXT_NOBLOCK, 0);
+}
+
+
+static void
+create_profile_string_root_metadata(char *buff, size_t size)
+{
+	snprintf(buff, size, "(version 1) \n\
+                          (allow default) \n\
+                          (import \"system.sb\") \n\
+                          (deny file-read-metadata (path \"/\")) \n");
+}
+
+T_DECL(statfs_ext_sandbox_root_metadata,
+    "test statfs_ext and fstatfs_ext when the sandbox profile denies file-read-metadata for root",
+    T_META_ASROOT(true))
+{
+#if (!RUN_TEST)
+	T_SKIP("Not macOS");
+#endif
+
+	struct statfs sfs_ext;
+	char *sberror = NULL;
+	char profile_string[1000];
+
+#if (!RUN_TEST)
+	T_SKIP("Not macOS");
+#endif
+
+	if (geteuid() != 0) {
+		T_SKIP("Test should run as root");
+	}
+
+	T_ATEND(cleanup);
+	T_SETUPBEGIN;
+
+	/* Create sandbox variables */
+	T_ASSERT_POSIX_NOTNULL(params = sandbox_create_params(), "Creating Sandbox params object");
+	create_profile_string_root_metadata(profile_string, sizeof(profile_string));
+	T_ASSERT_POSIX_NOTNULL(profile = sandbox_compile_string(profile_string, params, &sberror), "Creating Sandbox profile object");
+
+	T_SETUPEND;
+
+	/* Apply sandbox profile */
+	T_ASSERT_POSIX_SUCCESS(sandbox_apply(profile), "Applying Sandbox profile");
+
+	/* Test fstatfs_ext() with zero flags */
+	statfs_compare("/", &sfs_ext, TEST_MODE_STATFS, STATFS_EXT_NOBLOCK, 0);
+
+	/* Test fstatfs_ext() with the STATFS_EXT_NOBLOCK flag */
+	statfs_compare("/private/var/tmp", &sfs_ext, TEST_MODE_FSTATFS, STATFS_EXT_NOBLOCK, 0);
 }

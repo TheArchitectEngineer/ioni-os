@@ -291,6 +291,67 @@ out:
 	return error;
 }
 
+int
+fdesc_getbackingvnode(vnode_t fdesc_vp, vnode_t* out_vpp)
+{
+	struct fdescnode *fd;
+	struct fileproc *fp;
+	struct proc *p;
+	int error;
+	vnode_t backing_vp;
+
+	if (fdesc_vp == NULLVP || out_vpp == NULL) {
+		return EINVAL;
+	}
+
+	*out_vpp = NULLVP;
+
+	/* Check if this is actually a fdesc vnode */
+	if (vnode_tag(fdesc_vp) != VT_FDESC) {
+		return ENOENT;
+	}
+
+	/* Get the current process - this is the context we need for fd lookup */
+	p = current_proc();
+	if (p == NULL) {
+		return ESRCH;
+	}
+
+	fd = VTOFDESC(fdesc_vp);
+	if (fd == NULL || fd->fd_type != Fdesc) {
+		return ENOENT;
+	}
+
+	/* Look up the file descriptor to get the backing vnode */
+	error = fp_lookup(p, fd->fd_fd, &fp, 0);
+	if (error) {
+		return error;
+	}
+
+	/* Check if the file descriptor points to a vnode */
+	if (FILEGLOB_DTYPE(fp->fp_glob) != DTYPE_VNODE) {
+		/* Not a vnode, can't continue */
+		fp_drop(p, fd->fd_fd, fp, 0);
+		return ENOENT;
+	}
+
+	backing_vp = (vnode_t)fp_get_data(fp);
+	if (backing_vp == NULLVP) {
+		fp_drop(p, fd->fd_fd, fp, 0);
+		return ENOENT;
+	}
+
+	/* Take a reference on the vnode before dropping the fp reference */
+	error = vnode_getwithref(backing_vp);
+	fp_drop(p, fd->fd_fd, fp, 0);
+	if (error) {
+		return error;
+	}
+
+	*out_vpp = backing_vp;
+	return 0;
+}
+
 /*
  * vp is the current namei directory
  * ndp is the name to locate in that directory...
@@ -305,7 +366,6 @@ devfs_devfd_lookup(struct vnop_lookup_args *ap)
 	struct componentname *cnp = ap->a_cnp;
 	char *pname = cnp->cn_nameptr;
 	struct proc *p = vfs_context_proc(ap->a_context);
-	int numfiles = p->p_fd.fd_nfiles;
 	int fd;
 	int error;
 	struct vnode *fvp;
@@ -331,10 +391,21 @@ devfs_devfd_lookup(struct vnop_lookup_args *ap)
 		goto bad;
 	}
 
-	if (fd < 0 || fd >= numfiles ||
+	proc_fdlock_spin(p);
+	if (fd < 0 || fd >= p->p_fd.fd_nfiles ||
 	    *fdfile(p, fd) == NULL ||
 	    (*fdflags(p, fd) & UF_RESERVED)) {
+		proc_fdunlock(p);
 		error = EBADF;
+		goto bad;
+	}
+	proc_fdunlock(p);
+
+	/*
+	 * Don't allow mount/unmount operations on fdesc vnodes
+	 */
+	if (cnp->cn_ndp->ni_op == OP_MOUNT || cnp->cn_ndp->ni_op == OP_UNMOUNT) {
+		error = ENOTSUP;
 		goto bad;
 	}
 
@@ -599,6 +670,7 @@ devfs_devfd_readdir(struct vnop_readdir_args *ap)
 	struct proc *p = current_proc();
 	off_t i;
 	int error;
+	bool proc_fd_locked = false;
 
 	/*
 	 * We don't allow exporting fdesc mounts, and currently local
@@ -618,13 +690,19 @@ devfs_devfd_readdir(struct vnop_readdir_args *ap)
 	i = uio->uio_offset / UIO_MX;
 	error = 0;
 	while (uio_resid(uio) >= UIO_MX) {
+		proc_fdlock(p);
 		if (i >= p->p_fd.fd_nfiles || i < 0) {
+			proc_fdunlock(p);
 			break;
 		}
+		proc_fd_locked = true;
 
 		if (*fdfile(p, i) != NULL && !(*fdflags(p, i) & UF_RESERVED)) {
 			struct dirent d;
 			struct dirent *dp = &d;
+
+			proc_fdunlock(p);
+			proc_fd_locked = false;
 
 			bzero((caddr_t) dp, UIO_MX);
 
@@ -640,6 +718,11 @@ devfs_devfd_readdir(struct vnop_readdir_args *ap)
 			if (error) {
 				break;
 			}
+		}
+
+		if (proc_fd_locked) {
+			proc_fdunlock(p);
+			proc_fd_locked = false;
 		}
 		i++;
 	}

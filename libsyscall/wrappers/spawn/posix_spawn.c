@@ -27,6 +27,7 @@
 
 #define CONFIG_MEMORYSTATUS 1 // <rdar://problem/13604997>
 #include <sys/types.h> /* for user_size_t */
+#include <sys/resource.h>
 #include <spawn.h>
 #include <spawn_private.h>
 #include <sys/spawn_internal.h>
@@ -159,6 +160,7 @@ __posix_spawnattr_init(struct _posix_spawnattr *psattrp)
 	psattrp->psa_max_addr = 0;
 
 	psattrp->psa_no_smt = false;
+	psattrp->psa_4k = false;
 	psattrp->psa_tecs = false;
 
 	psattrp->psa_crash_count = 0;
@@ -919,7 +921,7 @@ posix_spawnattr_setdataless_iopolicy_np(posix_spawnattr_t * __restrict attr,
 
 	psattr = *(_posix_spawnattr_t *)attr;
 	psattr->psa_options |= PSA_OPTION_DATALESS_IOPOLICY;
-	psattr->psa_dataless_iopolicy = policy;
+	psattr->psa_dataless_iopolicy = (policy | IOPOL_MATERIALIZE_DATALESS_FILES_ORIG);
 
 	return 0;
 }
@@ -2648,6 +2650,21 @@ posix_spawnattr_setnosmt_np(const posix_spawnattr_t * __restrict attr)
 }
 
 int
+posix_spawnattr_set_4k_page_size_np(const posix_spawnattr_t * __restrict attr)
+{
+	_posix_spawnattr_t psattr;
+
+	if (attr == NULL || *attr == NULL) {
+		return EINVAL;
+	}
+
+	psattr = *(_posix_spawnattr_t *)attr;
+	psattr->psa_4k = true;
+
+	return 0;
+}
+
+int
 posix_spawnattr_set_csm_np(const posix_spawnattr_t * __restrict attr, uint32_t flags)
 {
 	_posix_spawnattr_t psattr;
@@ -2818,6 +2835,23 @@ posix_spawnattr_set_conclave_id_np(const posix_spawnattr_t *attr, const char *co
 		psattr->psa_conclave_id = buf;
 	}
 	strlcpy(psattr->psa_conclave_id, conclave_id, MAXCONCLAVENAME);
+	return 0;
+}
+
+int
+posix_spawnattr_set_telemetry_np(posix_spawnattr_t *attr, posix_spawn_telemetry_flags_t flags, uint64_t argument)
+{
+#pragma unused(flags, argument)
+	_posix_spawnattr_t psattr;
+
+	if (attr == NULL || *attr == NULL) {
+		return EINVAL;
+	}
+
+	psattr = *(_posix_spawnattr_t *)attr;
+	if (flags & PSA_TELEMETRY_PAGEIN) {
+		psattr->psa_options |= PSA_OPTION_PAGEIN_TELEMETRY;
+	}
 	return 0;
 }
 

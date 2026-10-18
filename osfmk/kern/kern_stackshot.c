@@ -73,10 +73,14 @@
 #include <kern/clock.h>
 #include <kern/policy_internal.h>
 #include <kern/socd_client.h>
+#include <kern/stackshot_kpi.h>
 #include <kern/startup.h>
 #include <vm/pmap.h>
+#include <vm/vm_compressor_xnu.h>
 #include <vm/vm_map_xnu.h>
+#include <vm/vm_stackshot_utils_xnu.h>
 #include <vm/vm_kern_xnu.h>
+#include <vm/vm_page.h>
 #include <vm/vm_pageout.h>
 #include <vm/vm_fault.h>
 #include <vm/vm_shared_region_xnu.h>
@@ -84,6 +88,10 @@
 #include <libkern/OSKextLibPrivate.h>
 #include <os/log.h>
 
+#if HAS_MTE
+#include <arm64/mte.h>
+#include <vm/vm_mteinfo_internal.h>
+#endif /* HAS_MTE */
 
 
 #ifdef CONFIG_EXCLAVES
@@ -100,10 +108,6 @@
 #endif
 
 #include <pexpert/pexpert.h>
-
-#if CONFIG_PERVASIVE_CPI
-#include <kern/monotonic.h>
-#endif /* CONFIG_PERVASIVE_CPI */
 
 #include <san/kasan.h>
 
@@ -140,6 +144,11 @@ extern unsigned int not_in_kdp;
 typedef uint64_t unaligned_u64 __attribute__((aligned(1)));
 
 int kdp_snapshot                            = 0;
+
+/* This are used for reporting purposes only and must not be used for security decisions */
+static stackshot_device_lock_state_t device_lock_state = stackshot_lock_state_unknown;
+static stackshot_passcode_status_t passcode_status = stackshot_passcode_unknown;
+static uint8_t after_first_unlock = false;
 
 #pragma mark ---Stackshot Struct Definitions---
 
@@ -334,6 +343,7 @@ struct stackshot_context {
 	size_t                        sc_num_buffers;
 	struct stackshot_workqueue    __counted_by(STACKSHOT_NUM_WORKQUEUES) sc_workqueues[STACKSHOT_NUM_WORKQUEUES];
 	struct port_label_hash        sc_plh;
+	struct stackshot_vmrl_state   sc_vmrl_state;
 
 	/* Statistics */
 	struct stackshot_duration_v2  sc_duration;
@@ -439,7 +449,10 @@ static kern_return_t    stackshot_finalize_kcdata(void);
 static kern_return_t    stackshot_finalize_singlethreaded_kcdata(void);
 static kern_return_t    stackshot_collect_kcdata(void);
 static int              kdp_stackshot_kcdata_format();
-static void             kdp_mem_and_io_snapshot(struct mem_and_io_snapshot *memio_snap);
+static void             kdp_mem_and_io_snapshot(struct mem_and_io_snapshot_v2 *memio_snap);
+#if HAS_MTE
+static kern_return_t    stackshot_mteinfo_snapshot(kcdata_descriptor_t data);
+#endif
 static vm_offset_t      stackshot_find_phys(vm_map_t map, vm_offset_t target_addr, kdp_fault_flags_t fault_flags, uint32_t *kdp_fault_result_flags);
 static boolean_t        stackshot_copyin(vm_map_t map, uint64_t uaddr, void *dest, size_t size, boolean_t try_fault, uint32_t *kdp_fault_result);
 static int              stackshot_copyin_string(task_t task, uint64_t addr, char *buf, int buf_sz, boolean_t try_fault, uint32_t *kdp_fault_results);
@@ -488,9 +501,7 @@ extern void             proc_memstat_data_kdp(void *p, int32_t *current_memlimit
 extern int              memorystatus_get_pressure_status_kdp(void);
 extern void             memorystatus_proc_flags_unsafe(void * v, boolean_t *is_dirty, boolean_t *is_dirty_tracked, boolean_t *allow_idle_exit, boolean_t *is_active, boolean_t *is_managed, boolean_t *has_assertion);
 extern void             panic_stackshot_release_lock(void);
-
-extern int count_busy_buffers(void); /* must track with declaration in bsd/sys/buf_internal.h */
-
+extern int              count_busy_buffers(void); /* must track with declaration in bsd/sys/buf_internal.h */
 #if CONFIG_TELEMETRY
 extern kern_return_t stack_microstackshot(user_addr_t tracebuf, uint32_t tracebuf_size, uint32_t flags, int32_t *retval);
 #endif /* CONFIG_TELEMETRY */
@@ -505,6 +516,8 @@ static kern_return_t collect_exclave_threads(uint64_t);
 static kern_return_t stackshot_setup_exclave_waitlist(void);
 static void stackshot_cleanup_exclave_waitlist(void);
 #endif
+
+static kern_return_t stackshot_vmrl_collect_blocking_relationships(void);
 
 /*
  * Validates that the given address for a word is both a valid page and has
@@ -1459,7 +1472,7 @@ get_stackshot_est_tasksize(uint64_t trace_flags)
 	    sizeof_if_traceflag(struct io_stats_snapshot, STACKSHOT_INSTRS_CYCLES) +
 	    sizeof_if_traceflag(uint32_t, STACKSHOT_ASID) +
 	    sizeof_if_traceflag(sizeof(uintptr_t) * STACKSHOT_PAGETABLE_BUFSZ, STACKSHOT_PAGE_TABLES) +
-	    sizeof_if_traceflag(struct instrs_cycles_snapshot_v2, STACKSHOT_INSTRS_CYCLES) +
+	    sizeof_if_traceflag(struct instrs_cycles_snapshot_v3, STACKSHOT_INSTRS_CYCLES) +
 	    sizeof(struct stackshot_cpu_architecture) +
 	    sizeof(struct stackshot_task_codesigning_info);
 
@@ -1511,6 +1524,11 @@ get_stackshot_estsize(
 	est_extra_size += sizeof(struct stackshot_latency_collection_v2);
 #endif
 
+#if HAS_MTE
+	if (trace_flags & STACKSHOT_MTEINFO) {
+		est_extra_size += mte_tag_storage_count * sizeof(struct mte_info_cell);
+	}
+#endif
 	est_extra_size += real_ncpus * MAX_FRAMES * sizeof(uintptr_t); /* Stacktrace buffers */
 	est_extra_size += FUDGED_SIZE(tasks_count, 10) * sizeof(uintptr_t) * STACKSHOT_NUM_WORKQUEUES; /* Work queues */
 	est_extra_size += sizeof_if_traceflag(sizeof(uintptr_t) * STACKSHOT_PAGETABLE_BUFSZ * real_ncpus, STACKSHOT_PAGE_TABLES);
@@ -1523,9 +1541,13 @@ get_stackshot_estsize(
 	size = FUDGED_SIZE(size, adj); /* add adj */
 	size = MAX(size, prev_size_hint); /* allow hint to increase */
 	size += stackshot_plh_est_size(); /* add space for the port label hash */
+	if (stackshot_flags & STACKSHOT_THREAD_WAITINFO) {
+		size += sizeof(struct stackshot_vmrl_blocking_relationship) * STACKSHOT_VMRL_MAX_BLOCKING_RELATIONSHIPS;
+		size += sizeof(struct stackshot_thread_vmrl_owner_info) * STACKSHOT_VMRL_MAX_OWNERS;
+		size += sizeof(struct stackshot_thread_vmrl_waiter_info) * STACKSHOT_VMRL_MAX_WAITERS;
+	}
 	size = MIN(size, VM_MAP_TRUNC_PAGE(UINT32_MAX, PAGE_MASK)); /* avoid overflow */
 	estimated_size = (uint32_t) VM_MAP_ROUND_PAGE(size, PAGE_MASK); /* round to pagesize */
-
 	return estimated_size;
 }
 
@@ -1841,6 +1863,7 @@ stackshot_finalize_kcdata(void)
 	LCK_MTX_ASSERT(&stackshot_subsys_mutex, LCK_MTX_ASSERT_OWNED);
 
 	assert(stackshot_ctx.sc_finalized_kcdata != NULL);
+	kcd_exit_on_error(stackshot_vmrl_collect_blocking_relationships());
 
 	/* Write stackshot timing info */
 	kcd_exit_on_error(stackshot_push_duration_and_latency(stackshot_ctx.sc_finalized_kcdata));
@@ -1882,7 +1905,7 @@ stackshot_finalize_singlethreaded_kcdata(void)
 	kern_return_t error;
 
 	assert(stackshot_ctx.sc_is_singlethreaded);
-
+	kcd_exit_on_error(stackshot_vmrl_collect_blocking_relationships());
 	kcd_exit_on_error(stackshot_push_duration_and_latency(stackshot_ctx.sc_finalized_kcdata));
 	/* Note: exactly 0 or 1 call to something pushing more data can be called after kcd_finalize_compression */
 	kcd_finalize_compression(stackshot_ctx.sc_finalized_kcdata);
@@ -1946,16 +1969,52 @@ stackshot_remap_buffer(void *stackshotbuf, uint32_t bytes_traced, uint64_t out_b
 		 */
 		error = copyout(CAST_DOWN(void *, &stackshotbuf_user_addr), (user_addr_t)out_buffer_addr, sizeof(stackshotbuf_user_addr));
 		if (error != KERN_SUCCESS) {
-			mach_vm_deallocate(get_task_map(current_task()), stackshotbuf_user_addr, (mach_vm_size_t)bytes_traced);
+			mach_vm_deallocate_kernel(get_task_map(current_task()), stackshotbuf_user_addr, (mach_vm_size_t)bytes_traced);
 			return error;
 		}
 		error = copyout(&bytes_traced, (user_addr_t)out_size_addr, sizeof(bytes_traced));
 		if (error != KERN_SUCCESS) {
-			mach_vm_deallocate(get_task_map(current_task()), stackshotbuf_user_addr, (mach_vm_size_t)bytes_traced);
+			mach_vm_deallocate_kernel(get_task_map(current_task()), stackshotbuf_user_addr, (mach_vm_size_t)bytes_traced);
 			return error;
 		}
 	}
 	return error;
+}
+
+static kern_return_t
+stackshot_vmrl_collect_blocking_relationships(void)
+{
+	kern_return_t kr = KERN_SUCCESS;
+	mach_vm_address_t out_addr;
+	/*
+	 * We allow stackshot not to find all blockers it initially thought it would.
+	 * For example - readers_count that we had on the entry lock was incorrect/in transition.
+	 */
+	uint32_t num_rels = 0;
+
+	if ((stackshot_flags & STACKSHOT_THREAD_WAITINFO) == 0 || stackshot_ctx.sc_vmrl_state.exp_num_relationships == 0) {
+		/* Nothing to do */
+		return kr;
+	}
+	num_rels = vmrl_stackshot_collect_final_blocking_rels(&stackshot_ctx.sc_vmrl_state);
+	if (num_rels == 0) {
+		return kr;
+	}
+
+	kcdata_compression_window_open(stackshot_ctx.sc_finalized_kcdata);
+
+	kr = kcdata_get_memory_addr_for_array(stackshot_ctx.sc_finalized_kcdata, STACKSHOT_KCTYPE_VMRL_BLOCKING_RELS,
+	    sizeof(struct stackshot_vmrl_blocking_relationship), num_rels, &out_addr);
+	if (kr != KERN_SUCCESS) {
+		os_log(OS_LOG_DEFAULT, "couldn't allocate array for sc_vmrl_blocking_rels");
+		return kr;
+	}
+
+	memcpy((vmrl_blocking_relationship_t *) out_addr, stackshot_ctx.sc_vmrl_state.relationships, sizeof(vmrl_blocking_relationship_t) * num_rels);
+
+	kcdata_compression_window_close(stackshot_ctx.sc_finalized_kcdata);
+
+	return kr;
 }
 
 #if CONFIG_EXCLAVES
@@ -2446,7 +2505,7 @@ kern_stack_snapshot_internal(int stackshot_config_version, void *stackshot_confi
 	}
 
 #if CONFIG_PERVASIVE_CPI && CONFIG_CPU_COUNTERS
-	if (!mt_core_supported) {
+	if (!cpc_cpmu_supported) {
 		snapshot_args.flags &= ~STACKSHOT_INSTRS_CYCLES;
 	}
 #else /* CONFIG_PERVASIVE_CPI && CONFIG_CPU_COUNTERS */
@@ -3691,6 +3750,25 @@ kdp_task_exec_meta_flags(task_t task)
 		flags |= kTaskExecHardenedHeap;
 	}
 
+#if (HAS_MTE || HAS_MTE_EMULATION_SHIMS) && APPLE_FEATURE_MTE
+	if (task_has_sec(task)) {
+		flags |= kTaskExecSec;
+
+		if (task_has_sec_inherit(task)) {
+			flags |= kTaskExecSecInherit;
+		}
+
+		if (task_has_sec_user_data(task)) {
+			flags |= kTaskExecSecUserData;
+		}
+#if HAS_MTE
+		if (task_has_sec_soft_mode(task)) {
+			flags |= kTaskExecSecSoftMode;
+		}
+#endif /* HAS_MTE */
+	}
+
+#endif /* (HAS_MTE || HAS_MTE_EMULATION_SHIMS) && APPLE_FEATURE_MTE */
 
 	return flags;
 }
@@ -3707,6 +3785,12 @@ stackshot_available_task_exec_flags(void)
 
 	flags_mask |= kTaskExecHardenedHeap;
 
+#if (HAS_MTE || HAS_MTE_EMULATION_SHIMS) && APPLE_FEATURE_MTE
+	flags_mask |= kTaskExecSec;
+	flags_mask |= kTaskExecSecUserData;
+	flags_mask |= kTaskExecSecSoftMode;
+	flags_mask |= kTaskExecSecInherit;
+#endif /* (HAS_MTE || HAS_MTE_EMULATION_SHIMS) && APPLE_FEATURE_MTE */
 
 	return flags_mask;
 }
@@ -3768,14 +3852,17 @@ error_exit:
 static kern_return_t
 kcdata_record_task_instrs_cycles(kcdata_descriptor_t kcd, task_t task)
 {
-	struct instrs_cycles_snapshot_v2 instrs_cycles = { 0 };
-	struct recount_usage usage = { 0 };
-	struct recount_usage perf_only = { 0 };
-	recount_task_terminated_usage_perf_only(task, &usage, &perf_only);
-	instrs_cycles.ics_instructions = recount_usage_instructions(&usage);
-	instrs_cycles.ics_cycles = recount_usage_cycles(&usage);
-	instrs_cycles.ics_p_instructions = recount_usage_instructions(&perf_only);
-	instrs_cycles.ics_p_cycles = recount_usage_cycles(&perf_only);
+	struct instrs_cycles_snapshot_v3 instrs_cycles = { 0 };
+	struct recount_usage usage_all = { 0 };
+	struct recount_usage usage_perf = { 0 };
+	struct recount_usage usage_mp = { 0 };
+	recount_task_terminated_usage_cpu_kinds(task, &usage_all, &usage_perf, &usage_mp);
+	instrs_cycles.ics_instructions = recount_usage_instructions(&usage_all);
+	instrs_cycles.ics_cycles = recount_usage_cycles(&usage_all);
+	instrs_cycles.ics_p_instructions = recount_usage_instructions(&usage_perf);
+	instrs_cycles.ics_p_cycles = recount_usage_cycles(&usage_perf);
+	instrs_cycles.ics_m_instructions = recount_usage_instructions(&usage_mp);
+	instrs_cycles.ics_m_cycles = recount_usage_cycles(&usage_mp);
 
 	return kcdata_push_data(kcd, STACKSHOT_KCTYPE_INSTRS_CYCLES, sizeof(instrs_cycles), &instrs_cycles);
 }
@@ -3842,6 +3929,20 @@ kcdata_record_task_jit_address_range(kcdata_descriptor_t kcd, task_t task)
 	} else {
 		return KERN_SUCCESS;
 	}
+}
+
+static kern_return_t
+stackshot_record_device_lock_state(kcdata_descriptor_t kcd)
+{
+	struct stackshot_device_lock_state state = {};
+	stackshot_device_lock_flags_t flags = {};
+	if (after_first_unlock) {
+		flags |= stackshot_device_after_first_unlock;
+	}
+	state.flags = flags;
+	state.passcode_status = passcode_status;
+	state.lock_state = device_lock_state;
+	return kcdata_push_data(kcd, STACKSHOT_KCTYPE_LOCK_STATE, sizeof(state), &state);
 }
 
 #if CONFIG_TASK_SUSPEND_STATS
@@ -4278,7 +4379,21 @@ _stackshot_backtrace_copy(void *vctx, void *dst, user_addr_t src, size_t size)
 	kasan_notify_address_nopoison(src_kva, size);
 #endif
 
+#if HAS_MTE
+	/*
+	 * Disable tag checking during the copy operation. While in the general case,
+	 * if the src page is tagged, we are dealing with a Swift async stack and
+	 * therefore a single tag value, we cannot merely fixup the tag here as
+	 * userspace could place any target address to be dereferenced in the
+	 * backtrace walk, leading to a Denial of Service. We TCO the access instead
+	 * although we should improve this to only TCO loads and not stores.
+	 */
+	mte_disable_tag_checking();
+#endif /* HAS_MTE */
 	memcpy(dst, (const void *)src_kva, size);
+#if HAS_MTE
+	mte_enable_tag_checking();
+#endif /* HAS_MTE */
 
 	return 0;
 }
@@ -4638,14 +4753,19 @@ kcdata_record_thread_snapshot(kcdata_descriptor_t kcd, thread_t thread, task_t t
 
 #if CONFIG_PERVASIVE_CPI
 	if (collect_instrs_cycles) {
-		struct recount_usage usage = { 0 };
-		recount_sum_unsafe(&recount_thread_plan, thread->th_recount.rth_lifetime,
-		    &usage);
+		struct recount_usage usage_all = { 0 };
+		struct recount_usage usage_perf = { 0 };
+		struct recount_usage usage_mp = { 0 };
+		recount_thread_usage_cpu_kinds_kdp(thread, &usage_all, &usage_perf, &usage_mp);
 
-		kcd_exit_on_error(kcdata_get_memory_addr(kcd, STACKSHOT_KCTYPE_INSTRS_CYCLES, sizeof(struct instrs_cycles_snapshot), &out_addr));
-		struct instrs_cycles_snapshot *instrs_cycles = (struct instrs_cycles_snapshot *)out_addr;
-		    instrs_cycles->ics_instructions = recount_usage_instructions(&usage);
-		    instrs_cycles->ics_cycles = recount_usage_cycles(&usage);
+		kcd_exit_on_error(kcdata_get_memory_addr(kcd, STACKSHOT_KCTYPE_INSTRS_CYCLES, sizeof(struct instrs_cycles_snapshot_v3), &out_addr));
+		struct instrs_cycles_snapshot_v3 *instrs_cycles = (struct instrs_cycles_snapshot_v3 *)out_addr;
+		    instrs_cycles->ics_instructions = recount_usage_instructions(&usage_all);
+		    instrs_cycles->ics_cycles = recount_usage_cycles(&usage_all);
+		    instrs_cycles->ics_p_instructions = recount_usage_instructions(&usage_perf);
+		    instrs_cycles->ics_p_cycles = recount_usage_cycles(&usage_perf);
+		    instrs_cycles->ics_m_instructions = recount_usage_instructions(&usage_mp);
+		    instrs_cycles->ics_m_cycles = recount_usage_cycles(&usage_mp);
 	}
 #endif /* CONFIG_PERVASIVE_CPI */
 
@@ -4781,7 +4901,7 @@ kdp_stackshot_record_task(task_t task)
 #if SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI
 	uint64_t task_begin_cpu_cycle_count = 0;
 	if (!stackshot_ctx.sc_panic_stackshot) {
-		task_begin_cpu_cycle_count = mt_cur_cpu_cycles();
+		task_begin_cpu_cycle_count = cpc_cycles();
 	}
 #endif
 
@@ -4979,6 +5099,10 @@ kdp_stackshot_record_task(task_t task)
 			 * or whether it's nonrunnable
 			 */
 			if (save_owner_info) {
+				if (thread->vm_map_lock_ctx_held) {
+					vmrl_stackshot_collect_intermediary_info(thread, &stackshot_ctx.sc_vmrl_state);
+				}
+
 				if (stackshot_thread_has_valid_waitinfo(thread)) {
 					num_waitinfo_threads++;
 				}
@@ -5088,7 +5212,7 @@ kdp_stackshot_record_task(task_t task)
 
 #if SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI
 		if (!stackshot_ctx.sc_panic_stackshot) {
-			kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (mt_cur_cpu_cycles() - task_begin_cpu_cycle_count),
+			kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (cpc_cycles() - task_begin_cpu_cycle_count),
 			    "task_cpu_cycle_count"));
 		}
 #endif
@@ -5221,7 +5345,7 @@ kdp_stackshot_kcdata_format(void)
 	uint64_t stackshot_begin_cpu_cycle_count = 0;
 
 	if (!stackshot_ctx.sc_panic_stackshot) {
-		stackshot_begin_cpu_cycle_count = mt_cur_cpu_cycles();
+		stackshot_begin_cpu_cycle_count = cpc_cycles();
 	}
 #endif
 
@@ -5325,11 +5449,16 @@ kdp_stackshot_kcdata_format(void)
 
 	/* Add requested information first */
 	if (stackshot_flags & STACKSHOT_GET_GLOBAL_MEM_STATS) {
-		struct mem_and_io_snapshot mais = {0};
+		struct mem_and_io_snapshot_v2 mais = {0};
 		kdp_mem_and_io_snapshot(&mais);
 		kcd_exit_on_error(kcdata_push_data(stackshot_kcdata_p, STACKSHOT_KCTYPE_GLOBAL_MEM_STATS, sizeof(mais), &mais));
 	}
 
+#if HAS_MTE
+	if (stackshot_flags & STACKSHOT_MTEINFO) {
+		kcd_exit_on_error(stackshot_mteinfo_snapshot(stackshot_kcdata_p));
+	}
+#endif
 
 #if CONFIG_THREAD_GROUPS
 	struct thread_group_snapshot_v3 *thread_groups = NULL;
@@ -5339,7 +5468,7 @@ kdp_stackshot_kcdata_format(void)
 	uint64_t thread_group_begin_cpu_cycle_count = 0;
 
 	if (!stackshot_ctx.sc_is_singlethreaded && (stackshot_flags & STACKSHOT_THREAD_GROUP)) {
-		thread_group_begin_cpu_cycle_count = mt_cur_cpu_cycles();
+		thread_group_begin_cpu_cycle_count = cpc_cycles();
 	}
 #endif
 
@@ -5367,7 +5496,7 @@ kdp_stackshot_kcdata_format(void)
 
 #if SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI
 	if (!stackshot_ctx.sc_panic_stackshot && (thread_group_begin_cpu_cycle_count != 0)) {
-		kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (mt_cur_cpu_cycles() - thread_group_begin_cpu_cycle_count),
+		kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (cpc_cycles() - thread_group_begin_cpu_cycle_count),
 		    "thread_groups_cpu_cycle_count"));
 	}
 #endif
@@ -5387,6 +5516,18 @@ kdp_stackshot_kcdata_format(void)
 
 	bool const process_scoped = (stackshot_args.pid != -1) &&
 	    ((stackshot_flags & STACKSHOT_INCLUDE_DRIVER_THREADS_IN_KERNEL) == 0);
+
+	if (stackshot_flags & STACKSHOT_THREAD_WAITINFO) {
+		bzero(&stackshot_ctx.sc_vmrl_state, sizeof(stackshot_ctx.sc_vmrl_state));
+		stackshot_ctx.sc_vmrl_state.owners = stackshot_alloc_arr(thread_vmrl_owner_info_t, STACKSHOT_VMRL_MAX_OWNERS, &error);
+		if (error != KERN_SUCCESS) {
+			goto error_exit;
+		}
+		stackshot_ctx.sc_vmrl_state.waiters = stackshot_alloc_arr(thread_vmrl_waiter_info_t, STACKSHOT_VMRL_MAX_WAITERS, &error);
+		if (error != KERN_SUCCESS) {
+			goto error_exit;
+		}
+	}
 
 	/* Iterate over tasks */
 	queue_iterate(&tasks, task, task_t, tasks)
@@ -5456,7 +5597,7 @@ kdp_stackshot_kcdata_format(void)
 		uint64_t coalition_begin_cpu_cycle_count = 0;
 
 		if (!stackshot_ctx.sc_panic_stackshot && (stackshot_flags & STACKSHOT_SAVE_JETSAM_COALITIONS)) {
-			coalition_begin_cpu_cycle_count = mt_cur_cpu_cycles();
+			coalition_begin_cpu_cycle_count = cpc_cycles();
 		}
 #endif /* SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI */
 
@@ -5483,7 +5624,7 @@ kdp_stackshot_kcdata_format(void)
 		}
 #if SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI
 		if (!stackshot_ctx.sc_panic_stackshot && (coalition_begin_cpu_cycle_count != 0)) {
-			kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (mt_cur_cpu_cycles() - coalition_begin_cpu_cycle_count),
+			kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (cpc_cycles() - coalition_begin_cpu_cycle_count),
 			    "coalitions_cpu_cycle_count"));
 		}
 #endif /* SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI */
@@ -5491,6 +5632,8 @@ kdp_stackshot_kcdata_format(void)
 #else
 	stackshot_flags &= ~(STACKSHOT_SAVE_JETSAM_COALITIONS);
 #endif /* CONFIG_COALITIONS */
+
+	kcd_exit_on_error(stackshot_record_device_lock_state(stackshot_kcdata_p));
 
 	stackshot_panic_guard();
 
@@ -5559,7 +5702,7 @@ kdp_stackshot_kcdata_format(void)
 
 #if SCHED_HYGIENE_DEBUG && CONFIG_PERVASIVE_CPI
 	if (!stackshot_ctx.sc_panic_stackshot) {
-		kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (mt_cur_cpu_cycles() - stackshot_begin_cpu_cycle_count),
+		kcd_exit_on_error(kcdata_add_uint64_with_description(stackshot_kcdata_p, (cpc_cycles() - stackshot_begin_cpu_cycle_count),
 		    "stackshot_total_cpu_cycle_cnt"));
 	}
 #endif
@@ -5645,7 +5788,7 @@ proc_did_throttle_from_task(task_t task)
 }
 
 static void
-kdp_mem_and_io_snapshot(struct mem_and_io_snapshot *memio_snap)
+kdp_mem_and_io_snapshot(struct mem_and_io_snapshot_v2 *memio_snap)
 {
 	unsigned int pages_reclaimed;
 	unsigned int pages_wanted;
@@ -5661,17 +5804,20 @@ kdp_mem_and_io_snapshot(struct mem_and_io_snapshot *memio_snap)
 	memio_snap->free_pages = vm_page_free_count;
 	memio_snap->active_pages = vm_page_active_count;
 	memio_snap->inactive_pages = vm_page_inactive_count;
-	memio_snap->purgeable_pages = vm_page_purgeable_count;
+	memio_snap->purgeable_pages = counter_load(&vm_page_purgeable_count);
 	memio_snap->wired_pages = vm_page_wire_count;
 	memio_snap->speculative_pages = vm_page_speculative_count;
+	memio_snap->shared_region_pages = os_atomic_load(&vm_page_shared_region_count, relaxed);
 	memio_snap->throttled_pages = vm_page_throttled_count;
 	memio_snap->busy_buffer_count = count_busy_buffers();
 	memio_snap->filebacked_pages = vm_page_pageable_external_count;
 	memio_snap->compressions = (uint32_t)compressions;
 	memio_snap->decompressions = (uint32_t)decompressions;
-	memio_snap->compressor_size = VM_PAGE_COMPRESSOR_COUNT;
-	kErr = mach_vm_pressure_monitor(FALSE, VM_PRESSURE_TIME_WINDOW, &pages_reclaimed, &pages_wanted);
+	memio_snap->compressor_size = vm_compressor_pool_size();
+	memio_snap->compressed_pages = vm_compressor_pages_compressed();
+	memio_snap->swapped_pages = vm_compressor_pages_swapped();
 
+	kErr = mach_vm_pressure_monitor(FALSE, VM_PRESSURE_TIME_WINDOW, &pages_reclaimed, &pages_wanted);
 	if (!kErr) {
 		memio_snap->pages_wanted = (uint32_t)pages_wanted;
 		memio_snap->pages_reclaimed = (uint32_t)pages_reclaimed;
@@ -5683,6 +5829,24 @@ kdp_mem_and_io_snapshot(struct mem_and_io_snapshot *memio_snap)
 	}
 }
 
+#if HAS_MTE
+static kern_return_t
+stackshot_mteinfo_snapshot(kcdata_descriptor_t data)
+{
+	kern_return_t error = KERN_SUCCESS;
+	mach_vm_address_t out_addr = 0;
+
+	kcdata_compression_window_open(stackshot_kcdata_p);
+	kcd_exit_on_error(kcdata_get_memory_addr_for_array(data, STACKSHOT_KCTYPE_MTEINFO_CELL, sizeof(struct mte_info_cell), mte_tag_storage_count, &out_addr));
+
+	kdp_mteinfo_snapshot((struct mte_info_cell*)out_addr, mte_tag_storage_count);
+
+	kcd_exit_on_error(kcdata_compression_window_close(stackshot_kcdata_p));
+
+error_exit:
+	return error;
+}
+#endif
 
 static vm_offset_t
 stackshot_find_phys(vm_map_t map, vm_offset_t target_addr, kdp_fault_flags_t fault_flags, uint32_t *kdp_fault_result_flags)
@@ -5962,7 +6126,9 @@ stackshot_cpu_preflight(void)
 		.intercluster_buf_used = 0
 	};
 #if CONFIG_PERVASIVE_CPI
-	mt_cur_cpu_cycles_instrs_speculative(&stackshot_cpu_latency.total_cycles, &stackshot_cpu_latency.total_instrs);
+	struct cpc_cycles_instrs counts = cpc_cycles_instrs_spec();
+	stackshot_cpu_latency.total_cycles = counts.cycles;
+	stackshot_cpu_latency.total_instrs = counts.instrs;
 #endif /* CONFIG_PERVASIVE_CPI */
 	stackshot_cpu_latency.init_latency_mt = stackshot_cpu_latency.total_latency_mt = mach_absolute_time();
 #endif /* STACKSHOT_COLLECTS_LATENCY_INFO */
@@ -6064,10 +6230,9 @@ stackshot_cpu_do_work(void)
 #if STACKSHOT_COLLECTS_LATENCY_INFO
 	stackshot_cpu_latency.total_latency_mt = mach_absolute_time() - stackshot_cpu_latency.total_latency_mt;
 #if CONFIG_PERVASIVE_CPI
-	uint64_t cycles, instrs;
-	mt_cur_cpu_cycles_instrs_speculative(&cycles, &instrs);
-	stackshot_cpu_latency.total_cycles = cycles - stackshot_cpu_latency.total_cycles;
-	stackshot_cpu_latency.total_instrs = instrs - stackshot_cpu_latency.total_instrs;
+	struct cpc_cycles_instrs counts = cpc_cycles_instrs_spec();
+	stackshot_cpu_latency.total_cycles = counts.cycles - stackshot_cpu_latency.total_cycles;
+	stackshot_cpu_latency.total_instrs = counts.instrs - stackshot_cpu_latency.total_instrs;
 #endif /* CONFIG_PERVASIVE_CPI */
 #endif /* STACKSHOT_COLLECTS_LATENCY_INFO */
 
@@ -6333,15 +6498,33 @@ stackshot_thread_wait_owner_info(thread_t thread, thread_waitinfo_v2_t *waitinfo
 		break;
 	case kThreadWaitPagingInProgress:
 	case kThreadWaitPagingActivity:
-	case kThreadWaitPagerInit:
+	case kThreadWaitPLReqInProgress:
 	case kThreadWaitPagerReady:
 	case kThreadWaitMemoryBlocked:
 	case kThreadWaitPageInThrottle:
 		kdp_vm_object_sleep_find_owner(thread->wait_event, waitinfo->wait_type, waitinfo_v1);
 		break;
+	case kThreadWaitVMEntryExclEvent:
+	case kThreadWaitVMEntrySharedEvent:
+	case kThreadWaitVMEntryKUnwireEvent:
 	default:
 		waitinfo->owner = 0;
 		waitinfo->context = 0;
 		break;
 	}
+}
+
+void
+stackshot_update_lock_state(stackshot_device_lock_state_t lock_state)
+{
+	device_lock_state = lock_state;
+	if (false == after_first_unlock && lock_state == stackshot_lock_state_device_unlocked) {
+		after_first_unlock = true;
+	}
+}
+
+void
+stackshot_update_passcode_status(stackshot_passcode_status_t primary_user_status)
+{
+	passcode_status = primary_user_status;
 }

@@ -29,9 +29,10 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
 else ifneq ($(findstring _host,$(RC_ProjectName)),)
 SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
 else
-SUPPORTED_ARM64_MACHINE_CONFIGS = T6000 T6020 T6030 T6031 T6041 T8101 T8103 T8112 T8122 T8132 VMAPPLE
+SUPPORTED_ARM64_MACHINE_CONFIGS = T6000 T6020 T6030 T6031 T6041 T6050 T8101 T8103 T8112 T8122 T8132 T8142 VMAPPLE
 
-SPTM_ENABLED_SOCS_MacOSX = t8112 t6020 t8122 t6030 t6031 t8132 t6041
+SPTM_ENABLED_SOCS_MacOSX = t6000 t8112 t6020 t8122 t6030 t6031 t6041 t6050 t8132 t8142
+EXCLAVES_ENABLED_SOCS_MacOSX = t8142 t6050
 
 
 endif
@@ -65,6 +66,11 @@ else
 	ARM64_EXTRA_BUILD_FLAGS += -fno-branch-target-identification -UXNU_BUILT_WITH_BTI
 endif
 
+MTE_SUPPORTED_SOCS = t8142 t6050
+
+ifneq ($(filter $(CURRENT_MACHINE_CONFIG_LC),$(MTE_SUPPORTED_SOCS)),)
+	DOCONF_KERNEL_TAG := -tag
+endif
 
 #
 # Component List
@@ -81,8 +87,10 @@ MACHINE_FLAGS_ARM64_T8112 = -DARM64_BOARD_CONFIG_T8112 			-mcpu=apple-a15
 MACHINE_FLAGS_ARM64_T6030 = -DARM64_BOARD_CONFIG_T6030 			-mcpu=apple-m3
 MACHINE_FLAGS_ARM64_T6031 = -DARM64_BOARD_CONFIG_T6031 			-mcpu=apple-m3
 MACHINE_FLAGS_ARM64_T6041 = -DARM64_BOARD_CONFIG_T6041			-mcpu=apple-m4
+MACHINE_FLAGS_ARM64_T6050 = -DARM64_BOARD_CONFIG_T6050 			-mcpu=apple-m4+memtag+predres2
 MACHINE_FLAGS_ARM64_T8122 = -DARM64_BOARD_CONFIG_T8122_T8130		-mcpu=apple-m3
 MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+MACHINE_FLAGS_ARM64_T8142 = -DARM64_BOARD_CONFIG_T8142 			-mcpu=apple-m4+memtag+predres2
 
 MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a+sme2
 
@@ -91,24 +99,27 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
 # Deployment target flag
 #
 ifeq ($(PLATFORM),MacOSX)
-    DEPLOYMENT_TARGET_FLAGS = -mmacosx-version-min=$(SDKVERSION) -DXNU_TARGET_OS_OSX
+    DEPLOYMENT_TARGET_FLAGS = -mmacosx-version-min=$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS = -Wl,-macosx_version_min,$(SDKVERSION)
 else ifeq ($(PLATFORM),DriverKit)
-    DEPLOYMENT_TARGET_FLAGS = -target apple-driverkit$(SDKVERSION) -DXNU_TARGET_OS_OSX
+    DEPLOYMENT_TARGET_FLAGS = -target apple-driverkit$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS = -Wl,-target,apple-driverkit$(SDKVERSION)
 else ifeq ($(PLATFORM),WatchOS)
-    DEPLOYMENT_TARGET_FLAGS = -mwatchos-version-min=$(SDKVERSION) -DXNU_TARGET_OS_WATCH
+    DEPLOYMENT_TARGET_FLAGS = -mwatchos-version-min=$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS =
 else ifeq ($(PLATFORM),tvOS)
-    DEPLOYMENT_TARGET_FLAGS = -mtvos-version-min=$(SDKVERSION) -DXNU_TARGET_OS_TV
+    DEPLOYMENT_TARGET_FLAGS = -mtvos-version-min=$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS =
 else ifeq ($(PLATFORM),AppleTVOS)
-    DEPLOYMENT_TARGET_FLAGS = -mtvos-version-min=$(SDKVERSION) -DXNU_TARGET_OS_TV
+    DEPLOYMENT_TARGET_FLAGS = -mtvos-version-min=$(SDKVERSION)
 else ifeq ($(PLATFORM),BridgeOS)
-    DEPLOYMENT_TARGET_FLAGS = -mbridgeos-version-min=$(SDKVERSION) -DXNU_TARGET_OS_BRIDGE
+    DEPLOYMENT_TARGET_FLAGS = -mbridgeos-version-min=$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS =
+else ifeq ($(PLATFORM),XROS)
+    DEPLOYMENT_TARGET_FLAGS = -target unknown-apple-xros$(SDKVERSION)
+    DEPLOYMENT_LINKER_FLAGS = -Wl,-target,unknown-apple-xros$(SDKVERSION)
 else ifneq ($(filter $(SUPPORTED_EMBEDDED_PLATFORMS),$(PLATFORM)),)
-    DEPLOYMENT_TARGET_FLAGS = -miphoneos-version-min=$(SDKVERSION) -DXNU_TARGET_OS_IOS
+    DEPLOYMENT_TARGET_FLAGS = -miphoneos-version-min=$(SDKVERSION)
     DEPLOYMENT_LINKER_FLAGS = -Wl,-ios_version_min,$(SDKVERSION)
 else ifneq ($(filter $(SUPPORTED_SIMULATOR_PLATFORMS),$(PLATFORM)),)
     DEPLOYMENT_TARGET_FLAGS =
@@ -118,8 +129,26 @@ else
     DEPLOYMENT_LINKER_FLAGS =
 endif
 
+ifeq ($(PLATFORM_FOR_CONFIG),MacOSX)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_OSX
+else ifeq ($(PLATFORM_FOR_CONFIG),DriverKit)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_OSX
+else ifeq ($(PLATFORM_FOR_CONFIG),WatchOS)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_WATCH
+else ifeq ($(PLATFORM_FOR_CONFIG),tvOS)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_TV
+else ifeq ($(PLATFORM_FOR_CONFIG),AppleTVOS)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_TV
+else ifeq ($(PLATFORM_FOR_CONFIG),BridgeOS)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_BRIDGE
+else ifeq ($(PLATFORM_FOR_CONFIG),XROS)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_XR
+else ifneq ($(filter $(SUPPORTED_EMBEDDED_PLATFORMS),$(PLATFORM_FOR_CONFIG)),)
+    DEPLOYMENT_TARGET_FLAGS += -DXNU_TARGET_OS_IOS
+endif
 
-DEPLOYMENT_TARGET_DEFINES = -DXNU_PLATFORM_$(PLATFORM)
+
+DEPLOYMENT_TARGET_DEFINES = -DXNU_PLATFORM_$(PLATFORM_FOR_CONFIG)
 
 
 #
@@ -183,6 +212,7 @@ WARNFLAGS_STD := \
 	-Wno-missing-variable-declarations \
 	-Wno-packed \
 	-Wno-padded \
+	-Wno-ms-bitfield-padding \
 	-Wno-partial-availability \
 	-Wno-reserved-id-macro \
 	-Wno-shift-sign-overflow \
@@ -196,24 +226,49 @@ WARNFLAGS_STD := \
 	-Wno-zero-length-array \
 	-Wno-packed \
 	-Wno-cast-function-type-strict \
-	-Wno-incompatible-function-pointer-types-strict
+	-Wno-incompatible-function-pointer-types-strict \
+	-Wno-four-char-constants \
+	-Wno-allocator-wrappers
 
-# When a new clang has new warnings disable them here until the kernel is fixed.
+# Avoid lock-step changes between compiler submissions and xnu.
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-unknown-warning-option
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-anon-enum-enum-conversion
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-enum-enum-conversion
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-c99-designator
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-reorder-init-list
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-switch-default
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-tautological-value-range-compare
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-null-pointer-subtraction
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-deprecated-volatile
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-incompatible-function-pointer-types-strict
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-cast-function-type-strict
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-bounds-safety-legacy-checks-enabled
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-nrvo
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-unterminated-string-initialization
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-unnecessary-virtual-specifier
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-global-constructors
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-uninitialized-const-pointer
+
+WARNFLAGS_STD := $(WARNFLAGS_STD) -Wno-sometimes-uninitialized
+
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
-	-Wno-unknown-warning-option \
-	-Wno-anon-enum-enum-conversion \
-	-Wno-error=enum-enum-conversion \
-	-Wno-error=c99-designator \
-	-Wno-error=reorder-init-list \
-	-Wno-error=switch-default \
-	-Wno-error=four-char-constants \
-	-Wno-error=suggest-override \
-	-Wno-error=suggest-destructor-override \
-	-Wno-error=tautological-value-range-compare \
-	-Wno-error=null-pointer-subtraction \
-	-Wno-deprecated-volatile \
-	-Wno-error=incompatible-function-pointer-types-strict \
-	-Wno-cast-function-type-strict
+	-Wno-quoted-include-in-framework-header
 
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wno-declaration-after-statement
@@ -237,22 +292,6 @@ WARNFLAGS_STD := $(WARNFLAGS_STD) \
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wno-switch-default
 
-# new diagnostics from public Xcode 26 clang, not enabled in Apple's
-# internal toolchain: reserved identifiers are pervasive in xnu, the
-# ms-bitfield-padding case targets an ABI the kernel does not use
-WARNFLAGS_STD := $(WARNFLAGS_STD) \
-	-Wno-reserved-identifier \
-	-Wno-ms-bitfield-padding \
-	-Wno-unnecessary-virtual-specifier \
-	-Wno-unused-but-set-variable
-
-# new diagnostics from public Xcode 26.6 clang: void* to enum casts in the
-# bsd sysctl dispatch, nrvo in iokit C++ return paths
-WARNFLAGS_STD := $(WARNFLAGS_STD) \
-	-Wno-error=void-pointer-to-enum-cast \
-	-Wno-error=void-pointer-to-int-cast \
-	-Wno-error=implicit-fallthrough \
-	-Wno-error=nrvo
 # Opt-ins:
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wpointer-arith \
@@ -509,7 +548,7 @@ ifeq ($(CURRENT_ARCH_CONFIG_LC),x86_64)
 	BOUND_CHECKS_SOFT := 0
 endif # x86_64
 
-# if BOUND_CHECKS_SOFT is enabled, ensure that BOUND_CHECKS is enabled as well
+# When BOUND_CHECKS_SOFT is enabled, ensure that BOUND_CHECKS is enabled as well
 ifneq ($(BOUND_CHECKS_SOFT),0)
     ifeq ($(BOUND_CHECKS),0)
         BOUND_CHECKS := 1
@@ -1110,9 +1149,10 @@ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/sy
 #
 LD_KERNEL_LIBS	   = -lcc_kext
 LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
-# Link opensource binary library for VMAPPLE and specific SoCs
-ifneq ($(filter T6000 T6020 T8101 T8103 T8112 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
-	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+
+# Link binary support library
+ifneq ($(CURRENT_MACHINE_CONFIG),NONE)
+        LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
 endif
 
 #
@@ -1135,6 +1175,9 @@ endif # SPTM
 ifneq ($(filter $(CURRENT_MACHINE_CONFIG_LC),$(SPTM_ENABLED_SOCS_$(PLATFORM))),)
   SPTM_ENABLED = 1
 endif
+ifneq ($(filter $(CURRENT_MACHINE_CONFIG_LC),$(EXCLAVES_ENABLED_SOCS_$(PLATFORM))),)
+  EXCLAVES_ENABLED := 1
+endif
 
 ifeq ($(SPTM_ENABLED),1)
   LD_KERNEL_ARCHIVES += -lTrustedExecutionMonitor_Kernel
@@ -1146,8 +1189,22 @@ ifeq ($(EXCLAVES_ENABLED),1)
   DOCONF_EXCLAVES := -exclaves
 endif # !EXCLAVES_ENABLED
 
-ifeq ($(CURRENT_ARCH_CONFIG),ARM64)
-TIGHTBEAM_EXPORTS := $(SRCROOT)/config/libTightbeam.exports
+
+ifneq ($(wildcard $(SDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+XNU_CONFIG_TIGHTBEAM := 1
+TIGHTBEAM_IN_SDK := 1
+else ifneq ($(wildcard $(KDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+XNU_CONFIG_TIGHTBEAM := 1
+endif
+ifeq ($(XNU_CONFIG_TIGHTBEAM),1)
+  ifeq ($(TIGHTBEAM_IN_SDK),1)
+    # Force-import the Tightbeam static lib so that all of its symbols can be exported to kexts
+    LD_KERNEL_ARCHIVES += -Wl,-force_load,$(SDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a
+    TIGHTBEAM_EXPORTS := $(SDKROOT)/usr/local/lib/kernel/platform/libTightbeam.exports
+  else # !TIGHTBEAM_IN_SDK
+    LD_KERNEL_ARCHIVES += -Wl,-force_load,$(KDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a
+    TIGHTBEAM_EXPORTS := $(KDKROOT)/usr/local/lib/kernel/platform/libTightbeam.exports
+  endif # TIGHTBEAM_IN_SDK
 endif
 
 #
@@ -1170,15 +1227,14 @@ INCFLAGS_IMPORT	= $(patsubst %, -I$(OBJROOT)/EXPORT_HDRS/%, $(COMPONENT_IMPORT_L
 INCFLAGS_EXTERN	= -I$(SRCROOT)/EXTERNAL_HEADERS
 INCFLAGS_GEN	= -I$(SRCROOT)/$(COMPONENT) -I$(OBJROOT)/EXPORT_HDRS/$(COMPONENT)
 INCFLAGS_LOCAL	= -I.
-INCFLAGS_KERNEL = -I$(SDKROOT)/usr/local/include/kernel
-INCFLAGS_SDK	= -I$(SDKROOT)/usr/local/include/ -I$(SDKROOT)/$(KPINCDIR)/AppleFeatures
+INCFLAGS_SDK    = -I$(SDKROOT)/usr/local/include/kernel -I$(SDKROOT)/usr/local/include/iBoot -I$(SDKROOT)/$(KPINCDIR)/AppleFeatures
 INCFLAGS_PLATFORM = -I$(SDKROOT)/$(KPINCDIR)/platform
 ifneq ($(KDKROOT),)
-INCFLAGS_SDK   += -I$(KDKROOT)/$(KPINCDIR)
+INCFLAGS_SDK   += -I$(KDKROOT)/$(KPINCDIR) -I$(KDKROOT)/System/Library/KernelSupport
 INCFLAGS_PLATFORM += -I$(KDKROOT)/$(KINCDIR)/platform -I$(KDKROOT)/$(KPINCDIR)/platform
 endif
 
-INCFLAGS	= $(INCFLAGS_LOCAL) $(INCFLAGS_GEN) $(INCFLAGS_IMPORT) $(INCFLAGS_EXTERN) $(INCFLAGS_MAKEFILE) $(INCFLAGS_KERNEL) $(INCFLAGS_SDK) $(INCFLAGS_PLATFORM)
+INCFLAGS	= $(INCFLAGS_LOCAL) $(INCFLAGS_GEN) $(INCFLAGS_IMPORT) $(INCFLAGS_EXTERN) $(INCFLAGS_MAKEFILE) $(INCFLAGS_SDK) $(INCFLAGS_PLATFORM)
 
 #
 # Default MIGFLAGS
@@ -1200,6 +1256,8 @@ MIGKSFLAGS = \
 MIGKUFLAGS = \
 	-DMACH_KERNEL_PRIVATE \
 	-DKERNEL_USER=1 \
+	-DEXC_SERVER_AUDITTOKEN=1 \
+	-DMACH_EXC_SERVER_AUDITTOKEN=1 \
 	-maxonstack 1024
 
 # Support for LLVM Profile Guided Optimization (PGO)
@@ -1266,6 +1324,21 @@ LDFLAGS_KERNEL_LTO =
 LDFLAGS_NOSTRIP_FLAG =
 LDFLAGS_KERNEL_STRIP_LTO =
 CFLAGS_NOLTO_FLAG =
+endif
+
+ifneq ($(SAVE_OPT_RECORD),)
+ifeq ($(USE_LTO),1)
+REMARKS_FLAGS = -Wl,-mllvm,--lto-pass-remarks-filter="$(SAVE_OPT_RECORD)" \
+                -Wl,-mllvm,--lto-pass-remarks-output=lto_remarks.opt.yaml \
+                -Wl,-mllvm,--lto-pass-remarks-format=yaml
+LDFLAGS_KERNEL_LTO += $(REMARKS_FLAGS)
+LDFLAGS_KERNEL_GEN += $(REMARKS_FLAGS)
+else
+REMARKS_FLAGS = -foptimization-record-passes="$(SAVE_OPT_RECORD)" \
+                -fsave-optimization-record=yaml
+CFLAGS_GEN += $(REMARKS_FLAGS)
+CXXFLAGS_GEN += $(REMARKS_FLAGS)
+endif
 endif
 
 #

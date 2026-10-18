@@ -104,6 +104,8 @@ typedef mach_voucher_attr_key_t *mach_voucher_attr_key_array_t;
 #define MACH_VOUCHER_ATTR_KEY_PTHPRIORITY       ((mach_voucher_attr_key_t)4)
 #define MACH_VOUCHER_ATTR_KEY_USER_DATA         ((mach_voucher_attr_key_t)7)
 #define MACH_VOUCHER_ATTR_KEY_BITS              MACH_VOUCHER_ATTR_KEY_USER_DATA
+
+/* not used, for compatibility only */
 #define MACH_VOUCHER_ATTR_KEY_TEST              ((mach_voucher_attr_key_t)8)
 
 /* not used, for compatibility only */
@@ -142,6 +144,15 @@ typedef mach_voucher_attr_recipe_command_t *mach_voucher_attr_recipe_command_arr
 #define MACH_VOUCHER_ATTR_SET_VALUE_HANDLE      ((mach_voucher_attr_recipe_command_t)3)
 #define MACH_VOUCHER_ATTR_AUTO_REDEEM           ((mach_voucher_attr_recipe_command_t)4)
 #define MACH_VOUCHER_ATTR_SEND_PREPROCESS       ((mach_voucher_attr_recipe_command_t)5)
+
+#if __BUILDING_XNU_LIB_UNITTEST__
+/*
+ * These are test-only voucher commands exposed so we have a means to
+ * unit test 'allowed voucher command' and 'disallowed voucher command' logic.
+ */
+#define MACH_VOUCHER_ATTR_UNIT_TEST_VECTOR_ALLOWED              ((mach_voucher_attr_recipe_command_t)6)
+#define MACH_VOUCHER_ATTR_UNIT_TEST_VECTOR_DISALLOWED   ((mach_voucher_attr_recipe_command_t)7)
+#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
 
 /* redeem is on its way out? */
 #define MACH_VOUCHER_ATTR_REDEEM                ((mach_voucher_attr_recipe_command_t)10)

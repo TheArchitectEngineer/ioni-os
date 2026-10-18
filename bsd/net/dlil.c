@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999-2025 Apple Inc. All rights reserved.
+ * Copyright (c) 1999-2026 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -3223,6 +3223,12 @@ ifnet_enqueue_single(struct ifnet *ifp, struct ifclassq *ifcq,
 	error = ifclassq_enqueue(((ifcq != NULL) ? ifcq : ifp->if_snd), p, p,
 	    1, pktlen, pdrop);
 
+	/* Increment LPW transmit statistics */
+	if (__improbable(is_net_lpw_mode())) {
+		os_atomic_add(&ifp->if_data.ifi_lpw_opackets, 1, relaxed);
+		os_atomic_add(&if_ports_used_stats.ifpu_lpw_tx_packets, 1, relaxed);
+	}
+
 	/*
 	 * Tell the driver to start dequeueing; do this even when the queue
 	 * for the packet is suspended (EQSUSPENDED), as the driver could still
@@ -3243,17 +3249,54 @@ ifnet_enqueue_chain(struct ifnet *ifp, struct ifclassq *ifcq,
 {
 	int error;
 
-	/* enqueue the packet (caller consumes object) */
-	error = ifclassq_enqueue(ifcq != NULL ? ifcq : ifp->if_snd, head, tail,
-	    cnt, bytes, pdrop);
+	if (ifp->if_output_netem != NULL) {
+		classq_pkt_t cpkt = *head;
+		classq_pkt_t cpkt_next = *head;
 
-	/*
-	 * Tell the driver to start dequeueing; do this even when the queue
-	 * for the packet is suspended (EQSUSPENDED), as the driver could still
-	 * be dequeueing from other unsuspended queues.
-	 */
-	if ((error == 0 && flush) || error == EQFULL || error == EQSUSPENDED) {
-		ifnet_start(ifp);
+		while (1) {
+			switch (head->cp_ptype) {
+			case QP_PACKET:
+				cpkt.cp_kpkt->pkt_pflags &= ~PKT_F_TS_VALID;
+				cpkt_next.cp_kpkt = cpkt.cp_kpkt->pkt_nextpkt;
+				break;
+			case QP_MBUF:
+				cpkt.cp_mbuf->m_pkthdr.pkt_flags &= ~PKTF_TS_VALID;
+				cpkt_next.cp_mbuf = cpkt.cp_mbuf->m_nextpkt;
+				break;
+			default:
+				VERIFY(0);
+				/* NOTREACHED */
+				__builtin_unreachable();
+			}
+
+			bool drop;
+			error = netem_enqueue(ifp->if_output_netem, &cpkt, &drop);
+			*pdrop = drop ? TRUE : FALSE;
+
+			if (cpkt_next.cp_kpkt == NULL) {
+				break;
+			}
+			cpkt = cpkt_next;
+		}
+	} else {
+		/* enqueue the packet (caller consumes object) */
+		error = ifclassq_enqueue(ifcq != NULL ? ifcq : ifp->if_snd, head, tail,
+		    cnt, bytes, pdrop);
+
+		/* Increment LPW transmit statistics */
+		if (__improbable(is_net_lpw_mode())) {
+			os_atomic_add(&ifp->if_data.ifi_lpw_opackets, cnt, relaxed);
+			os_atomic_add(&if_ports_used_stats.ifpu_lpw_tx_packets, cnt, relaxed);
+		}
+
+		/*
+		 * Tell the driver to start dequeueing; do this even when the queue
+		 * for the packet is suspended (EQSUSPENDED), as the driver could still
+		 * be dequeueing from other unsuspended queues.
+		 */
+		if ((error == 0 && flush) || error == EQFULL || error == EQSUSPENDED) {
+			ifnet_start(ifp);
+		}
 	}
 	return error;
 }
@@ -5474,12 +5517,6 @@ ifnet_detach(ifnet_t ifp)
 		bzero(ifp->if_ipv6_stat, sizeof(*ifp->if_ipv6_stat));
 	}
 
-	/* Release memory held for interface link status report */
-	if (ifp->if_link_status != NULL) {
-		kfree_type(struct if_link_status, ifp->if_link_status);
-		ifp->if_link_status = NULL;
-	}
-
 	/* Disable forwarding cached route */
 	lck_mtx_lock(&ifp->if_cached_route_lock);
 	ifp->if_fwd_cacheok = 0;
@@ -5662,6 +5699,14 @@ ifnet_detach_final(struct ifnet *ifp)
 #if SKYWALK
 	VERIFY(LIST_EMPTY(&ifp->if_netns_tokens));
 #endif /* SKYWALK */
+	/* Release memory held for interface link status report */
+	lck_rw_lock_exclusive(&ifp->if_link_status_lock);
+	if (ifp->if_link_status != NULL) {
+		kfree_type(struct if_link_status, ifp->if_link_status);
+		ifp->if_link_status = NULL;
+	}
+	lck_rw_done(&ifp->if_link_status_lock);
+
 	/* Drain and destroy send queue */
 	ifclassq_teardown(ifp->if_snd);
 
@@ -5715,14 +5760,9 @@ ifnet_detach_final(struct ifnet *ifp)
 
 	/* Detach (permanent) link address from if_addrhead */
 	ifa = TAILQ_FIRST(&ifp->if_addrhead);
-	VERIFY(ifnet_addrs[ifp->if_index - 1] == ifa);
 	IFA_LOCK(ifa);
 	if_detach_link_ifa(ifp, ifa);
 	IFA_UNLOCK(ifa);
-
-	/* Remove (permanent) link address from ifnet_addrs[] */
-	ifa_remref(ifa);
-	ifnet_addrs[ifp->if_index - 1] = NULL;
 
 	/* This interface should not be on {ifnet_head,detaching} */
 	VERIFY(ifp->if_link.tqe_next == NULL);
@@ -5989,6 +6029,13 @@ ifnet_detach_final(struct ifnet *ifp)
 	}
 
 	ifclassq_release(&ifp->if_snd);
+
+	/* Remove (permanent) link address from ifnet_addrs[] */
+	ifnet_head_lock_exclusive();
+	VERIFY(ifnet_addrs[ifp->if_index - 1] == ifa);
+	ifa_remref(ifa);
+	ifnet_addrs[ifp->if_index - 1] = NULL;
+	ifnet_head_done();
 
 	/* we're fully detached, clear the "in use" bit */
 	dlifp = (struct dlil_ifnet *)ifp;

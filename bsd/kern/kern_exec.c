@@ -191,6 +191,9 @@
 
 #include <mach/exclaves.h>
 
+#if HAS_MTE
+#include <arm64/mte_xnu.h>
+#endif /* HAS_MTE */
 
 extern boolean_t vm_darkwake_mode;
 
@@ -198,10 +201,6 @@ extern boolean_t vm_darkwake_mode;
 static TUNABLE(bool, bootarg_execfailurereports, "execfailurecrashes", false);
 
 #if XNU_TARGET_OS_OSX
-#if __has_feature(ptrauth_calls)
-static TUNABLE(bool, bootarg_arm64e_preview_abi, "-arm64e_preview_abi", false);
-#endif /* __has_feature(ptrauth_calls) */
-
 #if DEBUG || DEVELOPMENT
 static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
 #endif /* DEBUG || DEVELOPMENT */
@@ -276,7 +275,7 @@ static TUNABLE(bool, enable_dext_coredumps_on_panic, "dext_panic_coredump", true
 #else
 static TUNABLE(bool, enable_dext_coredumps_on_panic, "dext_panic_coredump", false);
 #endif
-extern kern_return_t kern_register_userspace_coredump(task_t task, const char * name);
+extern kern_return_t kern_register_userspace_coredump(task_t task, const char * name, boolean_t emergency);
 #define USERSPACE_COREDUMP_PANIC_ENTITLEMENT "com.apple.private.enable-coredump-on-panic"
 #define USERSPACE_COREDUMP_PANIC_SEED_ENTITLEMENT \
 	"com.apple.private.enable-coredump-on-panic-seed-privacy-approved"
@@ -917,7 +916,6 @@ activate_exec_state(task_t task, proc_t p, thread_t thread, load_result_t *resul
 	return KERN_SUCCESS;
 }
 
-#if (DEVELOPMENT || DEBUG)
 extern char panic_on_proc_crash[];
 extern int use_panic_on_proc_crash;
 
@@ -945,7 +943,6 @@ set_crash_behavior_from_bootarg(proc_t p)
 		p->p_crash_behavior |= POSIX_SPAWN_PANIC_ON_SPAWN_FAIL;
 	}
 }
-#endif
 
 void
 set_proc_name(struct image_params *imgp, proc_t p)
@@ -969,14 +966,12 @@ set_proc_name(struct image_params *imgp, proc_t p)
 	bcopy((caddr_t)imgp->ip_ndp->ni_cnd.cn_nameptr, (caddr_t)p->p_comm, buflen);
 	p->p_comm[buflen] = '\0';
 
-#if (DEVELOPMENT || DEBUG)
 	/*
 	 * This happens during image activation, so the crash behavior flags from
 	 * posix_spawn will have already been set. So we don't have to worry about
 	 * this being overridden.
 	 */
 	set_crash_behavior_from_bootarg(p);
-#endif
 }
 
 #if __has_feature(ptrauth_calls)
@@ -1027,7 +1022,6 @@ arm64_cpusubtype_uses_ptrauth(cpu_subtype_t cpusubtype)
 }
 
 #endif /* __has_feature(ptrauth_calls) */
-
 /**
  * Returns whether a type/subtype slice matches the requested
  * type/subtype.
@@ -1110,6 +1104,36 @@ static struct {
 		NULL,
 		"com.apple.security.hardened-process.dyld-ro",
 	},
+#if HAS_MTE
+	[CHECKED_ALLOCATIONS] = {
+		"com.apple.developer.hardened-process.checked-allocations",
+		"com.apple.security.hardened-process.checked-allocations"
+	},
+	[CHECKED_ALLOCATIONS_DISABLE_PURE_DATA] = {
+		NULL,
+		"com.apple.security.hardened-process.checked-allocations.disable-pure-data"
+	},
+	[CHECKED_ALLOCATIONS_NO_TAGGED_RECEIVE] = {
+		NULL,
+		"com.apple.security.hardened-process.checked-allocations.no-tagged-receive"
+	},
+	[CHECKED_ALLOCATIONS_SOFT_MODE] = {
+		NULL,
+		"com.apple.security.hardened-process.checked-allocations.soft-mode"
+	},
+#endif /* HAS_MTE */
+	[SCRIPT_RESTRICTIONS] = {
+		NULL,
+		"com.apple.security.script-restrictions"
+	},
+	[IPC_CONTAINMENT_VESSEL] = {
+		NULL,
+		"com.apple.security.hardened-process.containment.ipc"
+	},
+	[NO_GUARD_OBJECTS] = {
+		NULL,
+		"com.apple.security.hardened-process.no-guard-objects"
+	}
 };
 
 /*
@@ -1118,16 +1142,17 @@ static struct {
  * This mitigation opts you into the grab bag of various kernel mitigations
  * including IPC security restrictions
  * The presence of the entitlement opts the binary into the feature.
- * The entitlement is an <integer> entitlement containing a version number
+ * The entitlement is a <string> entitlement containing a version number
  * for the platform restrictions you are opting into.
  */
-#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS "com.apple.security.hardened-process.platform-restrictions"
+#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR "com.apple.security.hardened-process.platform-restrictions-string"
 
 /*
- * Version number for enhanced security
- * Currently stored with 3 bits in `hardened_process_version`
+ * rdar://168452024: The platform restrictions entitlement was originally mapped
+ * to an integer, but unfortunately some machinery doesn't support integer value ranges.
+ * The original entitlement is preserved and parsed for compatibility.
  */
-#define HARDENED_PROCESS_VERSION "com.apple.security.hardened-process.enhanced-security-version"
+#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_INT "com.apple.security.hardened-process.platform-restrictions"
 
 /* See kern_exec_internal.h for the extensive documentation. */
 exec_security_err_t
@@ -1164,6 +1189,7 @@ exec_check_security_entitlement(struct image_params *imgp,
 }
 
 
+
 /*
  * Entitled binaries get hardened_heap
  */
@@ -1185,32 +1211,562 @@ imgact_setup_hardened_heap(struct image_params *imgp, task_t task)
 	}
 }
 
-/*
- * Configure the platform restrictions security features on the task
- * This must be done before `ipc_task_enable` so that the bits
- * can be propogated to the ipc space.
- *
- * Requires `exectextresetvp` to be called on `task` previously so
- * that we can use the `IOTaskGetEntitlement` API
- */
-static inline void
-exec_setup_platform_restrictions(task_t task)
+static inline errno_t
+imgact_setup_script_restrictions(struct image_params *imgp, task_t task)
 {
-	uint64_t value = 0;
-	/* Set platform restrictions version */
-	if (task_get_platform_binary(task)) {
-		task_set_platform_restrictions_version(task, 2);
-	} else if (IOTaskGetIntegerEntitlement(task, SPAWN_ENABLE_PLATFORM_RESTRICTIONS, &value) &&
-	    value > 1) {
-		task_set_platform_restrictions_version(task, value);
+	exec_security_err_t ret = exec_check_security_entitlement(imgp, SCRIPT_RESTRICTIONS);
+	if (ret == EXEC_SECURITY_ENTITLED) {
+		task_set_script_restrictions(task);
+	} else {
+		task_clear_script_restrictions(task);
 	}
-
-	/* Set hardened process version*/
-	if (IOTaskGetIntegerEntitlement(task, HARDENED_PROCESS_VERSION, &value)) {
-		task_set_hardened_process_version(task, value);
+	switch (ret) {
+	case EXEC_SECURITY_INVALID_CONFIG:
+		return EINVAL;
+	case EXEC_SECURITY_ENTITLED:
+	case EXEC_SECURITY_NOT_ENTITLED:
+		return 0;
 	}
 }
 
+/*
+ * Configure the platform restrictions security features on the task.
+ * This must be done before `ipc_task_enable` so that the bits
+ * can be propagated to the IPC space.
+ *
+ * Returns KERN_SUCCESS on success, or EINVAL if validation fails.
+ */
+static inline errno_t
+imgact_setup_platform_restrictions(struct image_params *imgp, load_result_t *load_result, task_t task)
+{
+	char* endptr = NULL;
+	char* maybe_platform_restrictions_level_str = NULL;
+	uint64_t maybe_platform_restrictions_level_int = 0;
+
+	/* Platform binaries always get the highest available restriction level */
+	if (load_result->platform_binary) {
+		task_set_platform_restrictions_version(task, 3);
+		return KERN_SUCCESS;
+	}
+
+	/*
+	 * Parse the platform restriction version via entitlement if present.
+	 * rdar://168452024: Prefer the new-style string version over the old-style int version.
+	 */
+	if (IOVnodeIsEntitlementPresentWithAnyValue(imgp->ip_vp, (int64_t)imgp->ip_arch_offset,
+	    SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR)) {
+		maybe_platform_restrictions_level_str = IOVnodeGetEntitlement(imgp->ip_vp,
+		    (int64_t)imgp->ip_arch_offset, SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR);
+
+		/*
+		 * Note we're able to enforce stricter validation on the string-based
+		 * entitlement as we've never shipped this entitlement without validation.
+		 */
+		if (maybe_platform_restrictions_level_str == NULL) {
+			/* The entitlement is present but we failed to parse it as a string */
+			EXEC_LOG("Invalid platform restrictions string specified");
+			return EINVAL;
+		} else {
+			maybe_platform_restrictions_level_int = (uint64_t)strtoul(maybe_platform_restrictions_level_str, &endptr, 10);
+			if (maybe_platform_restrictions_level_str == endptr ||
+			    *endptr != '\0' ||
+			    maybe_platform_restrictions_level_int > UINT_MAX) {
+				/* Failed to parse an int out of the string */
+				kfree_data(maybe_platform_restrictions_level_str, strlen(maybe_platform_restrictions_level_str) + 1);
+				EXEC_LOG("Invalid platform restrictions string specified");
+				return EINVAL;
+			}
+			kfree_data(maybe_platform_restrictions_level_str, strlen(maybe_platform_restrictions_level_str) + 1);
+
+			if (maybe_platform_restrictions_level_int < 2 || maybe_platform_restrictions_level_int >= 8) {
+				/* Only levels 2 <= val < 8 are valid via this entitlement */
+				EXEC_LOG("Invalid platform restrictions level specified");
+				return EINVAL;
+			}
+
+			/* Parsed out a valid version from the string entitlement */
+			task_set_platform_restrictions_version(task, maybe_platform_restrictions_level_int);
+			return KERN_SUCCESS;
+		}
+	}
+	/*
+	 * Last resort: try the integer value entitlement.
+	 * To paper over compatibility concerns from when this entitlement was primary
+	 * and lacked some validation, all settings of this entitlement result in version==2
+	 * (which was the only valid value in the extant timeframe of this entitlement).
+	 */
+	if (IOVnodeIsEntitlementPresentWithAnyValue(imgp->ip_vp, (int64_t)imgp->ip_arch_offset,
+	    SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_INT)) {
+		task_set_platform_restrictions_version(task, 2);
+		return KERN_SUCCESS;
+	}
+
+	/* No entitlement, no problem */
+	return KERN_SUCCESS;
+}
+
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+
+#if DEVELOPMENT || DEBUG
+static inline void config_sec_inheritance(task_t, task_t);
+#endif /* DEVELOPMENT || DEBUG */
+static inline void config_sec_spawnflags(load_result_t *load_result,
+    struct _posix_spawnattr *, task_t);
+
+#if HAS_MTE
+
+static inline void config_sec_user_data(struct image_params *, load_result_t *,
+    task_t, struct cs_blob *);
+
+static inline errno_t config_checked_allocations_entitlements(struct image_params *,
+    load_result_t *, task_t, struct cs_blob *, proc_t);
+
+static inline exec_security_err_t
+imgact_setup_has_checked_allocations_entitlement(struct image_params *imgp, load_result_t *load_result,
+    __unused task_t new_task, __unused struct cs_blob *cs_blob)
+{
+	/* First-party DriverKit always gets MTE regardless of our normal entitlement knobs */
+	if (load_result->platform_binary && IOVnodeHasEntitlement(imgp->ip_vp,
+	    (int64_t)imgp->ip_arch_offset, kIODriverKitEntitlementKey)) {
+		/* In soft mode, to mitigate risks on the build */
+		EXEC_LOG("Enabling MTE because we're launching a first-party dext");
+		return EXEC_SECURITY_ENTITLED;
+	}
+
+	/* If not a hardened-process, bail out. */
+	if (!load_result->hardened_process_version) {
+		return EXEC_SECURITY_NOT_ENTITLED;
+	}
+
+	/* Check the entitlement. */
+	exec_security_err_t ret = exec_check_security_entitlement(imgp, CHECKED_ALLOCATIONS);
+
+	/* Bail out early on invalid configuration. These will fail execution. */
+	if (ret == EXEC_SECURITY_INVALID_CONFIG) {
+		return ret;
+	}
+
+	/*
+	 * We need a couple of extra checks for first party binaries, mostly around
+	 * AMFI and reporting early (forbidden) usage of the entitlement.
+	 */
+	if (load_result->platform_binary) {
+#if KERN_AMFI_SUPPORTS_MTE >= 2
+		if (__improbable(amfi->has_mte_opt_out && amfi->has_mte_opt_out(cs_blob))) {
+			EXEC_LOG("Binary checked-allocations enablement was denied by AMFI static list\n");
+			return EXEC_SECURITY_NOT_ENTITLED;
+		}
+#endif /* KERN_AMFI_SUPPORTS_MTE */
+
+		/*
+		 * At this stage we are an hardened-process and AMFI hasn't said that we should
+		 * not enable MTE, therefore we just force enable even if the entitlement is not
+		 * present (until we can publicly require checked-allocations to be true).
+		 */
+		return EXEC_SECURITY_ENTITLED;
+	}
+
+	/*
+	 * The third-party flow is more linear: whatever the entitlement said it was the
+	 * setting, we'll run with it.
+	 */
+	return ret;
+}
+#endif /* HAS_MTE */
+
+/*
+ * Checked-allocations is a security feature that leverages MTE (Memory Tagging Extensions)
+ * inside userspace allocators to protect dynamic memory allocations.
+ *
+ * MTE is a hardware security feature available in recent hardware devices. For legacy
+ * devices, we support an internal-only readiness tool based on Rosetta that aims at
+ * qualifying binaries for the new hardware, but that is not meant to be used in production.
+ *
+ * Checked-allocations enablement (generally referred to as MTE enabled here) and
+ * configuration is controlled by:
+ *   - inheritance (debugging feature for bringup/readiness/performance evaluation)
+ *   - posix_spawn flags (no downgrade flags supported on RELEASE)
+ *   - entitlements (hardware only, no emulation. Main RELEASE configuration)
+ *
+ * The algorithm to decide whether checked-allocations should be enabled on the target
+ * process is summarized here.
+ * For Rosetta binaries, only posix_spawn flags are supported.
+ *
+ *  ┌────────────────┐                               ┌───────────────┐
+ *  │  Inheritance   │       ┌───────────────┐       │ Configure MTE │
+ *  │    enabled?    ├─YES──▶│  Enable MTE   │──────▶│   mirroring   │
+ *  └──────────┬─────┘       └───────────────┘       │ parent state  │
+ *             │                                     └───────────────┘
+ *            NO
+ *             │
+ *             │      ┌─────────────────────────────┐
+ *             └─────▶│posix_spawn explicit enable? │
+ *                    └──┬─────────────┬────────────┘
+ *                       │             │
+ *                       │             │
+ *                     YES            NO
+ *                       │             │   ┌──────────────────────────────────┐
+ * ┌───────────────┐     │             └──▶│ hardened-process entitlement or  │
+ * │  Enable MTE   │◀────┘                 │   (1p && DriverKit entitlement)? │
+ * └───────┬───────┘                       └───────────┬─────────────┬────────┘
+ *         │                                          YES            NO
+ * ┌───────▼───────┐                                   │             │
+ * │ Configure MTE │                        ┌──────────▼────┐   ┌────▼─────────┐
+ * │    through    │                        │  Enable MTE   │   │ Disable MTE  │
+ * │  posix_spawn  │                        └──────────┬────┘   └──────────────┘
+ * │     flags     │                                   │
+ * └───────────────┘                        ┌──────────▼────┐
+ *                                          │ Configure MTE │
+ *                                          │    through    │
+ *                                          │ entitlements  │
+ *                                          └───────────────┘
+ *
+ *
+ * The above algorithm covers the decision of enabling checked-allocations but doesn't
+ * cover the configuration options which are described later.
+ *
+ * This function returns false only in case POSIX_SPAWN_SECFLAG_EXPLICIT_REQUIRE_ENABLE is passed
+ * and the binary fails to satisfy the requirement.
+ */
+static inline errno_t
+imgact_setup_sec(struct image_params *imgp, __unused load_result_t *load_result, task_t old_task,
+    task_t new_task, __unused vm_map_t new_map, __unused proc_t new_proc)
+{
+#if HAS_MTE
+	/* Nothing to do if we have disabled MTE for userspace programs */
+	if (!mte_user_enabled()) {
+		EXEC_LOG("MTE enablement is skipped due to system-wide disablement\n");
+		return 0;
+	}
+#endif /* HAS_MTE */
+
+#if HAS_MTE_EMULATION_SHIMS
+	/* Ignore any emulation attempt if we are not running under Rosetta. */
+	if ((imgp->ip_flags & (IMGPF_ROSETTA | IMGPF_ALT_ROSETTA)) == 0) {
+		return 0;
+	}
+#endif /* HAS_MTE_EMULATION_SHIMS */
+
+	/* Reset to a clear view on the target task - we'll decide the configuration here. */
+	task_clear_sec(new_task);
+	task_clear_sec_policy(new_task);
+
+	/*
+	 * If the parent has sec inherit, propagate the security settings.
+	 * Inheritance is currently aimed only at debug sessions and will trump
+	 * any existing configuration. Inheritance should be seen as the same posix_spawn
+	 * flags used to enable it (+ configure the feature) re-applied over and over on
+	 * every descendant.
+	 */
+	if (task_has_sec_inherit(old_task)) {
+		EXEC_LOG("Task will be configured based on inheritance\n");
+		/* Inheritance propagates to the next task. */
+		task_set_sec_inherit(new_task);
+
+		if (task_has_sec(old_task)) {
+			task_set_sec(new_task);
+#if DEVELOPMENT || DEBUG
+			config_sec_inheritance(old_task, new_task);
+#endif /* DEVELOPMENT || DEBUG */
+		}
+		return 0;
+	}
+
+#if HAS_MTE
+	struct cs_blob* cs_blob = csvnode_get_blob(imgp->ip_vp, imgp->ip_arch_offset);
+#endif /* HAS_MTE */
+
+	/* Check posix_spawn flags now if any */
+	struct _posix_spawnattr *px_sa = imgp->ip_px_sa;
+
+	if (px_sa != NULL) {
+#if DEVELOPMENT || DEBUG
+		/*
+		 * Do we have a request to explicitly disable?
+		 */
+		if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_DISABLE) != 0) {
+			EXEC_LOG("Task configured to disable the security feature due to posix_spawn\n");
+			/* For A/B testing, allow DISABLE to propagate through inheritance. */
+			config_sec_spawnflags(load_result, px_sa, new_task);
+			/* Clear we were, clear we stay. */
+			return 0;
+		}
+#endif /* DEVELOPMENT || DEBUG */
+
+		/* Do we have a request to explicitly enable? */
+		if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_ENABLE) != 0) {
+			EXEC_LOG("Task is explicitly enabled via posix_spawn flags\n");
+			task_set_sec(new_task);
+			config_sec_spawnflags(load_result, px_sa, new_task);
+#if HAS_MTE
+			/* Configure tagging of user data allocations */
+			config_sec_user_data(imgp, load_result, new_task, cs_blob);
+#endif /* HAS_MTE */
+			return 0;
+		}
+
+#if HAS_MTE
+		/* Do we have a request to enforce that the target is properly entitled? */
+		if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_REQUIRE_ENABLE) != 0) {
+			if (!load_result->hardened_process_version) {
+				EXEC_LOG("Caller requested the explicit presence of the hardened-process entitlement"
+				    " which the binary doesn't have\n");
+				return EINVAL;
+			}
+			/* FALLTHROUGH to entitlement evaluation */
+		}
+#endif /* HAS_MTE */
+	}
+
+#if HAS_MTE
+
+#if DEVELOPMENT || DEBUG
+	/* Runtime options solely affect entitlement-driven choices. */
+	if (!mte_user_enabled()) {
+		/* Clear we were, clear we stay. */
+		return 0;
+	}
+#endif /* DEVELOPMENT || DEBUG */
+
+	switch (imgact_setup_has_checked_allocations_entitlement(imgp, load_result, new_task, cs_blob)) {
+	case EXEC_SECURITY_INVALID_CONFIG:
+		EXEC_LOG("Invalid configuration detected\n");
+		return EINVAL;
+	case EXEC_SECURITY_ENTITLED:
+		EXEC_LOG("Task is explicitly configured via entitlements\n");
+		task_set_sec(new_task);
+		return config_checked_allocations_entitlements(imgp, load_result, new_task, cs_blob,
+		           new_proc);
+	case EXEC_SECURITY_NOT_ENTITLED:
+#if DEVELOPMENT || DEBUG
+		/* Last chance: everything 1p is force-enabled. */
+		if (mte_force_all_enabled() && load_result->platform_binary) {
+			EXEC_LOG("Task is explicitly configured via enable-all boot-arg\n");
+			task_set_sec(new_task);
+		}
+#endif /* DEVELOPMENT || DEBUG */
+		return 0;
+	default:
+		panic("Invalid return value from entitlement evaluation");
+	}
+#endif /* HAS_MTE */
+
+	return 0;
+}
+
+/*
+ * MTE/Checked-allocation configuration.
+ *
+ * There are three configuration vectors: inheritance, posix_spawn flags and entitlements.
+ * Each of the functions below covers one configuration vector.
+ *
+ * Configuration vectors are designed to be exclusive when it comes to define how the
+ * feature will behave. This means that if configurations happens through inheritance,
+ * it will trump any posix_spawn flag or entitlement and if it happens through
+ * posix_spawn flag, it will trump entitlements.
+ *
+ * Inheritance is provided as a dev feature and needs to be explicitly "enabled" via posix_spawn.
+ * Just like posix_spawn, it's not allowed to downgrade MTE state.
+ *
+ * While there are several posix_spawn flags, the majority of them is again only for
+ * DEVELOPMENT || DEBUG. Only flags that do not _decrease_ the security posture of the
+ * target are supported in production (essentially, only flags that _enable_ features).
+ * posix_spawn flags are also the only way to control the emulation of MTE via the
+ * readiness tool based on Rosetta.
+ *
+ * Entitlements are the expected and preferred way to configure MTE/checked-allocations
+ * for the system. They are not supported for the Rosetta based emulation.
+ */
+
+#if DEVELOPMENT || DEBUG
+static inline void
+config_sec_inheritance(task_t current, task_t new_task)
+{
+	/* Configure the target task based on current task */
+	if (task_has_sec_never_check(current)) {
+		task_set_sec_never_check(new_task);
+		vm_map_set_sec_disabled(get_task_map(new_task));
+	}
+
+	if (task_has_sec_user_data(current)) {
+		task_set_sec_user_data(new_task);
+	}
+
+	/* Allow soft-mode to propagate for internal testing */
+	if (task_has_sec_soft_mode(current)) {
+		task_set_sec_soft_mode(new_task);
+	}
+}
+
+#endif /* DEVELOPMENT || DEBUG */
+
+static inline void
+config_sec_spawnflags(load_result_t *load_result,
+    struct _posix_spawnattr *px_sa, task_t new_task)
+{
+	/* We cannot be here if there were no posix_spawn attributes */
+	assert(px_sa);
+
+	/*
+	 * Most configurations are not available on RELEASE, but we need to
+	 * allow inheritance for Xcode debugging workflows.
+	 */
+	if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_ENABLE_INHERIT) != 0) {
+		EXEC_LOG("Task explicitly enables inheritance via posix_spawn flags\n");
+		task_set_sec_inherit(new_task);
+	}
+
+	/*
+	 * On both RELEASE and DEVELOPMENT, we allow preflighting MTE through
+	 * posix spawn flags: unlike POSIX_SPAWN_SECFLAG_EXPLICIT_CHECK_BYPASS,
+	 * with POSIX_SPAWN_SECFLAG_EXPLICIT_PREFLIGHT we only allow turning
+	 * on soft mode if the process is not a hardened process.
+	 */
+	if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_PREFLIGHT) != 0) {
+		if (!load_result->hardened_process_version) {
+			EXEC_LOG("Task explicitly enables soft-mode preflight via posix_spawn flags\n");
+			task_set_sec_soft_mode(new_task);
+		}
+	}
+
+#if DEVELOPMENT || DEBUG
+	if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_ENABLE_PURE_DATA) != 0) {
+		EXEC_LOG("Task explicitly enables userspace coverage via posix_spawn flags\n");
+		task_set_sec_user_data(new_task);
+	}
+
+	/* Allow testing of soft-mode via posix_spawn */
+	if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_CHECK_BYPASS) != 0) {
+		EXEC_LOG("Task explicitly enables soft-mode via posix_spawn flags\n");
+		task_set_sec_soft_mode(new_task);
+	}
+
+	if ((px_sa->psa_sec_flags & POSIX_SPAWN_SECFLAG_EXPLICIT_NEVER_CHECK_ENABLE) != 0) {
+		task_set_sec_never_check(new_task);
+		vm_map_set_sec_disabled(get_task_map(new_task));
+	}
+#endif /* DEVELOPMENT || DEBUG */
+}
+
+#if HAS_MTE
+
+static inline void
+config_sec_user_data(struct image_params *imgp, load_result_t *load_result,
+    task_t new_task, __unused struct cs_blob *cs_blob)
+{
+	exec_security_err_t ret = EXEC_SECURITY_INVALID_CONFIG;
+	bool enable_user_data = false;
+	bool explicit_opt_out = false;
+	uint8_t hardened_proc_vers = load_result->hardened_process_version;
+
+	if (!mte_user_data_enabled()) {
+		return;
+	}
+
+	if (load_result->platform_binary) {
+		/* For platform binaries, check the negative entitlement */
+		ret = exec_check_security_entitlement(imgp,
+		    CHECKED_ALLOCATIONS_DISABLE_PURE_DATA);
+		assert(ret == EXEC_SECURITY_ENTITLED || ret == EXEC_SECURITY_NOT_ENTITLED);
+		if (ret == EXEC_SECURITY_ENTITLED) {
+			EXEC_LOG("Disabling user data tagging via entitlement");
+			explicit_opt_out = true;
+		}
+
+		/*
+		 * If there are no explicit opt outs, we enable user data tagging
+		 * by default for platform binaries.
+		 */
+		enable_user_data = !explicit_opt_out;
+	} else {
+		/*
+		 * For non-platform binaries, we enable data tagging by default, if
+		 * they are hardened-process.
+		 */
+		if (hardened_proc_vers >= HARDENED_PROCESS_VERSION_ONE) {
+			EXEC_LOG("Enabling user data tagging 3P binary");
+			enable_user_data = true;
+		}
+	}
+
+	if (enable_user_data) {
+		task_set_sec_user_data(new_task);
+	}
+}
+
+static inline errno_t
+config_checked_allocations_entitlements(struct image_params *imgp, __unused load_result_t *load_result,
+    task_t new_task, __unused struct cs_blob *cs_blob, __unused proc_t new_proc)
+{
+	/* Configure tagging of user data allocations */
+	config_sec_user_data(imgp, load_result, new_task, cs_blob);
+
+	/*
+	 * Check whether we need to restrict receiving aliases to MTE memory (which are, by policy,
+	 * untagged) from other actors.
+	 */
+	exec_security_err_t ret = exec_check_security_entitlement(imgp,
+	    CHECKED_ALLOCATIONS_NO_TAGGED_RECEIVE);
+	assert(ret == EXEC_SECURITY_ENTITLED || ret == EXEC_SECURITY_NOT_ENTITLED);
+
+	if (ret == EXEC_SECURITY_ENTITLED) {
+		EXEC_LOG("Restricting receiving aliases to tagged memory due to entitlement\n");
+		task_set_sec_restrict_receiving_aliases_to_tagged_memory(new_task);
+	}
+
+
+	ret = exec_check_security_entitlement(imgp, CHECKED_ALLOCATIONS_SOFT_MODE);
+	assert(ret == EXEC_SECURITY_ENTITLED || ret == EXEC_SECURITY_NOT_ENTITLED);
+
+	/*
+	 * All 1p processes run in hard-mode in lockdown mode, regardless of their
+	 * entitlement configuration.
+	 */
+	if (load_result->platform_binary && get_lockdown_mode_state() != 0) {
+		ret = EXEC_SECURITY_NOT_ENTITLED;
+	}
+
+	if (ret == EXEC_SECURITY_ENTITLED) {
+		EXEC_LOG("Enabling soft-mode from entitlement\n");
+		task_set_sec_soft_mode(new_task);
+	}
+
+	return EXEC_SECURITY_NOT_ENTITLED;
+}
+
+#endif /* HAS_MTE */
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
+
+
+static inline errno_t
+imgact_setup_guard_objects(struct image_params *imgp, load_result_t *load_result, task_t task)
+{
+	exec_security_err_t ret = exec_check_security_entitlement(imgp, NO_GUARD_OBJECTS);
+
+	if (ret == EXEC_SECURITY_NOT_ENTITLED) {
+		/* apply guard objects entitlement if hardened-process and not disabled */
+		if (load_result->hardened_process_version >= HARDENED_PROCESS_VERSION_TWO) {
+			task_set_guard_objects(task);
+			return 0;
+		}
+
+		/* force-enroll 1p driverkit drivers */
+		if (load_result->platform_binary &&
+		    IOVnodeHasEntitlement(imgp->ip_vp,
+		    (int64_t)imgp->ip_arch_offset, kIODriverKitEntitlementKey)) {
+			task_set_guard_objects(task);
+			return 0;
+		}
+	}
+
+	task_clear_guard_objects(task);
+
+	if (ret == EXEC_SECURITY_INVALID_CONFIG) {
+		return EINVAL;
+	}
+
+	return 0;
+}
 
 /*
  * This routine configures the various runtime mitigations we can apply to a process
@@ -1222,6 +1778,9 @@ static inline errno_t
 imgact_setup_runtime_mitigations(struct image_params *imgp, __unused load_result_t *load_result,
     __unused task_t old_task, task_t new_task, __unused vm_map_t map, __unused proc_t proc)
 {
+	/* Set hardened process version */
+	task_set_hardened_process_version(new_task, load_result->hardened_process_version);
+
 	/*
 	 * It's safe to check entitlements anytime after `load_machfile` if you check
 	 * based on the vnode in imgp. We must perform this entitlement check
@@ -1247,8 +1806,51 @@ imgact_setup_runtime_mitigations(struct image_params *imgp, __unused load_result
 		return retval;
 	}
 
+	/*
+	 * Script-Restrictions enables protections around script usage in the process.
+	 */
+	if ((retval = imgact_setup_script_restrictions(imgp, new_task)) != 0) {
+		EXEC_LOG("Invalid configuration detected for script-restrictions");
+		return retval;
+	}
+
+	/*
+	 * Platform-Restrictions enables a grab bag of various kernel mitigations
+	 * including IPC security restrictions.
+	 */
+	if ((retval = imgact_setup_platform_restrictions(imgp, load_result, new_task)) != 0) {
+		EXEC_LOG("Invalid configuration detected for platform-restrictions");
+		return retval;
+	}
+
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	/*
+	 * Sec-shims a.k.a. checked-allocations a.k.a. MTE (due to several hoops around secrecy)
+	 * control whether the target process system allocators leverage MTE or not to provide
+	 * further security mitigations.
+	 */
+	if ((retval = imgact_setup_sec(imgp, load_result, old_task, new_task, map, proc)) != 0) {
+		EXEC_LOG("Invalid configuration detected for the security shim");
+		return retval;
+	}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 
 
+	/* Pipe through the IPC containment vessel entitlement state from the load result */
+	if (load_result->is_ipc_containment_vessel) {
+		EXEC_LOG("Enabling IPC-specific containment vessel restrictions as the load result carried the relevant flag.\n");
+		task_set_ipc_containment_vessel(new_task);
+	} else {
+		task_clear_ipc_containment_vessel(new_task);
+	}
+
+	/*
+	 * No-guard-objects disables guards for process deallocated allocations or VM.
+	 */
+	if ((retval = imgact_setup_guard_objects(imgp, load_result, new_task)) != 0) {
+		EXEC_LOG("Invalid configuration detected for no-guard-objects");
+		return retval;
+	}
 
 	return retval;
 }
@@ -1594,35 +2196,6 @@ grade:
 	}
 
 #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
-	/*
-	 * ptrauth version 0 is a preview ABI.  Developers can opt into running
-	 * their own arm64e binaries for local testing, with the understanding
-	 * that future OSes may break ABI.
-	 */
-	if ((imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
-	    CPU_SUBTYPE_ARM64_PTR_AUTH_VERSION(imgp->ip_origcpusubtype) == 0 &&
-	    !load_result.platform_binary &&
-	    !bootarg_arm64e_preview_abi) {
-		static bool logged_once = false;
-		set_proc_name(imgp, p);
-
-		printf("%s: not running binary \"%s\" built against preview arm64e ABI\n", __func__, p->p_name);
-		if (!os_atomic_xchg(&logged_once, true, relaxed)) {
-			printf("%s: (to allow this, add \"-arm64e_preview_abi\" to boot-args)\n", __func__);
-		}
-
-		exec_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_BAD_MACHO);
-		if (bootarg_execfailurereports) {
-			exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
-			exec_failure_reason->osr_flags |= OS_REASON_FLAG_CONSISTENT_FAILURE;
-		}
-
-		/* release new address space since we won't use it */
-		imgp->ip_free_map = map;
-		map = VM_MAP_NULL;
-		goto badtoolate;
-	}
-
 	if ((imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E &&
 	    imgp->ip_origcputype == CPU_TYPE_ARM64 &&
 	    load_result.platform_binary &&
@@ -1922,6 +2495,20 @@ grade:
 		goto badtoolate;
 	}
 
+	/*
+	 * Save the exec path if the no-read-procargs entitlement is present, while
+	 * we still have ip_strings in hand.
+	 */
+	if (IOTaskHasEntitlement(task, SYSCTL_PROCARGS_NO_READ_ENTITLEMENT)) {
+		char *exec_path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
+		char *new_execpath = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+		strlcpy(new_execpath, exec_path, MAXPATHLEN);
+
+		/* The exec path always starts from a clean process, so this should never be set. */
+		assert(p->p_execpath == NULL);
+		p->p_execpath = new_execpath;
+	}
+
 	/* Switch to target task's map to copy out strings */
 	switch_ctx = vm_map_switch_to(get_task_map(task));
 
@@ -2050,10 +2637,6 @@ grade:
 		fp->fp_glob->fg_ops = &vnops;
 		fp_set_data(fp, imgp->ip_vp);
 
-		proc_fdlock(p);
-		procfdtbl_releasefd(p, main_binary_fd, NULL);
-		fp_drop(p, main_binary_fd, fp, 1);
-		proc_fdunlock(p);
 
 		vnode_ref(imgp->ip_vp);
 
@@ -2104,6 +2687,13 @@ grade:
 			}
 			goto cleanup_rosetta_fp;
 		}
+
+		/* Release file descriptor to userspace, from this point
+		 * ownership of the main_binary_fd is given to userspace */
+		proc_fdlock(p);
+		procfdtbl_releasefd(p, main_binary_fd, NULL);
+		fp_drop(p, main_binary_fd, fp, 1);
+		proc_fdunlock(p);
 
 cleanup_rosetta_fp:
 		if (error) {
@@ -2265,7 +2855,7 @@ cleanup_rosetta_fp:
 		/* 16 - NULL char - strlen("-") - maximum of 5 digits for pid */
 		snprintf(core_name, MACH_CORE_FILEHEADER_NAMELEN, "%.9s-%d", userspace_coredump_name, proc_getpid(p));
 
-		kern_register_userspace_coredump(task, core_name);
+		kern_register_userspace_coredump(task, core_name, FALSE);
 
 		/* Discard the copy of the entitlement */
 		kfree_data(userspace_coredump_name, userspace_coredump_name_len + 1);
@@ -3334,6 +3924,7 @@ spawn_copyin_macpolicyinfo(const struct user__posix_spawn_args_desc *px_args,
 
 #if !__LP64__
 		if (extension->data > UINT32_MAX) {
+			error = EINVAL;
 			goto bad;
 		}
 #endif
@@ -3397,7 +3988,7 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 	// non-root process should not be allowed to set persona with uid/gid 0
 	if (!kauth_cred_issuser(mycred) &&
 	    (px_persona->pspi_uid == 0 || px_persona->pspi_gid == 0)) {
-		return EPERM;
+		error = EPERM;
 	}
 
 	persona_put(persona);
@@ -3586,7 +4177,38 @@ proc_apply_jit_and_vm_policies(struct image_params *imgp, proc_t p, task_t task)
 #pragma unused(p)
 #endif /* CONFIG_MACF */
 
+#if HAS_MTE
+	/*
+	 * If we are MTE enabled, communicate to the pmap layer that
+	 * we need the right configuration at each context switch.
+	 */
+	if (task_has_sec(task)) {
+		vm_map_set_sec_enabled(get_task_map(task));
 
+#if KERN_AMFI_SUPPORTS_MTE
+		if (get_lockdown_mode_state() == 0 &&
+		    amfi->has_mte_soft_mode &&
+		    amfi->has_mte_soft_mode(p)) {
+			EXEC_LOG("AMFI says: enable soft-mode\n");
+			task_set_sec_soft_mode(task);
+		}
+#endif /* KERN_AMFI_SUPPORTS_MTE */
+	}
+
+	/* Pipe through alias restrictions onto our backing map */
+	if (task_has_sec_restrict_receiving_aliases_to_tagged_memory(task)) {
+		vm_map_set_restrict_receiving_aliases_to_tagged_memory(get_task_map(task), true);
+	}
+
+#endif /* HAS_MTE */
+
+
+#if HAS_MTE_EMULATION_SHIMS && XNU_TARGET_OS_IOS
+	if (task_has_sec(task)) {
+		/* Give Rosetta some breathing room for the shadow table. */
+		needs_jumbo_va = true;
+	}
+#endif /* HAS_MTE_EMULATION_SHIMS && XNU_TARGET_OS_IOS */
 	if (needs_jumbo_va) {
 		vm_map_set_jumbo(get_task_map(task));
 	}
@@ -3779,7 +4401,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 	imgp->ip_px_persona = NULL;
 	imgp->ip_px_pcred_info = NULL;
 	imgp->ip_cs_error = OS_REASON_NULL;
-	imgp->ip_simulator_binary = IMGPF_SB_DEFAULT;
+	imgp->ip_flags2 = 0;
 	imgp->ip_subsystem_root_path = NULL;
 	imgp->ip_inherited_shared_region_id = NULL;
 	imgp->ip_inherited_jop_pid = 0;
@@ -3945,6 +4567,12 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 					goto bad;
 				}
 			}
+
+			/* to align `setlogin` syscall behaviour and login name via posix_spawn:
+			 * we need to make sure that the logname is always null-terminated despite
+			 * the last character not being null (look at setlogin in kern_prot.c)
+			 */
+			px_pcred_info->pspci_login[MAXLOGNAME] = 0;
 		}
 #if CONFIG_MACF
 		if (px_args.mac_extensions_size != 0) {
@@ -4017,6 +4645,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 	 * which depends on it.
 	 */
 
+	bool start_pagein_telemetry = false;
 	if (imgp->ip_px_sa != NULL) {
 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
 		if ((psa->psa_options & PSA_OPTION_PLUGIN_HOST_DISABLE_A_KEYS) == PSA_OPTION_PLUGIN_HOST_DISABLE_A_KEYS) {
@@ -4027,11 +4656,21 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 		if ((psa->psa_options & PSA_OPTION_ALT_ROSETTA) == PSA_OPTION_ALT_ROSETTA) {
 			imgp->ip_flags |= (IMGPF_ROSETTA | IMGPF_ALT_ROSETTA);
 		}
+#if HAS_MTE_EMULATION_SHIMS
+		/* If the task has inheritance enabled, carry the emulation setup. */
+		if (task_has_sec(old_task) && task_has_sec_inherit(old_task)) {
+			imgp->ip_flags |= (IMGPF_ROSETTA | IMGPF_ALT_ROSETTA);
+		}
+#endif /* HAS_MTE_EMULATION_SHIMS */
 #endif /* (DEVELOPMENT || DEBUG) */
 
 
 		if ((error = exec_validate_spawnattr_policy(psa->psa_apptype)) != 0) {
 			goto bad;
+		}
+
+		if ((psa->psa_options & PSA_OPTION_PAGEIN_TELEMETRY) == PSA_OPTION_PAGEIN_TELEMETRY) {
+			start_pagein_telemetry = true;
 		}
 	}
 
@@ -4043,7 +4682,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 	 * and execve().
 	 */
 	if (imgp->ip_px_sa == NULL || !(px_sa.psa_flags & POSIX_SPAWN_SETEXEC)) {
-		/* Set the new task's coalition, if it is requested.  */
+		/* Set the new task's coalition, if it is requested. */
 		coalition_t coal[COALITION_NUM_TYPES] = { COALITION_NULL };
 #if CONFIG_COALITIONS
 		int i, ncoals;
@@ -4077,8 +4716,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 				 */
 				if (!task_is_in_privileged_coalition(proc_task(p), i) &&
 				    !IOTaskHasEntitlement(proc_task(p), COALITION_SPAWN_ENTITLEMENT)) {
-					coal_dbg("ERROR: %d not in privilegd "
-					    "coalition of type %d",
+					coal_dbg("ERROR: %d not in privileged coalition of type %d",
 					    proc_getpid(p), i);
 					spawn_coalitions_release_all(coal);
 					error = EPERM;
@@ -4113,6 +4751,10 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 				coal_role[i] = coal_info.psci_info[i].psci_role;
 				ncoals++;
 			}
+		}
+		if (start_pagein_telemetry) {
+			void telemetry_pagein_start(void *coal);
+			telemetry_pagein_start(coal[COALITION_TYPE_JETSAM]);
 		}
 		if (ncoals < COALITION_NUM_TYPES) {
 			/*
@@ -4608,8 +5250,6 @@ bad:
 
 		vm_map_setup(get_task_map(new_task), new_task);
 
-		exec_setup_platform_restrictions(new_task);
-
 		/*
 		 * Set starting EXC_GUARD behavior for task now that platform
 		 * and platform restrictions bits are set.
@@ -4622,10 +5262,21 @@ bad:
 		    proc_sdk(p));
 
 		/*
-		 * Enable new task IPC access if exec_activate_image() returned an
-		 * active task. (Checks active bit in ipc_task_enable() under lock).
+		 * Between proc_exec_switch_task and ipc_task_enable, there is a
+		 * window where proc_find will return the new proc, but task_for_pid
+		 * and similar functions will return an error as the task ipc is not
+		 * enabled yet. Configure the task control port during this window
+		 * before other process have access to this task port.
+		 *
 		 * Must enable after resettextvp so that task port policies are not evaluated
 		 * until the csblob in the textvp is accurately reflected.
+		 */
+		task_set_ctrl_port_default(new_task, imgp->ip_new_thread);
+
+		/*
+		 * Enable new task IPC access if exec_activate_image() returned an
+		 * active task. (Checks active bit in ipc_task_enable() under lock).
+		 * Similarly, this must happen after resettextvp.
 		 */
 		ipc_task_enable(new_task);
 
@@ -4706,8 +5357,8 @@ bad:
 		if (imgp->ip_px_sa != NULL && px_sa.psa_thread_limit > 0) {
 			task_set_thread_limit(new_task, (uint16_t)px_sa.psa_thread_limit);
 		}
-		if (imgp->ip_px_sa != NULL && px_sa.psa_conclave_mem_limit > 0) {
-			task_set_conclave_mem_limit(new_task, px_sa.psa_conclave_mem_limit);
+		if (error == 0 && imgp->ip_px_sa != NULL && px_sa.psa_conclave_mem_limit > 0) {
+			error = task_set_conclave_mem_limit_internal(new_task, px_sa.psa_conclave_mem_limit);
 		}
 
 #if CONFIG_PROC_RESOURCE_LIMITS
@@ -4770,6 +5421,8 @@ bad:
 #if __arm64__
 		proc_footprint_entitlement_hacks(p, new_task);
 #endif /* __arm64__ */
+
+		memorystatus_set_proc_entitlement_flags(p);
 
 #if XNU_TARGET_OS_OSX
 #define SINGLE_JIT_ENTITLEMENT "com.apple.security.cs.single-jit"
@@ -4840,18 +5493,27 @@ bad:
 		}
 	}
 
-	if (error == 0 && imgp->ip_px_sa != NULL) {
-		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+	struct _iopol_param_t iop_param = {
+		.iop_scope = IOPOL_SCOPE_PROCESS,
+		.iop_iotype = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+	};
 
-		if (psa->psa_options & PSA_OPTION_DATALESS_IOPOLICY) {
-			struct _iopol_param_t iop_param = {
-				.iop_scope = IOPOL_SCOPE_PROCESS,
-				.iop_iotype = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
-				.iop_policy = psa->psa_dataless_iopolicy,
-			};
-			error = iopolicysys_vfs_materialize_dataless_files(p, IOPOL_CMD_SET, iop_param.iop_scope,
+	if (error == 0) {
+		if (imgp->ip_px_sa != NULL) {
+			struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+
+			if (psa->psa_options & PSA_OPTION_DATALESS_IOPOLICY) {
+				iop_param.iop_policy = psa->psa_dataless_iopolicy;
+			}
+		} else {
+			error = iopolicysys_vfs_materialize_dataless_files(p, IOPOL_CMD_GET, iop_param.iop_scope,
 			    iop_param.iop_policy, &iop_param);
 		}
+	}
+
+	if (error == 0 && iop_param.iop_policy != 0) {
+		error = iopolicysys_vfs_materialize_dataless_files(p, IOPOL_CMD_SET, iop_param.iop_scope,
+		    (iop_param.iop_policy | IOPOL_MATERIALIZE_DATALESS_FILES_ORIG), &iop_param);
 	}
 
 	if (error == 0) {
@@ -5405,7 +6067,7 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 	imgp->ip_seg = (is_64 ? UIO_USERSPACE64 : UIO_USERSPACE32);
 	imgp->ip_mac_return = 0;
 	imgp->ip_cs_error = OS_REASON_NULL;
-	imgp->ip_simulator_binary = IMGPF_SB_DEFAULT;
+	imgp->ip_flags2 = 0;
 	imgp->ip_subsystem_root_path = NULL;
 	uthread_set_exec_data(current_uthread(), imgp);
 
@@ -5441,6 +6103,16 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 		new_task = get_threadtask(imgp->ip_new_thread);
 	}
 
+#if HAS_MTE_EMULATION_SHIMS
+	/*
+	 * ARM2ARM Rosetta doesn't carry over the configuration from the initial posix_spawn,
+	 * so we key the enablement of the runtime to whether inheritance is enabled or not
+	 * for the task. We will defer any MTE specific configuration to image activation.
+	 */
+	if (task_has_sec_inherit(old_task) && task_has_sec(old_task)) {
+		imgp->ip_flags |= (IMGPF_ROSETTA | IMGPF_ALT_ROSETTA);
+	}
+#endif /* HAS_MTE_EMULATION_SHIMS */
 
 	p = (proc_t)get_bsdthreadtask_info(imgp->ip_new_thread);
 
@@ -5488,8 +6160,6 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 
 		vm_map_setup(get_task_map(new_task), new_task);
 
-		exec_setup_platform_restrictions(new_task);
-
 		/*
 		 * Set starting EXC_GUARD behavior for task now that platform
 		 * and platform restrictions bits are set.
@@ -5502,10 +6172,21 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 		    proc_sdk(p));
 
 		/*
-		 * Enable new task IPC access if exec_activate_image() returned an
-		 * active task. (Checks active bit in ipc_task_enable() under lock).
+		 * Between proc_exec_switch_task and ipc_task_enable, there is a
+		 * window where proc_find will return the new proc, but task_for_pid
+		 * and similar functions will return an error as the task ipc is not
+		 * enabled yet. Configure the task control port during this window
+		 * before other process have access to this task port.
+		 *
 		 * Must enable after resettextvp so that task port policies are not evaluated
 		 * until the csblob in the textvp is accurately reflected.
+		 */
+		task_set_ctrl_port_default(new_task, imgp->ip_new_thread);
+
+		/*
+		 * Enable new task IPC access if exec_activate_image() returned an
+		 * active task. (Checks active bit in ipc_task_enable() under lock).
+		 * Similarly, this must happen after resettextvp.
 		 */
 		ipc_task_enable(new_task);
 		error = process_signature(p, imgp);
@@ -5569,13 +6250,13 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
 		// Don't inherit crash behavior across exec, but preserve crash behavior from bootargs
 		p->p_crash_behavior = 0;
 		p->p_crash_behavior_deadline = 0;
-#if (DEVELOPMENT || DEBUG)
 		set_crash_behavior_from_bootarg(p);
-#endif
 
 #if __arm64__
 		proc_footprint_entitlement_hacks(p, new_task);
 #endif /* __arm64__ */
+
+		memorystatus_set_proc_entitlement_flags(p);
 
 #if XNU_TARGET_OS_OSX
 		if (IOTaskHasEntitlement(new_task, SINGLE_JIT_ENTITLEMENT)) {
@@ -6311,7 +6992,6 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, exe_boothash_salt_generate);
 #define APP_BOOT_SESSION_KEY "executable_boothash="
 #if __has_feature(ptrauth_calls)
 #define PTRAUTH_DISABLED_FLAG "ptrauth_disabled=1"
-#define DYLD_ARM64E_ABI_KEY "arm64e_abi="
 #endif /* __has_feature(ptrauth_calls) */
 #define MAIN_TH_PORT_KEY "th_port="
 
@@ -6320,9 +7000,9 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, exe_boothash_salt_generate);
 #define HEX_STR_LEN 18 // 64-bit hex value "0x0123456701234567"
 #define HEX_STR_LEN32 10 // 32-bit hex value "0x01234567"
 
-#if XNU_TARGET_OS_OSX && _POSIX_SPAWN_FORCE_4K_PAGES && PMAP_CREATE_FORCE_4K_PAGES
+#if XNU_TARGET_OS_OSX && __ARM_MIXED_PAGE_SIZE__
 #define VM_FORCE_4K_PAGES_KEY "vm_force_4k_pages=1"
-#endif /* XNU_TARGET_OS_OSX && _POSIX_SPAWN_FORCE_4K_PAGES && PMAP_CREATE_FORCE_4K_PAGES */
+#endif /* XNU_TARGET_OS_OSX && __ARM_MIXED_PAGE_SIZE__ */
 
 static int
 exec_add_entropy_key(struct image_params *imgp,
@@ -6573,21 +7253,6 @@ exec_add_apple_strings(struct image_params *imgp,
 	}
 #endif /* __has_feature(ptrauth_calls) */
 
-
-#if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
-	{
-		char dyld_abi_string[strlen(DYLD_ARM64E_ABI_KEY) + 8];
-		strlcpy(dyld_abi_string, DYLD_ARM64E_ABI_KEY, sizeof(dyld_abi_string));
-		bool allowAll = bootarg_arm64e_preview_abi;
-		strlcat(dyld_abi_string, (allowAll ? "all" : "os"), sizeof(dyld_abi_string));
-		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(dyld_abi_string), UIO_SYSSPACE, FALSE);
-		if (error) {
-			goto bad;
-		}
-
-		imgp->ip_applec++;
-	}
-#endif
 	/*
 	 * Add main thread mach port name
 	 * +1 uref on main thread port, this ref will be extracted by libpthread in __pthread_init
@@ -6609,10 +7274,10 @@ exec_add_apple_strings(struct image_params *imgp,
 		imgp->ip_applec++;
 	}
 
-#if XNU_TARGET_OS_OSX && _POSIX_SPAWN_FORCE_4K_PAGES && PMAP_CREATE_FORCE_4K_PAGES
+#if XNU_TARGET_OS_OSX && __ARM_MIXED_PAGE_SIZE__
 	if (imgp->ip_px_sa != NULL) {
 		struct _posix_spawnattr* psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
-		if (psa->psa_flags & _POSIX_SPAWN_FORCE_4K_PAGES) {
+		if (psa->psa_4k || (psa->psa_flags & _POSIX_SPAWN_FORCE_4K_PAGES)) {
 			const char *vm_force_4k_string = VM_FORCE_4K_PAGES_KEY;
 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vm_force_4k_string), UIO_SYSSPACE, FALSE);
 			if (error) {
@@ -6621,7 +7286,7 @@ exec_add_apple_strings(struct image_params *imgp,
 			imgp->ip_applec++;
 		}
 	}
-#endif /* XNU_TARGET_OS_OSX && _POSIX_SPAWN_FORCE_4K_PAGES && PMAP_CREATE_FORCE_4K_PAGES */
+#endif /* XNU_TARGET_OS_OSX && __ARM_MIXED_PAGE_SIZE__ */
 
 	/* adding the libmalloc experiment string */
 	local_experiment_factors = os_atomic_load_wide(&libmalloc_experiment_factors, relaxed);
@@ -6665,6 +7330,33 @@ exec_add_apple_strings(struct image_params *imgp,
 	}
 
 
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	if (task_has_sec(task)) {
+		const char *sec_transition_shims = "has_sec_transition=1";
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(sec_transition_shims), UIO_SYSSPACE, FALSE);
+		if (error) {
+			printf("Failed to add security translation shims notification\n");
+			goto bad;
+		}
+
+		imgp->ip_applec++;
+
+		/* Push down MTE-specific configuration options that allocators may be interested into. */
+		#define SEC_TRANSITION_POLICY_KEY "sec_transition_policy="
+
+		char sec_transition_policy[strlen(SEC_TRANSITION_POLICY_KEY) + HEX_STR_LEN + 1];
+
+		snprintf(sec_transition_policy, sizeof(sec_transition_policy),
+		    SEC_TRANSITION_POLICY_KEY "0x%x", task_get_sec_policy(task));
+
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(sec_transition_policy), UIO_SYSSPACE, FALSE);
+		if (error) {
+			printf("Failed to add the security transition policy string with error %d\n", error);
+			goto bad;
+		}
+		imgp->ip_applec++;
+	}
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 
 
 	if (load_result->hardened_browser) {
@@ -7216,7 +7908,7 @@ create_unix_stack(vm_map_t map, load_result_t* load_result,
 		    FALSE,
 		    VM_PROT_NONE);
 		if (kr != KERN_SUCCESS) {
-			(void)mach_vm_deallocate(map, addr, size);
+			(void)mach_vm_deallocate_kernel(map, addr, size);
 			return kr;
 		}
 	}
@@ -8371,3 +9063,16 @@ sysctl_setup_ensure_pidversion_changes_on_exec(__unused int64_t in, int64_t *out
 
 SYSCTL_TEST_REGISTER(setup_ensure_pidversion_changes_on_exec, sysctl_setup_ensure_pidversion_changes_on_exec);
 #endif /* DEBUG || DEVELOPMENT */
+
+#if HAS_MTE && (DEBUG || DEVELOPMENT)
+static int
+sysctl_is_mte_enabled SYSCTL_HANDLER_ARGS
+{
+	int value = mte_enabled() ? 1 : 0;
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, is_mte_enabled,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_is_mte_enabled, "I", "Return whether MTE is enabled");
+#endif /* HAS_MTE && (DEBUG || DEVELOPMENT) */

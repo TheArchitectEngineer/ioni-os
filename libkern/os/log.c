@@ -869,7 +869,7 @@ _os_log_internal_driverKit(void *dso, os_log_t log, uint8_t type, const char *fm
 	return 0;
 }
 
-__attribute__((noinline, not_tail_called)) __mockable void
+__attribute__((noinline, not_tail_called)) __mockable_strong void
 os_log_with_args(os_log_t oslog, os_log_type_t type, const char *fmt,
     va_list args, void *addr)
 {
@@ -993,7 +993,13 @@ firehose_trace_save_payload(const log_payload_s *lp, const uint8_t *lp_data,
 	uint8_t *ft_data = ft->ft_data;
 
 	if (priv_data_size > 0) {
-		assert(FIREHOSE_TRACE_ID_HAS_FLAG(lp->lp_ftid, log, has_private_data));
+		if (!FIREHOSE_TRACE_ID_HAS_FLAG(lp->lp_ftid, log, has_private_data)) {
+#if DEVELOPMENT || DEBUG
+			panic("Log payload had private data but 'has_private_data' was not set!");
+#else
+			return;
+#endif // DEVELOPMENT || DEBUG
+		}
 		memcpy(ft_priv_data, log_payload_priv_data(lp, lp_data), priv_data_size);
 
 		firehose_chunk_t fc = firehose_chunk_for_address(ft);

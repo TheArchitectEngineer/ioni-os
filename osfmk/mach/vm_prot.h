@@ -101,13 +101,6 @@ typedef int             vm_prot_t;
 #define VM_PROT_ALL     (VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE)
 
 /*
- *	This is an alias to VM_PROT_EXECUTE to identify callers that
- *	want to allocate an hardware assisted Read-only/read-write
- *	trusted path in userland.
- */
-#define        VM_PROT_RORW_TP                 (VM_PROT_EXECUTE)
-
-/*
  *	An invalid protection value.
  *	Used only by memory_object_lock_request to indicate no change
  *	to page locks.  Using -1 here is a bad idea because it
@@ -168,14 +161,6 @@ typedef int             vm_prot_t;
  */
 #define VM_PROT_STRIP_READ              ((vm_prot_t) 0x80)
 #define VM_PROT_EXECUTE_ONLY    (VM_PROT_EXECUTE|VM_PROT_STRIP_READ)
-
-#ifdef PRIVATE
-/*
- * When using VM_PROT_COPY, fail instead of copying an executable mapping,
- * since that could cause code-signing violations.
- */
-#define VM_PROT_COPY_FAIL_IF_EXECUTABLE ((vm_prot_t)0x100)
-#endif /* PRIVATE */
 
 /*
  * Another invalid protection value to support pager TPRO protection.

@@ -236,6 +236,7 @@ typedef struct _posix_spawnattr {
 
 	uint64_t        psa_max_addr;           /* Max valid VM address */
 	bool            psa_no_smt;
+	bool            psa_4k;                 /* Force 4k address space */
 	bool            psa_tecs;
 	int             psa_platform;           /* Plaform for the binary */
 
@@ -290,6 +291,7 @@ __options_decl(posix_spawn_secflag_options, uint16_t, {
 	POSIX_SPAWN_SECFLAG_EXPLICIT_ENABLE_INHERIT         = 0x200,
 	POSIX_SPAWN_SECFLAG_EXPLICIT_REQUIRE_ENABLE         = 0x400,
 	POSIX_SPAWN_SECFLAG_EXPLICIT_ENABLE_PURE_DATA       = 0x800,
+	POSIX_SPAWN_SECFLAG_EXPLICIT_PREFLIGHT              = 0x1000,
 });
 
 /*
@@ -387,6 +389,7 @@ __options_decl(posix_spawn_options, uint32_t, {
 	PSA_OPTION_PLUGIN_HOST_DISABLE_A_KEYS   = 0x1,
 	PSA_OPTION_ALT_ROSETTA                  = 0x2,
 	PSA_OPTION_DATALESS_IOPOLICY            = 0x4,
+	PSA_OPTION_PAGEIN_TELEMETRY             = 0x8,
 });
 
 /*

@@ -174,12 +174,62 @@ struct vm_statistics64 {
 	uint64_t        total_uncompressed_pages_in_compressor; /* # of pages (uncompressed) held within the compressor. */
 	/* added for rev2 */
 	uint64_t        swapped_count;          /* # of compressor-stored pages currently stored in swap */
+	/* Added in rev3 */
+	/* The total number of physical pages in the tag storage region */
+	uint64_t total_tag_storage_pages;
+	/*
+	 * The number of tag storage pages which hold non-tag data and are pageable
+	 */
+	uint64_t nontag_pageable_tag_storage_pages;
+	/* The number of tag storage pages which hold non-tag data and are wired */
+	uint64_t nontag_wired_tag_storage_pages;
+	/*
+	 * The number of tag storage pages which are being used for neither tags nor
+	 * regular memory
+	 */
+	uint64_t free_tag_storage_pages;
+	/* The number of tag storage pages which currently hold tags */
+	uint64_t tag_storing_tag_storage_pages;
+
+	/* The total number of virtual pages which are tagged */
+	uint64_t total_tagged_pages;
+	/* The number of resident, physical pages which are tagged */
+	uint64_t resident_tagged_pages;
+	/*
+	 * The outstanding number of virtual tagged pages whose contents reside in the
+	 * compressor
+	 */
+	uint64_t compressed_tagged_pages;
+
+	/* The number of tagged pages which have been compressed since boot */
+	uint64_t tagged_compressions;
+	/* The number of tagged pages which have been decompressed since boot */
+	uint64_t tagged_decompressions;
+	/* The current number of bytes consumed by compressed tag storage data */
+	uint64_t compressed_tag_storage_bytes;
 } __attribute__((aligned(8)));
 
 typedef struct vm_statistics64  *vm_statistics64_t;
 typedef struct vm_statistics64  vm_statistics64_data_t;
-
+#if KERNEL
+/*
+ * @func vm_stats
+ *
+ * @brief
+ * Get virtual memory statistics for the host machine. Equivalent to system call
+ * @c host_statistics64() with flavor @c HOST_VM_INFO64.
+ *
+ * @param info
+ * Out-param of type vm_statistics64_data_t
+ *
+ * @param count
+ * The size of the @c info buffer in words
+ *
+ * @returns
+ * KERN_SUCCESS if successful
+ */
 kern_return_t vm_stats(void *info, unsigned int *count);
+#endif
 
 /*
  * VM_STATISTICS_TRUNCATE_TO_32_BIT
@@ -226,20 +276,36 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
 
 /* included for the vm_map_page_query call */
 
-#define VM_PAGE_QUERY_PAGE_PRESENT      0x1
-#define VM_PAGE_QUERY_PAGE_FICTITIOUS   0x2
-#define VM_PAGE_QUERY_PAGE_REF          0x4
-#define VM_PAGE_QUERY_PAGE_DIRTY        0x8
-#define VM_PAGE_QUERY_PAGE_PAGED_OUT    0x10
-#define VM_PAGE_QUERY_PAGE_COPIED       0x20
-#define VM_PAGE_QUERY_PAGE_SPECULATIVE  0x40
-#define VM_PAGE_QUERY_PAGE_EXTERNAL     0x80
+typedef int32_t vm_page_disposition_t;
+
+#define VM_PAGE_QUERY_PAGE_PRESENT      0x001
+#define VM_PAGE_QUERY_PAGE_FICTITIOUS   0x002
+#define VM_PAGE_QUERY_PAGE_REF          0x004
+#define VM_PAGE_QUERY_PAGE_DIRTY        0x008
+#define VM_PAGE_QUERY_PAGE_PAGED_OUT    0x010
+#define VM_PAGE_QUERY_PAGE_COPIED       0x020
+#define VM_PAGE_QUERY_PAGE_SPECULATIVE  0x040
+#define VM_PAGE_QUERY_PAGE_EXTERNAL     0x080
 #define VM_PAGE_QUERY_PAGE_CS_VALIDATED 0x100
 #define VM_PAGE_QUERY_PAGE_CS_TAINTED   0x200
 #define VM_PAGE_QUERY_PAGE_CS_NX        0x400
 #define VM_PAGE_QUERY_PAGE_REUSABLE     0x800
 
 #pragma mark User Flags
+
+/*
+ * Options for vm_reallocate:
+ *
+ * VM_REALLOCATE_DEALLOCATE_SOURCE
+ *  When the source is relocated, the VA it previously occupied will be unmapped.
+ *
+ * VM_REALLOCATE_ZERO_FILL_SOURCE
+ *  When the source is relocated, the VA it previously occupied will be mapped
+ *  by new entries with equivalent protections and inheritance, equivalent to a
+ *  fresh zero-filled allocation from vm_allocate().
+ */
+#define VM_REALLOCATE_DEALLOCATE_SOURCE 0x0
+#define VM_REALLOCATE_ZERO_FILL_SOURCE  0x1
 
 /*
  * VM allocation flags:
@@ -271,6 +337,10 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
  *	Pages brought in to this VM region are placed on the speculative
  *	queue instead of the active queue.  In other words, they are not
  *	cached so that they will be stolen first if memory runs low.
+ *
+ * VM_FLAGS_GUARD_OBJECT_OPTOUT
+ *	Opt out this allocation from the guard object allocation policy.
+ *	And memory will be allocated in typical first-fit allocation order.
  */
 
 #define VM_FLAGS_FIXED                  0x00000000
@@ -283,7 +353,8 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
 #define VM_FLAGS_RESILIENT_MEDIA        0x00000040
 #define VM_FLAGS_PERMANENT              0x00000080
 #define VM_FLAGS_TPRO                   0x00001000
-#define VM_FLAGS_OVERWRITE              0x00004000  /* delete any existing mappings first */
+#define VM_FLAGS_MTE                    0x00002000
+#define VM_FLAGS_OVERWRITE              0x00004000 /* delete any existing mappings first */
 /*
  * VM_FLAGS_SUPERPAGE_MASK
  *	3 bits that specify whether large pages should be used instead of
@@ -291,6 +362,7 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
  */
 #define VM_FLAGS_SUPERPAGE_MASK         0x00070000 /* bits 0x10000, 0x20000, 0x40000 */
 #define VM_FLAGS_RETURN_DATA_ADDR       0x00100000 /* Return address of target data, rather than base of page */
+#define VM_FLAGS_GUARD_OBJECT_OPTOUT    0x00400000
 #define VM_FLAGS_RETURN_4K_DATA_ADDR    0x00800000 /* Return 4K aligned address of target data */
 #define VM_FLAGS_ALIAS_MASK             0xFF000000
 #define VM_GET_FLAGS_ALIAS(flags, alias)                        \
@@ -321,13 +393,17 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
 	                         VM_FLAGS_RESILIENT_MEDIA |     \
 	                         VM_FLAGS_PERMANENT |           \
 	                         VM_FLAGS_TPRO |                \
+	                         VM_FLAGS_MTE |                 \
 	                         VM_FLAGS_OVERWRITE |           \
 	                         VM_FLAGS_SUPERPAGE_MASK |      \
 	                         VM_FLAGS_RETURN_DATA_ADDR |    \
+	                         VM_FLAGS_GUARD_OBJECT_OPTOUT | \
 	                         VM_FLAGS_RETURN_4K_DATA_ADDR | \
 	                         VM_FLAGS_ALIAS_MASK)
+
 #endif /* XNU_KERNEL_PRIVATE */
-#define VM_FLAGS_HW     (VM_FLAGS_TPRO)
+#define VM_FLAGS_HW             (VM_FLAGS_TPRO |                \
+	                         VM_FLAGS_MTE)
 
 /* These are the flags that we accept from user-space */
 #define VM_FLAGS_USER_ALLOCATE  (VM_FLAGS_FIXED |               \
@@ -338,6 +414,7 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
 	                         VM_FLAGS_NO_CACHE |            \
 	                         VM_FLAGS_PERMANENT |           \
 	                         VM_FLAGS_OVERWRITE |           \
+	                         VM_FLAGS_GUARD_OBJECT_OPTOUT | \
 	                         VM_FLAGS_SUPERPAGE_MASK |      \
 	                         VM_FLAGS_HW |                  \
 	                         VM_FLAGS_ALIAS_MASK)
@@ -359,7 +436,7 @@ typedef struct vm_purgeable_info        *vm_purgeable_info_t;
 #define SUPERPAGE_SIZE_ANY              1
 #define VM_FLAGS_SUPERPAGE_NONE     (SUPERPAGE_NONE     << VM_FLAGS_SUPERPAGE_SHIFT)
 #define VM_FLAGS_SUPERPAGE_SIZE_ANY (SUPERPAGE_SIZE_ANY << VM_FLAGS_SUPERPAGE_SHIFT)
-#if defined(__x86_64__) || !defined(KERNEL)
+#if defined(__x86_64__) || !defined(KERNEL) || defined(__BUILDING_XNU_LIB_UNITTEST__)
 #define SUPERPAGE_SIZE_2MB              2
 #define VM_FLAGS_SUPERPAGE_SIZE_2MB (SUPERPAGE_SIZE_2MB<<VM_FLAGS_SUPERPAGE_SHIFT)
 #endif
@@ -379,6 +456,7 @@ __enum_decl(virtual_memory_guard_exception_code_t, uint32_t, {
 	kGUARD_EXC_SEC_IOPL_ON_EXEC_PAGE = 10,
 	kGUARD_EXC_SEC_EXEC_ON_IOPL_PAGE = 11,
 	kGUARD_EXC_SEC_UPL_WRITE_ON_EXEC_REGION = 12,
+	kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY = 13,
 	/*
 	 * rdar://151450801 (Remove spurious kGUARD_EXC_SEC_ACCESS_FAULT and kGUARD_EXC_SEC_ASYNC_ACCESS_FAULT once CrashReporter is aligned)
 	 */
@@ -388,11 +466,33 @@ __enum_decl(virtual_memory_guard_exception_code_t, uint32_t, {
 	kGUARD_EXC_SEC_COPY_DENIED = 100,
 	kGUARD_EXC_SEC_SHARING_DENIED = 101,
 
+	/* Fault-related exceptions. */
+	kGUARD_EXC_MTE_SYNC_FAULT = 200,
+	kGUARD_EXC_MTE_ASYNC_USER_FAULT = 201,
+	kGUARD_EXC_MTE_ASYNC_KERN_FAULT = 202,
+	kGUARD_EXC_GUARD_OBJECT_ASYNC_USER_FAULT = 203,
+	kGUARD_EXC_GUARD_OBJECT_ASYNC_KERN_FAULT = 204,
 });
 
+#define kGUARD_EXC_MTE_SOFT_MODE       0x100000
 
 #ifdef XNU_KERNEL_PRIVATE
 
+#if HAS_MTE
+static inline bool
+vm_guard_is_mte_policy(uint32_t flavor)
+{
+	return flavor == kGUARD_EXC_SEC_COPY_DENIED || flavor == kGUARD_EXC_SEC_SHARING_DENIED;
+}
+
+static inline bool
+vm_guard_is_mte_fault(uint32_t flavor)
+{
+	return flavor == kGUARD_EXC_MTE_SYNC_FAULT ||
+	       flavor == kGUARD_EXC_MTE_ASYNC_USER_FAULT ||
+	       flavor == kGUARD_EXC_MTE_ASYNC_KERN_FAULT;
+}
+#endif /* HAS_MTE */
 
 #pragma mark Map Ranges
 
@@ -414,17 +514,10 @@ __enum_decl(virtual_memory_guard_exception_code_t, uint32_t, {
  * Range containing general purpose allocations from kalloc, etc that
  * contain pointers.
  *
- * @const KMEM_RANGE_ID_SPRAYQTN
- * The spray quarantine range contains allocations that have the following
- * properties:
- * - An attacker could control the size, lifetime and number of allocations
- *   of this type (or from this callsite).
- * - The pointer to the allocation is zeroed to ensure that it isn't left
- *   dangling limiting the use of UaFs.
- * - OOBs on the allocation is carefully considered and sufficiently
- *   addressed.
+ * @const KMEM_RANGE_ID_IO
+ * Range for MMIO register mappings.
  *
- * @const KMEM_RANGE_ID_DATA
+ * @const KMEM_RANGE_ID_DATA_PRIVATE
  * Range containing allocations that are bags of bytes and contain no
  * pointers.
  *
@@ -437,8 +530,8 @@ __enum_decl(vm_map_range_id_t, uint8_t, {
 	KMEM_RANGE_ID_PTR_0,
 	KMEM_RANGE_ID_PTR_1,
 	KMEM_RANGE_ID_PTR_2,
-	KMEM_RANGE_ID_SPRAYQTN,
-	KMEM_RANGE_ID_DATA,
+	KMEM_RANGE_ID_IO,
+	KMEM_RANGE_ID_DATA_PRIVATE,
 	KMEM_RANGE_ID_DATA_SHARED,
 
 	KMEM_RANGE_ID_FIRST   = KMEM_RANGE_ID_PTR_0,
@@ -486,15 +579,15 @@ typedef union {
 		    __unused_bit_10:1,
 		    __unused_bit_11:1,
 		    vmf_tpro:1,
-		__unused_bit_13:1,
-		vmf_overwrite:1,
+		    vmf_mte:1,
+		    vmf_overwrite:1,
 		    __unused_bit_15:1,
 
 		    vmf_superpage_size:3,
 		    __unused_bit_19:1,
 		    vmf_return_data_addr:1,
 		    __unused_bit_21:1,
-		    __unused_bit_22:1,
+		    vmf_guard_object_optout:1,
 		    vmf_return_4k_data_addr:1,
 
 		/*
@@ -509,12 +602,17 @@ typedef union {
 		/*
 		 * General kernel flags
 		 */
-		    vmkf_already:1,             /* OK if same mapping already exists */
 		    vmkf_beyond_max:1,          /* map beyond the map's max offset */
-		    vmkf_no_pmap_check:1,       /* do not check that pmap is empty */
 		    vmkf_map_jit:1,             /* mark entry as JIT region */
 		    vmkf_iokit_acct:1,          /* IOKit accounting */
-		    vmkf_keep_map_locked:1,     /* keep map locked when returning from vm_map_enter() */
+		    vmkf_keep_map_ilocked:1,    /* keep map interlocked when returning
+		                                 * from vm_map_enter() iff call successful,
+		                                 * incompatible with vmf_superpage_size
+		                                 */
+		    vmkf_keep_entries_locked:1, /* keep entries exclusively locked under
+		                                 * ctx when returning from vm_map_enter(),
+		                                 * incompatible with vmf_superpage_size
+		                                 */
 		    vmkf_overwrite_immutable:1, /* can overwrite immutable mappings */
 		    vmkf_remap_prot_copy:1,     /* vm_remap for VM_PROT_COPY */
 		    vmkf_remap_legacy_mode:1,   /* vm_remap, not vm_remap_new */
@@ -522,8 +620,7 @@ typedef union {
 		    vmkf_cs_enforcement:1,      /* new value for CS_ENFORCEMENT */
 		    vmkf_nested_pmap:1,         /* use a nested pmap */
 		    vmkf_no_copy_on_read:1,     /* do not use copy_on_read */
-		    vmkf_copy_single_object:1,  /* vm_map_copy only 1 VM object */
-		    vmkf_copy_pageable:1,       /* vm_map_copy with pageable entries */
+		    vmkf_copy_single_object:1,  /* vm_map_copy only 1 VM object (more accurately, 1 entry) */
 		    vmkf_copy_same_map:1,       /* vm_map_copy to remap in original map */
 		    vmkf_translated_allow_execute:1,    /* allow execute in translated processes */
 		    vmkf_tpro_enforcement_override:1,   /* override TPRO propagation */
@@ -534,7 +631,12 @@ typedef union {
 		 */
 		    vmkf_submap:1,              /* mapping a VM submap */
 		    vmkf_submap_atomic:1,       /* keep entry atomic (no splitting/coalescing) */
-		    vmkf_submap_adjust:1,       /* the submap needs to be adjusted */
+
+		/*
+		 * MTE Behavior bits.
+		 */
+		    vmkf_copy_dest:2,           /* See VM_COPY_DESTINATION_* */
+		    vmkf_is_iokit:1,            /* creating a memory entry to back an IOMD */
 
 		/*
 		 * Flags altering the behavior of vm_map_locate_space_anywhere()
@@ -543,9 +645,6 @@ typedef union {
 		    vmkf_guard_before:1,        /* guard page before the mapping */
 		    vmkf_last_free:1,           /* find space from the end */
 		    vmkf_range_id:KMEM_RANGE_BITS;      /* kmem range to allocate in */
-
-		unsigned long long
-		__vmkf_unused2:64;
 	};
 
 	/*
@@ -578,21 +677,22 @@ typedef union {
 	VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmf_permanent = true, __VA_ARGS__)
 
 #define VM_MAP_KERNEL_FLAGS_DATA_BUFFERS_ANYWHERE(...) \
-	VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmkf_range_id = KMEM_RANGE_ID_DATA, __VA_ARGS__)
+	VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmkf_range_id = KMEM_RANGE_ID_DATA_PRIVATE, __VA_ARGS__)
 
 #define VM_MAP_KERNEL_FLAGS_DATA_SHARED_ANYWHERE(...) \
-	VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmkf_range_id = kmem_needs_data_share_range() ? \
-	                    KMEM_RANGE_ID_DATA_SHARED : KMEM_RANGE_ID_DATA, __VA_ARGS__)
+	VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmkf_range_id = KMEM_RANGE_ID_DATA_SHARED, __VA_ARGS__)
 
 typedef struct {
 	unsigned int
 	    vmnekf_ledger_tag:3,
 	    vmnekf_ledger_no_footprint:1,
-	__vmnekf_unused:28;
+	    vmnekf_is_iokit:1,
+	    __vmnekf_unused:27;
 } vm_named_entry_kernel_flags_t;
 #define VM_NAMED_ENTRY_KERNEL_FLAGS_NONE (vm_named_entry_kernel_flags_t) {    \
 	.vmnekf_ledger_tag = 0,                                                \
 	.vmnekf_ledger_no_footprint = 0,                                       \
+	.vmnekf_is_iokit = 0,                                                  \
 	.__vmnekf_unused = 0                                                   \
 }
 
@@ -653,6 +753,8 @@ typedef struct {
 
 #define VM_MEMORY_MACH_MSG 20
 #define VM_MEMORY_IOKIT 21
+#define VM_MEMORY_VM_RECLAIM 22
+
 #define VM_MEMORY_STACK  30
 #define VM_MEMORY_GUARD  31
 #define VM_MEMORY_SHARED_PMAP 32
@@ -867,20 +969,6 @@ typedef struct {
 #define VM_MAKE_TAG(tag) ((tag) << 24)
 #endif /* XNU_KERNEL_PRIVATE */
 
-#if PRIVATE && !KERNEL
-///
-/// Return a human-readable description for a given VM user tag.
-///
-/// - Parameters:
-///   - tag: A VM tag between `[0,VM_MEMORY_COUNT)`
-///
-/// - Returns: A string literal description of the tag
-///
-__SPI_AVAILABLE(macos(16.0), ios(19.0), watchos(12.0), tvos(19.0), visionos(3.0), bridgeos(10.0))
-OS_EXPORT
-const char *mach_vm_tag_describe(unsigned int tag);
-#endif /* PRIVATE && !KERNEL */
-
 #if KERNEL_PRIVATE
 
 #pragma mark Kernel Tags
@@ -930,6 +1018,7 @@ const char *mach_vm_tag_describe(unsigned int tag);
 #define VM_KERN_MEMORY_KALLOC_TYPE      31
 #define VM_KERN_MEMORY_TRIAGE           32
 #define VM_KERN_MEMORY_RECOUNT          33
+#define VM_KERN_MEMORY_MTAG             34
 #define VM_KERN_MEMORY_EXCLAVES         35
 #define VM_KERN_MEMORY_EXCLAVES_SHARED  36
 #define VM_KERN_MEMORY_KALLOC_SHARED    37
@@ -990,6 +1079,10 @@ const char *mach_vm_tag_describe(unsigned int tag);
 /* The number of VM_KERN_COUNT_ stats. New VM_KERN_COUNT_ entries should be less than this. */
 #define VM_KERN_COUNTER_COUNT           15
 
+#define VM_COPY_DESTINATION_USER 0
+#define VM_COPY_DESTINATION_KERNEL 1
+#define VM_COPY_DESTINATION_UNKNOWN 2 /* memory entry */
+#define VM_COPY_DESTINATION_INTERNAL 3 /* creating a copy map for internal use which is soon discarded */
 #endif /* KERNEL_PRIVATE */
 
 __END_DECLS

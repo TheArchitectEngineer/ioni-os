@@ -74,6 +74,7 @@
 #include <mach/thread_act.h>
 #include <mach/task_special_ports.h>
 #include <mach/vm_param.h>
+#include <mach/exclaves.h>
 #include <kern/assert.h>
 #include <kern/mach_param.h>
 #include <kern/misc_protos.h>
@@ -277,7 +278,7 @@ kernel_startup_bootstrap(void)
 
 	qsort(startup_entries, n, sizeof(struct startup_entry), startup_entry_cmp);
 
-#if !CONFIG_SPTM && !defined(__BUILDING_XNU_LIBRARY__)
+#if !__arm64__ && !defined(__BUILDING_XNU_LIBRARY__)
 	/* static_if relies on TEXT editing and not supported in user-mode build*/
 	static_if_init(PE_boot_args());
 #endif
@@ -417,6 +418,7 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
 		[STARTUP_SUB_KMEM] = "kmem",
 		[STARTUP_SUB_ZALLOC] = "zalloc",
 		[STARTUP_SUB_PERCPU] = "percpu",
+		[STARTUP_SUB_SCHED] = "sched",
 		[STARTUP_SUB_EVENT] = "event",
 
 		[STARTUP_SUB_CODESIGNING] = "codesigning",
@@ -451,6 +453,8 @@ event_register_handler(struct event_hdr *hdr)
 	head->next = hdr;
 }
 
+extern bool fki_is_skipped_func_name(startup_subsystem_id_t subsys_id, const char* func_name);
+
 __startup_func
 void
 kernel_startup_initialize_upto(startup_subsystem_id_t upto)
@@ -465,6 +469,12 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
 			kprintf("%s[%d, rank %d]: %p(%p)\n", __func__,
 			    cur->subsystem, cur->rank, cur->func, cur->arg);
 		}
+#ifdef __BUILDING_XNU_LIB_UNITTEST__
+		if (fki_is_skipped_func_name(cur->subsystem, cur->func_name)) {
+			startup_entry_cur = ++cur;
+			continue;
+		}
+#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
 		startup_phase = cur->subsystem - 1;
 		kernel_startup_log(cur->subsystem);
 		cur->func(cur->arg);
@@ -480,23 +490,32 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
 }
 
 #ifdef __BUILDING_XNU_LIB_UNITTEST__
-/* unit-test initialization needs to pick specific phases */
+/*
+ * unit-test initialization needs to pick only specific phases
+ * and out of these phases, possibly skip certain functions.
+ * @param sysid the system-id the startup steps for. Must be higher than
+ *   any system-id that already ran.
+ */
 void
 kernel_startup_initialize_only(startup_subsystem_id_t sysid)
 {
 	assert(startup_phase < sysid);
 	struct startup_entry *cur = startup_entry_cur;
-	while (cur < startup_entries_end && cur->subsystem <= sysid) {
-		if (cur->subsystem == sysid) {
-			startup_phase = cur->subsystem - 1;
-			kernel_startup_log(cur->subsystem);
-			cur->func(cur->arg);
+	for (; cur < startup_entries_end && cur->subsystem <= sysid; ++cur) {
+		startup_entry_cur = cur;
+		if (cur->subsystem != sysid) {
+			continue;
 		}
-		startup_entry_cur = ++cur;
+		if (fki_is_skipped_func_name(cur->subsystem, cur->func_name)) {
+			continue;
+		}
+		startup_phase = cur->subsystem - 1;
+		kernel_startup_log(cur->subsystem);
+		cur->func(cur->arg);
 	}
 	startup_phase = sysid;
 }
-#endif
+#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
 
 void
 kernel_bootstrap(void)
@@ -565,9 +584,6 @@ kernel_bootstrap(void)
 	kernel_bootstrap_log("stackshot_init");
 	stackshot_init();
 
-	kernel_bootstrap_log("sched_init");
-	sched_init();
-
 #if CONFIG_MACF
 	kernel_bootstrap_log("mac_policy_init");
 	mac_policy_init();
@@ -580,7 +596,7 @@ kernel_bootstrap(void)
 	 * that this CPU is using the kernel pmap.
 	 */
 	kernel_bootstrap_log("PMAP_ACTIVATE_KERNEL");
-	PMAP_ACTIVATE_KERNEL(master_cpu);
+	PMAP_ACTIVATE_KERNEL(boot_cpu_id);
 
 	kernel_bootstrap_log("mapping_free_prime");
 	mapping_free_prime();                                           /* Load up with temporary mapping blocks */
@@ -826,6 +842,10 @@ kernel_bootstrap_thread(void)
 	sdt_early_init();
 #endif
 
+#if CONFIG_EXCLAVES
+	exclaves_early_init();
+#endif
+
 #if CODE_SIGNING_MONITOR
 	/*
 	 * Lockdown mode is initialized as a startup function within the early boot
@@ -1042,8 +1062,12 @@ load_context(
 		SCHED(run_count_incr)(thread);
 	}
 
+	if (thread == processor->active_thread) {
+		processor_state_update_from_running_thread(processor, thread, false);
+	} else {
+		processor_state_update_from_new_thread(processor, thread, false);
+	}
 	processor->active_thread = thread;
-	processor_state_update_from_thread(processor, thread, false);
 	processor->starting_pri = thread->sched_pri;
 	processor->deadline = UINT64_MAX;
 	thread->last_processor = processor;

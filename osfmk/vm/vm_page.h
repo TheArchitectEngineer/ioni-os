@@ -91,6 +91,10 @@
 #endif
 
 
+#if HAS_MTE
+static_assert(!XNU_VM_HAS_DELAYED_PAGES, "MTE and delayed pages aren't compatible");
+static_assert(XNU_VM_HAS_LINEAR_PAGES_ARRAY, "MTE requires linear vm_pages[]");
+#endif /* HAS_MTE */
 
 /*
  * in order to make the size of a vm_page_t 64 bytes (cache line size for both arm64 and x86_64)
@@ -123,8 +127,28 @@ typedef vm_page_packed_t                        vm_page_object_t;
  * The relocation is on behalf of the contiguous allocator; it is likely to be
  * wired, so do not consider pages that cannot be wired for any reason.
  */
+#if HAS_MTE
+/*
+ * VM_RELOCATE_REASON_TAG_STORAGE_RECLAIM:
+ * The relocation is to free up a tag storage range page, so that it can be
+ * used for tag storage.
+ *
+ * VM_RELOCATE_REASON_TAG_STORAGE_WIRE:
+ * The relocation is because a codepath is trying or is about to try to wire a
+ * tag storage page.  The relocation code will relax requirements around the
+ * page state needed to be relocatable.
+ *
+ * NOTE: For now, tag storage pages will be considered wireable... but in the
+ * future, tag storage pages will not be considered wireable.
+ * VM_RELOCATE_REASON_TAG_STORAGE_WIRE exists in anticipation of this.
+ */
+#endif /* HAS_MTE */
 __enum_closed_decl(vm_relocate_reason_t, unsigned int, {
 	VM_RELOCATE_REASON_CONTIGUOUS,
+#if HAS_MTE
+	VM_RELOCATE_REASON_TAG_STORAGE_RECLAIM,
+	VM_RELOCATE_REASON_TAG_STORAGE_WIRE,
+#endif /* HAS_MTE */
 
 	VM_RELOCATE_REASON_COUNT,
 });
@@ -147,8 +171,31 @@ __enum_closed_decl(vm_relocate_reason_t, unsigned int, {
  * Denotes memory must be put on the secluded queue,
  * this is not returned by @c vm_page_get_memory_class().
  */
+#if HAS_MTE
+/*
+ * @const VM_MEMORY_CLASS_TAGGED
+ * MTE tagged memory, which should participate in the lifecycle for tagged
+ * pages.  Pages may move between this and the VM_MEMORY_CLASS_REGULAR classes,
+ * dynamically.
+ *
+ * @const VM_MEMORY_CLASS_TAG_STORAGE
+ * MTE tag storage memory, which should participate in the lifecycle for tag
+ * storage pages.  Note that this is NOT the same as being in the tag storage
+ * region; some pages in the tag storage region will be classified as regular
+ * pages, because the system will never use them for tag storage.
+ *
+ * @const VM_MEMORY_CLASS_DEAD_TAG_STORAGE
+ * MTE tag storage that is either recursive or for unmanaged memory
+ * that must always be used as regular memory and can never be taggable.
+ */
+#endif /* HAS_MTE */
 __enum_closed_decl(vm_memory_class_t, uint8_t, {
 	VM_MEMORY_CLASS_REGULAR,
+#if HAS_MTE
+	VM_MEMORY_CLASS_TAGGED,
+	VM_MEMORY_CLASS_TAG_STORAGE,
+	VM_MEMORY_CLASS_DEAD_TAG_STORAGE,
+#endif /* HAS_MTE */
 #if XNU_VM_HAS_LOPAGE
 	VM_MEMORY_CLASS_LOPAGE,
 #endif /* XNU_VM_HAS_LOPAGE */
@@ -187,6 +234,7 @@ __enum_closed_decl(vm_memory_class_t, uint8_t, {
  */
 
 #define VM_PAGE_NULL            ((vm_page_t) 0)
+#define VM_PAGE_PRIMED          ((vm_page_t) ~0)
 
 __enum_closed_decl(vm_page_q_state_t, uint8_t, {
 	VM_PAGE_NOT_ON_Q                = 0,    /* page is not present on any queue, nor is it wired... mainly a transient state */
@@ -208,8 +256,11 @@ __enum_closed_decl(vm_page_q_state_t, uint8_t, {
 	VM_PAGE_ON_INACTIVE_INTERNAL_Q  = 11,   /* page is on the inactive internal queue a.k.a.  anonymous queue */
 	VM_PAGE_ON_INACTIVE_EXTERNAL_Q  = 12,   /* page in on the inactive external queue a.k.a.  file backed queue */
 	VM_PAGE_ON_INACTIVE_CLEANED_Q   = 13,   /* page has been cleaned to a backing file and is ready to be stolen */
+	VM_PAGE_IS_IOPL_WIRED           = 14,   /* page has been wired for an I/O UPL; object lock must be held when transitioning into/out of this state. */
+	VM_PAGE_NUM_Q_STATES
 });
-#define VM_PAGE_Q_STATE_LAST_VALID_VALUE  13    /* we currently use 4 bits for the state... don't let this go beyond 15 */
+
+_Static_assert(VM_PAGE_NUM_Q_STATES <= 16, "Too many vm_page_q_state_t values to fit in 4-bit vmp_q_state field");
 
 __enum_closed_decl(vm_page_specialq_t, uint8_t, {
 	VM_PAGE_SPECIAL_Q_EMPTY         = 0,
@@ -280,13 +331,17 @@ struct vm_page {
 		                                            /* be reused ahead of other pages (P) */
 		uint8_t                 vmp_reference:1;    /* page has been used (P) */
 		uint8_t                 vmp_realtime:1;     /* page used by realtime thread (P) */
-		uint8_t                 vmp_iopl_wired:1;   /* page has been wired for I/O UPL (O&P) */
 #if CONFIG_TRACK_UNMODIFIED_ANON_PAGES
 		uint8_t                 vmp_unmodified_ro:1;/* Tracks if an anonymous page is modified after a decompression (O&P).*/
 #else
 		uint8_t                 __vmp_reserved1:1;
 #endif
+#if HAS_MTE
+		uint8_t                 vmp_ts_wanted:1;    /* This tag storage page is wanted for reclaim (O&P) */
+#else
 		uint8_t                 __vmp_reserved2:1;
+#endif
+		uint8_t                 __vmp_reserved3:1;
 	};
 
 	/*
@@ -301,7 +356,30 @@ struct vm_page {
 	    vmp_wanted:1,                     /* someone is waiting for page (O) */
 	    vmp_tabled:1,                     /* page is in VP table (O) */
 	    vmp_hashed:1,                     /* page is in vm_page_buckets[] (O) + the bucket lock */
+#if HAS_MTE
+	/*
+	 * Whether the page is tagged (O)
+	 *
+	 * This bit is modified in 3 cases:
+	 *
+	 * - while the page is on the free queue (vmp_q_state ==
+	 *   VM_PAGE_ON_FREE_Q) with the free queue lock held;
+	 *
+	 * - when the page is in limbo on its way to the free queue
+	 *   (vmp_q_state == VM_PAGE_NOT_ON_Q, vmp_busy == true)
+	 *   by the thread owning exclusive access to this page;
+	 *
+	 * - when the page is on a free local queue (vmp_q_state ==
+	 *   VM_PAGE_ON_FREE_LOCAL_Q), by the CPU owning that queue under
+	 *   preemption disabled.
+	 *
+	 * Observing this bit as a result is always stable
+	 * under the object lock (O).
+	 */
+	    vmp_using_mte : 1,
+#else
 	__vmp_unused : 1,
+#endif /* HAS_MTE */
 	vmp_clustered:1,                      /* page is not the faulted page (O) or (O-shared AND pmap_page) */
 	    vmp_pmapped:1,                    /* page has at some time been entered into a pmap (O) or */
 	                                      /* (O-shared AND pmap_page) */
@@ -357,6 +435,7 @@ extern uint32_t         vm_pages_count;
 extern ppnum_t          vm_pages_first_pnum;
 #endif /* XNU_VM_HAS_LINEAR_PAGES_ARRAY */
 
+
 /**
  * Internal accessor which returns the raw vm_pages pointer.
  *
@@ -385,6 +464,48 @@ vm_page_get(uint32_t i)
 	return VM_FAR_ADD_PTR_UNBOUNDED(vm_pages_array_internal(), i);
 }
 
+#if HAS_MTE
+
+/**
+ * Internal accessor which returns the raw vm_array_tag_storage pointer,
+ * which is a pointer inside the VM pages array pointing to the first tag
+ * storage page.
+ *
+ * This pointer must not be indexed directly. Use vm_tag_storage_page_get()
+ * instead when indexing into the array.
+ *
+ * __pure2 helps explain to the compiler that the value vm_pages is a constant.
+ */
+__pure2
+static inline struct vm_page *
+vm_pages_tag_storage_array_internal(void)
+{
+	extern vm_page_t vm_pages_tag_storage;
+	return vm_pages_tag_storage;
+}
+
+/**
+ * Get a pointer to tag storage page at index i.
+ *
+ * This getter is the only legal way to index into the vm_pages_tag_storage array.
+ */
+__pure2
+static inline vm_page_t
+vm_tag_storage_page_get(uint32_t i)
+{
+	return VM_FAR_ADD_PTR_UNBOUNDED(vm_pages_tag_storage_array_internal(), i);
+}
+
+__pure2
+static inline bool
+vm_page_in_tag_storage_array(const struct vm_page *m)
+{
+	extern vm_page_t vm_pages_tag_storage_end;
+	return vm_pages_tag_storage_array_internal() <= m &&
+	       m < vm_pages_tag_storage_end;
+}
+
+#endif /* HAS_MTE */
 
 __pure2
 static inline bool
@@ -493,12 +614,7 @@ extern unsigned int     vm_clump_mask, vm_clump_shift;
 #define VM_PAGE_PACKED_ALIGNED          __attribute__((aligned(VM_PAGE_PACKED_PTR_ALIGNMENT)))
 #define VM_PAGE_PACKED_PTR_BITS         31
 #define VM_PAGE_PACKED_PTR_SHIFT        6
-#ifndef __BUILDING_XNU_LIB_UNITTEST__
 #define VM_PAGE_PACKED_PTR_BASE         ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
-#else
-extern uintptr_t mock_page_ptr_base;
-#define VM_PAGE_PACKED_PTR_BASE         (mock_page_ptr_base)
-#endif
 #define VM_PAGE_PACKED_FROM_ARRAY       0x80000000
 
 static inline vm_page_packed_t
@@ -532,7 +648,9 @@ vm_page_unpack_ptr(uintptr_t p)
 #define VM_PAGE_PACK_PTR(p)     vm_page_pack_ptr((uintptr_t)(p))
 #define VM_PAGE_UNPACK_PTR(p)   vm_page_unpack_ptr((uintptr_t)(p))
 
-#define VM_OBJECT_PACK(o)       ((vm_page_object_t)VM_PACK_POINTER((uintptr_t)(o), VM_PAGE_PACKED_PTR))
+#define VM_OBJECT_PACK(o)       (VM_ASSERT_POINTER_PACKABLE((uintptr_t)(o), VM_PAGE_PACKED_PTR), \
+	                        (vm_page_object_t)VM_PACK_POINTER((uintptr_t)(o), VM_PAGE_PACKED_PTR))
+
 #define VM_OBJECT_UNPACK(p)     ((vm_object_t)VM_UNPACK_POINTER(p, VM_PAGE_PACKED_PTR))
 
 #define VM_PAGE_OBJECT(p)       VM_OBJECT_UNPACK((p)->vmp_object)
@@ -945,7 +1063,8 @@ typedef struct vm_locks_array {
 } vm_locks_array_t;
 
 
-#define VM_PAGE_WIRED(m)        ((m)->vmp_q_state == VM_PAGE_IS_WIRED)
+#define VM_PAGE_WIRED(m)        (((m)->vmp_q_state == VM_PAGE_IS_WIRED) || ((m)->vmp_q_state == VM_PAGE_IS_IOPL_WIRED))
+#define VM_PAGE_IOPL_WIRED(m)   ((m)->vmp_q_state == VM_PAGE_IS_IOPL_WIRED)
 #define NEXT_PAGE(m)            ((m)->vmp_snext)
 #define NEXT_PAGE_PTR(m)        (&(m)->vmp_snext)
 
@@ -971,10 +1090,29 @@ typedef struct vm_locks_array {
  * @field vmpl_has_realtime
  * At least one page on the list has vmp_realtime set.
  */
+#if HAS_MTE
+/*
+ * @field vmpl_has_untagged
+ * Whether there are pages with the @c vmp_using_mte property unset on it.
+ *
+ * It can be used by callers to know that they need to adjust the tagging
+ * properties of the list with @c pmap_{un,}make_tagged_pages().
+ *
+ * @field vmpl_has_tagged
+ * Whether there are pages with the @c vmp_using_mte property set on it.
+ *
+ * It can be used by callers to know that they need to adjust the tagging
+ * properties of the list with @c pmap_{un,}make_tagged_pages().
+ */
+#endif
 typedef struct {
 	vm_page_t vmpl_head;
 	uint32_t  vmpl_count;
 	bool      vmpl_has_realtime;
+#if HAS_MTE
+	bool      vmpl_has_untagged;
+	bool      vmpl_has_tagged;
+#endif
 } vm_page_list_t;
 
 
@@ -1008,6 +1146,13 @@ vm_page_list_push(vm_page_list_t *list, vm_page_t mem)
 	if (mem->vmp_realtime) {
 		list->vmpl_has_realtime = true;
 	}
+#if HAS_MTE
+	if (mem->vmp_using_mte) {
+		list->vmpl_has_tagged = true;
+	} else {
+		list->vmpl_has_untagged = true;
+	}
+#endif
 }
 
 /*!
@@ -1024,6 +1169,10 @@ vm_page_list_for_page(vm_page_t mem)
 		       .vmpl_head  = mem,
 		       .vmpl_count = 1,
 		       .vmpl_has_realtime = mem->vmp_realtime,
+#if HAS_MTE
+		       .vmpl_has_untagged = !mem->vmp_using_mte,
+		       .vmpl_has_tagged = mem->vmp_using_mte,
+#endif
 	};
 }
 
@@ -1383,10 +1532,8 @@ extern unsigned int     vm_page_pageable_internal_count;
 extern unsigned int     vm_page_pageable_external_count;
 extern
 unsigned int    vm_page_xpmapped_external_count;        /* How many pages are mapped executable? */
-extern
-unsigned int    vm_page_external_count; /* How many pages are file-backed? */
-extern
-unsigned int    vm_page_internal_count; /* How many pages are anonymous? */
+SCALABLE_COUNTER_DECLARE(vm_page_external_count);       /* How many pages are file-backed? */
+SCALABLE_COUNTER_DECLARE(vm_page_internal_count);       /* How many pages are file-backed? */
 extern
 unsigned int    vm_page_wire_count;             /* How many pages are wired? */
 extern
@@ -1422,16 +1569,21 @@ extern
 unsigned int    vm_page_speculative_used;
 #endif
 
-extern
-unsigned int    vm_page_purgeable_count;/* How many pages are purgeable now ? */
-extern
-unsigned int    vm_page_purgeable_wired_count;/* How many purgeable pages are wired now ? */
-extern
-uint64_t        vm_page_purged_count;   /* How many pages got purged so far ? */
+SCALABLE_COUNTER_DECLARE(vm_page_purgeable_count);      /* How many pages are purgeable now ? */
+SCALABLE_COUNTER_DECLARE(vm_page_purgeable_wired_count);/* How many purgeable pages are wired now ? */
+extern uint64_t        vm_page_purged_count;            /* How many pages got purged so far ? */
 
 extern
 _Atomic unsigned int vm_page_swapped_count;
 /* How many pages are swapped to disk? */
+
+extern
+_Atomic uint64_t vm_page_swap_count;
+/* How many pages of compressed data are present in the swapfile? */
+
+extern
+_Atomic unsigned int vm_page_shared_region_count;
+/* How many resident pages are backed by a shared region pager? */
 
 extern unsigned int     vm_page_free_wanted;
 /* how many threads are waiting for memory */
@@ -1451,8 +1603,6 @@ extern const ppnum_t    vm_page_guard_addr;
 
 
 extern boolean_t        vm_page_deactivate_hint;
-
-extern int              vm_compressor_mode;
 
 #if __x86_64__
 /*
@@ -1490,18 +1640,45 @@ extern ppnum_t          max_valid_low_ppnum;
  * Denotes that the caller never wants @c vm_page_grab_options() to call
  * @c VM_PAGE_WAIT(), even if the thread is privileged.
  *
+ * @const VM_PAGE_GRAB_VM_PRIV
+ * The caller thread is VM privileged.
+ *
+ * @const VM_PAGE_GRAB_PRIME
+ * The caller doesn't expect to receive a VM page, it just means for the per-cpu
+ * queues to be primed. @c VM_PAGE_PRIMED will be returned if priming was
+ * successful.
+ *
+ * @const VM_PAGE_GRAB_ZERO_FILL
+ * Grab a zero filled page (or zero fill the page returned)
+ *
  * @const VM_PAGE_GRAB_SECLUDED
  * The caller is eligible to the secluded pool.
  */
+#if HAS_MTE
+/*
+ * @const VM_PAGE_GRAB_MTE
+ * The grabbed page must have MTE tagging enabled.
+ *
+ * @const VM_PAGE_GRAB_ALLOW_TAG_STORAGE
+ * The grabbed page can be a claimed tag storage page.
+ */
+#endif
 __enum_decl(vm_grab_options_t, uint32_t, {
-	VM_PAGE_GRAB_OPTIONS_NONE               = 0x00000000,
-	VM_PAGE_GRAB_Q_LOCK_HELD                = 0x00000001,
-	VM_PAGE_GRAB_NOPAGEWAIT                 = 0x00000002,
+	VM_PAGE_GRAB_OPTIONS_NONE       = 0x00000000,
+	VM_PAGE_GRAB_Q_LOCK_HELD        = 0x00000001,
+	VM_PAGE_GRAB_NOPAGEWAIT         = 0x00000002,
+	VM_PAGE_GRAB_VM_PRIV            = 0x00000004,
+	VM_PAGE_GRAB_PRIME              = 0x00000008,
+	VM_PAGE_GRAB_ZERO_FILL          = 0x00000010,
 
 	/* architecture/platform-specific flags */
 #if CONFIG_SECLUDED_MEMORY
-	VM_PAGE_GRAB_SECLUDED                   = 0x00010000,
+	VM_PAGE_GRAB_SECLUDED           = 0x00010000,
 #endif /* CONFIG_SECLUDED_MEMORY */
+#if HAS_MTE
+	VM_PAGE_GRAB_MTE                = 0x00020000,
+	VM_PAGE_GRAB_ALLOW_TAG_STORAGE  = 0x00040000,
+#endif /* HAS_MTE */
 });
 
 /*
@@ -1535,7 +1712,7 @@ extern void vm_pressure_response(void);
 	        vm_page_pageable_external_count + \
 	        vm_page_free_count +              \
 	        VM_PAGE_SECLUDED_COUNT_OVER_TARGET() + \
-	        (VM_DYNAMIC_PAGING_ENABLED() ? 0 : vm_page_purgeable_count) \
+	        (VM_DYNAMIC_PAGING_ENABLED() ? 0 : (uint32_t)counter_load(&vm_page_purgeable_count)) \
 	        )
 
 #else /* CONFIG_JETSAM */

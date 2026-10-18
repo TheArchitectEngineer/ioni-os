@@ -1352,6 +1352,7 @@ void    vfs_setfstypename(mount_t mp, const char *name);
 uint64_t vfs_throttle_mask(mount_t mp);
 int vfs_isswapmount(mount_t mp);
 int     vfs_context_dataless_materialization_is_prevented(vfs_context_t);
+int     vfs_context_orig_dataless_materialization_is_prevented(vfs_context_t);
 boolean_t vfs_context_is_dataless_manipulator(vfs_context_t);
 boolean_t vfs_context_can_resolve_triggers(vfs_context_t);
 boolean_t vfs_context_can_break_leases(vfs_context_t);
@@ -1474,6 +1475,14 @@ int vfs_mount_at_path(const char *fstype, const char *path,
 #define VFS_MOUNT_FLAG_PERMIT_UNMOUNT   0x02 /* Allow (non-forced) unmounts by users other the one who mounted the volume */
 #define VFS_MOUNT_FLAG_CURRENT_CONTEXT  0x04 /* Mount using the current VFS context */
 
+/*!
+ * @function vfs_setsnapshotmntflags
+ * @abstract Set mount flags for snapshot mount based on livefs's mount flags.
+ * @param mp Livefs mountpoint which the mount flags to based on
+ * @param snap_mp Snapshot mountpoint to set the mount's flags
+ */
+void vfs_setsnapshotmntflags(mount_t mp, mount_t snap_mp);
+
 #endif  /* KERNEL_PRIVATE */
 __END_DECLS
 
@@ -1509,8 +1518,9 @@ OS_ENUM(graftdmg_type, uint32_t,
     GRAFTDMG_CRYPTEX_PDI_NONCE = 6,
     GRAFTDMG_CRYPTEX_EFFECTIVE_AP = 7,
     GRAFTDMG_CRYPTEX_MOBILE_ASSET = 8,
+    GRAFTDMG_CRYPTEX_MOBILE_ASSET_WITH_CODE = 9,
     // Update this when a new type is added
-    GRAFTDMG_CRYPTEX_MAX = 8);
+    GRAFTDMG_CRYPTEX_MAX = 9);
 
 OS_ENUM(cryptex_auth_type, uint32_t,
     // Reserved: GRAFTDMG_CRYPTEX_BOOT = 1,
@@ -1521,8 +1531,9 @@ OS_ENUM(cryptex_auth_type, uint32_t,
     CRYPTEX_AUTH_PDI_NONCE = 6,
     // Reserved: GRAFTDMG_CRYPTEX_EFFECTIVE_AP = 7,
     CRYPTEX_AUTH_MOBILE_ASSET = 8,
+    CRYPTEX_AUTH_MOBILE_ASSET_WITH_CODE = 9,
     // Update this when a new type is added
-    CRYPTEX_AUTH_MAX = 8);
+    CRYPTEX_AUTH_MAX = 9);
 
 #ifndef KERNEL
 

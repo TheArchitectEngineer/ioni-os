@@ -136,6 +136,8 @@
 
 #include <os/log.h>
 
+extern void log_hexdump(os_log_t log_handle, void *__sized_by(len) data, size_t len);
+
 extern struct inpcbinfo ripcbinfo;
 
 #define DBG_LAYER_BEG           NETDBG_CODE(DBG_NETIP, 0)
@@ -614,13 +616,40 @@ inaddr_hashlookup(uint32_t key)
 }
 
 static void
-ip_proto_process_wake_packet(struct mbuf *m)
+log_wake_ip_mbuf(struct ifnet *ifp, struct mbuf *m)
+{
+	char buffer[64];
+	size_t buflen = MIN(mbuf_pkthdr_len(m), sizeof(buffer));
+
+	os_log(wake_packet_log_handle, "LPW IP packet from %s len %d wakepkt: %d",
+	    ifp->if_xname, m_pktlen(m), (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT));
+	if (mbuf_copydata(m, 0, buflen, buffer) == 0) {
+		log_hexdump(wake_packet_log_handle, buffer, buflen);
+	}
+}
+
+static void
+ip_proto_process_lpw_packet(struct mbuf *m)
 {
 	struct ifnet *ifp = m->m_pkthdr.rcvif;
+	struct ip *ip = mtod(m, struct ip *);
 
-	if (if_is_lpw_enabled(ifp)) {
-		if_exit_lpw(ifp, "IP packet");
+	/*
+	 * Do nothing for protocol that can handle LPW mode
+	 */
+	switch (ip->ip_p) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+		return;
+	default:
+		break;
 	}
+
+	if (net_wake_pkt_debug > 0) {
+		log_wake_ip_mbuf(ifp, m);
+	}
+	if_ports_used_match_mbuf(ifp, PF_INET, m);
+	if_exit_lpw(ifp, "IP packet");
 }
 
 __private_extern__ void
@@ -694,10 +723,10 @@ ip_proto_dispatch_in(struct mbuf *m, int hlen, u_int8_t proto,
 	}
 
 	/*
-	 * Check if need to switch to full wake mode -- TCP knows about idle connections
+	 * Check if need to switch to full wake mode -- only TCP knows about idle connections
 	 */
-	if (__improbable(ip->ip_p != IPPROTO_TCP && (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT) != 0)) {
-		ip_proto_process_wake_packet(m);
+	if (__improbable(if_is_lpw_enabled(m->m_pkthdr.rcvif))) {
+		ip_proto_process_lpw_packet(m);
 	}
 
 	/*
@@ -738,12 +767,14 @@ ip_chain_insert(struct mbuf *packet, pktchain_elm_t *__counted_by(PKTTBL_SZ) tbl
 {
 	struct ip*      ip;
 	int             pkttbl_idx = 0;
+	struct mbuf *head;
 
 	ip = mtod(packet, struct ip*);
 
 	/* reusing the hash function from inaddr_hashval */
 	pkttbl_idx = inaddr_hashval(ntohl(ip->ip_src.s_addr)) % PKTTBL_SZ;
-	if (tbl[pkttbl_idx].pkte_head == NULL) {
+	head = tbl[pkttbl_idx].pkte_head;
+	if (head == NULL) {
 		tbl[pkttbl_idx].pkte_head = packet;
 		tbl[pkttbl_idx].pkte_saddr.s_addr = ip->ip_src.s_addr;
 		tbl[pkttbl_idx].pkte_daddr.s_addr = ip->ip_dst.s_addr;
@@ -751,7 +782,8 @@ ip_chain_insert(struct mbuf *packet, pktchain_elm_t *__counted_by(PKTTBL_SZ) tbl
 	} else {
 		if ((ip->ip_dst.s_addr == tbl[pkttbl_idx].pkte_daddr.s_addr) &&
 		    (ip->ip_src.s_addr == tbl[pkttbl_idx].pkte_saddr.s_addr) &&
-		    (ip->ip_p == tbl[pkttbl_idx].pkte_proto)) {
+		    (ip->ip_p == tbl[pkttbl_idx].pkte_proto) &&
+		    (packet->m_flags & (M_BCAST | M_MCAST)) == (head->m_flags & (M_BCAST | M_MCAST))) {
 		} else {
 			return packet;
 		}
@@ -1307,6 +1339,7 @@ ip_input_check_interface(struct mbuf **mp, struct ip *ip, struct ifnet *inifp)
 	struct in_ifaddr *__single best_ia = NULL;
 	ifnet_ref_t match_ifp = NULL;
 	ip_check_if_result_t result = IP_CHECK_IF_NONE;
+	enum drop_reason drop_reason = DROP_REASON_IP_RCV_IF_NO_MATCH;
 
 	/*
 	 * Host broadcast and all network broadcast addresses are always a match
@@ -1353,7 +1386,12 @@ ip_input_check_interface(struct mbuf **mp, struct ip *ip, struct ifnet *inifp)
 			 */
 			result = IP_CHECK_IF_DROP;
 		} else {
-			result = IP_CHECK_IF_OURS;
+			if ((m->m_flags & (M_BCAST | M_MCAST)) != 0) {
+				drop_reason = DROP_REASON_FSW_DEMUX_L2_MULTI_L3_UNI;
+				result = IP_CHECK_IF_DROP;
+			} else {
+				result = IP_CHECK_IF_OURS;
+			}
 			ip_input_setdst_chain(m, 0, best_ia);
 		}
 	}
@@ -1442,16 +1480,24 @@ ip_input_check_interface(struct mbuf **mp, struct ip *ip, struct ifnet *inifp)
 
 			inet_ntop(AF_INET, &ip->ip_src, src_str, sizeof(src_str));
 			inet_ntop(AF_INET, &ip->ip_dst, dst_str, sizeof(dst_str));
-			os_log(OS_LOG_DEFAULT,
-			    "%s: no interface match for packet from %s to %s proto %u received via %s",
-			    __func__, src_str, dst_str, ip->ip_p, inifp->if_xname);
+			if (drop_reason == DROP_REASON_IP_RCV_IF_NO_MATCH) {
+				os_log(OS_LOG_DEFAULT,
+				    "%s: no interface match for packet from %s to %s proto %u received via %s",
+				    __func__, src_str, dst_str, ip->ip_p, inifp->if_xname);
+			} else if (drop_reason == DROP_REASON_FSW_DEMUX_L2_MULTI_L3_UNI) {
+				os_log(OS_LOG_DEFAULT,
+				    "%s: Layer 3 unicast dst sent to layer 2 non unicast dst: from %s to %s proto %u received via %s",
+				    __func__, src_str, dst_str, ip->ip_p, inifp->if_xname);
+			}
 		}
-		mbuf_ref_t tmp_mbuf = m;
-		while (tmp_mbuf != NULL) {
-			ipstat.ips_rcv_if_no_match++;
-			tmp_mbuf = tmp_mbuf->m_nextpkt;
+		if (drop_reason == DROP_REASON_IP_RCV_IF_NO_MATCH) {
+			mbuf_ref_t tmp_mbuf = m;
+			while (tmp_mbuf != NULL) {
+				ipstat.ips_rcv_if_no_match++;
+				tmp_mbuf = tmp_mbuf->m_nextpkt;
+			}
 		}
-		m_drop_list(m, NULL, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_RCV_IF_NO_MATCH, NULL, 0);
+		m_drop_list(m, NULL, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, drop_reason, NULL, 0);
 		*mp = NULL;
 	}
 

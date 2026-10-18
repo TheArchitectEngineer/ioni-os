@@ -162,6 +162,8 @@ extern int ipsec_bypass;
 
 #include <os/log.h>
 
+extern void log_hexdump(os_log_t log_handle, void *__sized_by(len) data, size_t len);
+
 struct ip6protosw *ip6_protox[IPPROTO_MAX];
 
 static LCK_GRP_DECLARE(in6_ifaddr_rwlock_grp, "in6_ifaddr_rwlock");
@@ -607,6 +609,7 @@ ip6_input_check_interface(struct mbuf *m, struct ip6_hdr *ip6, struct ifnet *ini
 	struct in6_ifaddr *__single best_ia6 = NULL;
 	uint32_t dst_ifscope = IFSCOPE_NONE;
 	ip6_check_if_result_t result = IP6_CHECK_IF_NONE;
+	enum drop_reason drop_reason = DROP_REASON_IP_RCV_IF_NO_MATCH;
 
 	*deliverifp = NULL;
 
@@ -653,10 +656,15 @@ ip6_input_check_interface(struct mbuf *m, struct ip6_hdr *ip6, struct ifnet *ini
 			 */
 			result = IP6_CHECK_IF_DROP;
 		} else {
-			result = IP6_CHECK_IF_OURS;
-			*deliverifp = best_ia6->ia_ifp;
-			ip6_setdstifaddr_info(m, 0, best_ia6);
-			ip6_setsrcifaddr_info(m, best_ia6->ia_ifp->if_index, NULL);
+			if ((m->m_flags & (M_BCAST | M_MCAST)) != 0) {
+				drop_reason = DROP_REASON_FSW_DEMUX_L2_MULTI_L3_UNI;
+				result = IP6_CHECK_IF_DROP;
+			} else {
+				result = IP6_CHECK_IF_OURS;
+				*deliverifp = best_ia6->ia_ifp;
+				ip6_setdstifaddr_info(m, 0, best_ia6);
+				ip6_setsrcifaddr_info(m, best_ia6->ia_ifp->if_index, NULL);
+			}
 		}
 	}
 	lck_rw_done(&in6_ifaddr_rwlock);
@@ -767,23 +775,54 @@ ip6_input_check_interface(struct mbuf *m, struct ip6_hdr *ip6, struct ifnet *ini
 
 			inet_ntop(AF_INET6, &ip6->ip6_src, src_str, sizeof(src_str));
 			inet_ntop(AF_INET6, &ip6->ip6_dst, dst_str, sizeof(dst_str));
-			os_log(OS_LOG_DEFAULT,
-			    "%s: no interface match for packet from %s to %s proto %u received via %s",
-			    __func__, src_str, dst_str, ip6->ip6_nxt, inifp->if_xname);
+			if (drop_reason == DROP_REASON_IP_RCV_IF_NO_MATCH) {
+				os_log(OS_LOG_DEFAULT,
+				    "%s: no interface match for packet from %s to %s proto %u received via %s",
+				    __func__, src_str, dst_str, ip6->ip6_nxt, inifp->if_xname);
+			} else if (drop_reason == DROP_REASON_FSW_DEMUX_L2_MULTI_L3_UNI) {
+				os_log(OS_LOG_DEFAULT,
+				    "%s: Layer 3 unicast dst sent to layer 2 non unicast dst: from %s to %s proto %u received via %s",
+				    __func__, src_str, dst_str, ip6->ip6_nxt, inifp->if_xname);
+			}
 		}
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, drop_reason, NULL, 0);
 	}
 
 	return result;
 }
 
+
 static void
-ip6_input_process_wake_packet(struct mbuf *m)
+log_lpw_ip6_mbuf(struct ifnet *ifp, struct mbuf *m)
+{
+	char buffer[64];
+	size_t buflen = MIN(mbuf_pkthdr_len(m), sizeof(buffer));
+
+	os_log(wake_packet_log_handle, "LPW IP6 packet from %s len %d wakepkt: %d",
+	    ifp->if_xname, m_pktlen(m), (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT));
+	if (mbuf_copydata(m, 0, buflen, buffer) == 0) {
+		log_hexdump(wake_packet_log_handle, buffer, buflen);
+	}
+}
+
+static void
+ip6_input_process_lpw_packet(struct mbuf *m, int nxt)
 {
 	struct ifnet *ifp = m->m_pkthdr.rcvif;
 
-	if (if_is_lpw_enabled(ifp)) {
-		if_exit_lpw(ifp, "IP6 packet");
+	switch (nxt) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+		return;
+	default:
+		break;
 	}
+
+	if (net_wake_pkt_debug > 0) {
+		log_lpw_ip6_mbuf(ifp, m);
+	}
+	if_ports_used_match_mbuf(ifp, PF_INET6, m);
+	if_exit_lpw(ifp, "IP6 packet");
 }
 
 void
@@ -1161,7 +1200,6 @@ check_with_pf:
 			ours = 1;
 			goto hbhcheck;
 		} else if (check_if_result == IP6_CHECK_IF_DROP) {
-			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_RCV_IF_NO_MATCH, NULL, 0);
 			goto bad;
 		}
 	}
@@ -1440,10 +1478,10 @@ injectit:
 		    struct ip *, NULL, struct ip6_hdr *, ip6);
 
 		/*
-		 * Check if need to switch to full wake mode -- TCP knows about idle connections
+		 * Check if need to switch to full wake mode
 		 */
-		if (__improbable(nxt != IPPROTO_TCP && (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT) != 0)) {
-			ip6_input_process_wake_packet(m);
+		if (__improbable(if_is_lpw_enabled(inifp))) {
+			ip6_input_process_lpw_packet(m, nxt);
 		}
 
 		if ((pr_input = ip6_protox[nxt]->pr_input) == NULL) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2025 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2026 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -1636,6 +1636,8 @@ nd6_service_expired_prefix(struct nd6svc_arg *ap, uint64_t timenow)
 
 	LCK_MTX_ASSERT(rnh_lock, LCK_MTX_ASSERT_NOTOWNED);
 	lck_mtx_lock(nd6_mutex);
+	nd_prefix_busy_wait();
+
 	/* expire prefix list */
 	pr = nd_prefix.lh_first;
 	while (pr != NULL) {
@@ -1686,7 +1688,7 @@ nd6_service_expired_prefix(struct nd6svc_arg *ap, uint64_t timenow)
 			    pr->ndpr_ifp, &pr->ndpr_prefix.sin6_addr,
 			    0);
 			NDPR_REMREF(pr);
-			pfxlist_onlink_check();
+			pfxlist_onlink_check(true);
 			pr = nd_prefix.lh_first;
 			ap->killed++;
 		} else {
@@ -1706,6 +1708,7 @@ nd6_service_expired_prefix(struct nd6svc_arg *ap, uint64_t timenow)
 		pr->ndpr_stateflags &= ~NDPRF_PROCESSED_SERVICE;
 		NDPR_UNLOCK(pr);
 	}
+	nd_prefix_busy_signal();
 	lck_mtx_unlock(nd6_mutex);
 }
 
@@ -2105,6 +2108,7 @@ nd6_purge_interface_prefixes(struct ifnet *ifp)
 	struct nd_prefix *__single npr = NULL;
 
 	LCK_MTX_ASSERT(nd6_mutex, LCK_MTX_ASSERT_OWNED);
+	nd_prefix_busy_wait();
 
 	/* Nuke prefix list entries toward ifp */
 	for (pr = nd_prefix.lh_first; pr; pr = npr) {
@@ -2139,8 +2143,9 @@ nd6_purge_interface_prefixes(struct ifnet *ifp)
 		}
 	}
 	if (removed) {
-		pfxlist_onlink_check();
+		pfxlist_onlink_check(true);
 	}
+	nd_prefix_busy_signal();
 }
 
 static void
@@ -2682,7 +2687,7 @@ nd6_free(struct rtentry *rt)
 		 * the check now.
 		 */
 		RT_UNLOCK(rt);
-		pfxlist_onlink_check();
+		pfxlist_onlink_check(false);
 
 		/*
 		 * refresh default router list
@@ -3201,28 +3206,41 @@ nd6_ioctl(u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) data, struct ifnet *i
 		struct nd_prefix *__single next = NULL;
 
 		lck_mtx_lock(nd6_mutex);
+		nd_prefix_busy_wait();
+
 		for (pr = nd_prefix.lh_first; pr; pr = next) {
 			struct in6_ifaddr *__single ia = NULL;
 			bool iterate_pfxlist_again = false;
 
-			next = pr->ndpr_next;
-
 			NDPR_LOCK(pr);
+			next = pr->ndpr_next;
+			if (next != NULL) {
+				NDPR_LOCK(next);
+				NDPR_ADDREF(next);
+				NDPR_UNLOCK(next);
+			}
+
 			if (IN6_IS_ADDR_LINKLOCAL(&pr->ndpr_prefix.sin6_addr)) {
 				NDPR_UNLOCK(pr);
+				if (next != NULL) {
+					NDPR_REMREF(next);
+				}
 				continue; /* XXX */
 			}
 			if (ifp != lo_ifp && pr->ndpr_ifp != ifp) {
 				NDPR_UNLOCK(pr);
+				if (next != NULL) {
+					NDPR_REMREF(next);
+				}
 				continue;
 			}
 			/* do we really have to remove addresses as well? */
 			NDPR_ADDREF(pr);
 			NDPR_UNLOCK(pr);
 			lck_rw_lock_exclusive(&in6_ifaddr_rwlock);
-			bool from_begining = true;
-			while (from_begining) {
-				from_begining = false;
+			bool from_beginning = true;
+			while (from_beginning) {
+				from_beginning = false;
 				TAILQ_FOREACH(ia, &in6_ifaddrhead, ia6_link) {
 					IFA_LOCK(&ia->ia_ifa);
 					if ((ia->ia6_flags & IN6_IFF_AUTOCONF) == 0) {
@@ -3249,7 +3267,7 @@ nd6_ioctl(u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) data, struct ifnet *i
 						 * The same applies for the prefix list.
 						 */
 						iterate_pfxlist_again = true;
-						from_begining = true;
+						from_beginning = true;
 						break;
 					}
 					IFA_UNLOCK(&ia->ia_ifa);
@@ -3259,12 +3277,21 @@ nd6_ioctl(u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) data, struct ifnet *i
 			NDPR_LOCK(pr);
 			prelist_remove(pr);
 			NDPR_UNLOCK(pr);
-			pfxlist_onlink_check();
+			pfxlist_onlink_check(true);
 			NDPR_REMREF(pr);
 			if (iterate_pfxlist_again) {
+				if (next != NULL) {
+					NDPR_REMREF(next);
+				}
 				next = nd_prefix.lh_first;
+				if (next != NULL) {
+					NDPR_LOCK(next);
+					NDPR_ADDREF(next);
+					NDPR_UNLOCK(next);
+				}
 			}
 		}
+		nd_prefix_busy_signal();
 		lck_mtx_unlock(nd6_mutex);
 		break;
 	}
@@ -3756,7 +3783,8 @@ fail:
 	}
 
 	if (do_update) {
-		rt_lookup_qset_id(rt, false);
+		uint64_t qset_id = rt_lookup_qset_id(rt, false);
+		nd6log3(info, "nd6_cache_lladdr: do_update qset_id=%lld", qset_id);
 
 		int route_ev_code = 0;
 
@@ -4547,6 +4575,7 @@ release:
 		 *  run on the downstream interface */
 		if (result == 0 && ifp->if_eth_traffic_rule_count) {
 			uint64_t qset_id = rt_lookup_qset_id(route, true);
+			nd6log3(info, "nd6_lookup_ipv6:  qset_id=%lld", qset_id);
 			if (packet != NULL) {
 				packet->m_pkthdr.pkt_ext_flags |= PKTF_EXT_QSET_ID_VALID;
 				packet->m_pkthdr.pkt_mpriv_qsetid = qset_id;

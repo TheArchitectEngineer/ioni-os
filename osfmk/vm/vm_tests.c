@@ -46,6 +46,7 @@
 #include <vm/vm_fault.h>
 #include <vm/vm_fault_internal.h>
 #include <vm/vm_map_internal.h>
+#include <vm/vm_map_lock_internal.h>
 #include <vm/vm_object_internal.h>
 #include <vm/vm_pageout_internal.h>
 #include <vm/vm_protos.h>
@@ -55,6 +56,7 @@
 #include <vm/vm_iokit.h>
 #include <vm/vm_page_internal.h>
 #include <vm/vm_shared_region_xnu.h>
+#include <vm/vm_test_utils_internal.h>
 #include <vm/vm_far.h>
 #include <vm/vm_upl.h>
 
@@ -66,8 +68,9 @@
 
 #include <tests/xnupost.h> /* for testing-related functions and macros */
 
-
-extern ledger_template_t        task_ledger_template;
+#if HAS_MTE
+#include <arm_acle.h>
+#endif /* HAS_MTE */
 
 extern kern_return_t
 vm_map_copy_adjust_to_target(
@@ -283,18 +286,17 @@ vm_test_wire_and_extract(void)
 	ppnum_t                 user_ppnum, wire_ppnum;
 	kern_return_t           kr;
 
-	ledger = ledger_instantiate(task_ledger_template,
-	    LEDGER_CREATE_ACTIVE_ENTRIES);
+	ledger = ledger_instantiate(&task_ledger_template);
 	pmap_t user_pmap = pmap_create_options(ledger, 0, PMAP_CREATE_64BIT);
 	assert(user_pmap);
 	user_map = vm_map_create_options(user_pmap,
 	    0x100000000ULL,
 	    0x200000000ULL,
-	    VM_MAP_CREATE_PAGEABLE);
+	    VM_MAP_CREATE_DEFAULT);
 	wire_map = vm_map_create_options(NULL,
 	    0x100000000ULL,
 	    0x200000000ULL,
-	    VM_MAP_CREATE_PAGEABLE);
+	    VM_MAP_CREATE_DEFAULT);
 	user_addr = 0;
 	user_size = 0x10000;
 	kr = mach_vm_allocate(user_map,
@@ -544,12 +546,12 @@ vm_test_4k(void)
 	printf("\n\n\nVM_TEST_4K:%d creating 4K map...\n", __LINE__);
 	test_pmap = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT | PMAP_CREATE_FORCE_4K_PAGES);
 	assert(test_pmap != NULL);
-	test_map = vm_map_create_options(test_pmap,
+	test_map = vm_map_create_with_page_shift(test_pmap,
 	    MACH_VM_MIN_ADDRESS,
 	    MACH_VM_MAX_ADDRESS,
-	    VM_MAP_CREATE_PAGEABLE);
+	    FOURK_PAGE_SHIFT,
+	    VM_MAP_CREATE_DEFAULT);
 	assert(test_map != VM_MAP_NULL);
-	vm_map_set_page_shift(test_map, FOURK_PAGE_SHIFT);
 	printf("VM_TEST_4K:%d map %p pmap %p page_size 0x%x\n", __LINE__, test_map, test_pmap, VM_MAP_PAGE_SIZE(test_map));
 
 	alloc1_addr = 0;
@@ -868,14 +870,12 @@ vm_test_map_copy_adjust_to_target(void)
 	vm_map_kernel_flags_t vmk_flags;
 
 	/* create a 4k map */
-	map4k = vm_map_create_options(PMAP_NULL, 0, (uint32_t)-1,
-	    VM_MAP_CREATE_PAGEABLE);
-	vm_map_set_page_shift(map4k, 12);
+	map4k = vm_map_create_with_page_shift(PMAP_NULL, 0, (uint32_t)-1,
+	    12, VM_MAP_CREATE_DEFAULT);
 
 	/* create a 16k map */
-	map16k = vm_map_create_options(PMAP_NULL, 0, (uint32_t)-1,
-	    VM_MAP_CREATE_PAGEABLE);
-	vm_map_set_page_shift(map16k, 14);
+	map16k = vm_map_create_with_page_shift(PMAP_NULL, 0, (uint32_t)-1,
+	    14, VM_MAP_CREATE_DEFAULT);
 
 	/* create 4 VM objects */
 	obj1 = vm_object_allocate(0x100000, map4k->serial_id);
@@ -1007,18 +1007,17 @@ vm_test_per_mapping_internal_accounting(void)
 		map_end = 0x20000000;
 	}
 	/* create a user address space */
-	ledger = ledger_instantiate(task_ledger_template,
-	    LEDGER_CREATE_ACTIVE_ENTRIES);
+	ledger = ledger_instantiate(&task_ledger_template);
 	assert(ledger);
 	user_pmap = pmap_create_options(ledger, 0, pmap_flags);
 	assert(user_pmap);
-	user_map = vm_map_create(user_pmap,
+	user_map = vm_map_create_options(user_pmap,
 	    map_start,
 	    map_end,
-	    TRUE);
+	    VM_MAP_CREATE_DEFAULT);
 	assert(user_map);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* allocate 1 page in that address space */
@@ -1030,7 +1029,7 @@ vm_test_per_mapping_internal_accounting(void)
 	    VM_FLAGS_ANYWHERE);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* remap the original mapping */
@@ -1048,7 +1047,7 @@ vm_test_per_mapping_internal_accounting(void)
 	    VM_INHERIT_DEFAULT);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* create a UPL from the original mapping */
@@ -1069,7 +1068,7 @@ vm_test_per_mapping_internal_accounting(void)
 	assert(upl_page_present(pl, 0));
 	ppnum = upl_phys_page(pl, 0);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	device_object = vm_object_allocate(PAGE_SIZE, kernel_map->serial_id);
@@ -1084,7 +1083,7 @@ vm_test_per_mapping_internal_accounting(void)
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* deallocate the original mapping */
@@ -1109,7 +1108,7 @@ vm_test_per_mapping_internal_accounting(void)
 	*(char *)device_addr = 'x';
 	printf("%s:%d 0x%llx: 0x%x\n", __FUNCTION__, __LINE__, (uint64_t)device_addr, *(uint32_t *)device_addr);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* fault in the remap addr */
@@ -1117,14 +1116,14 @@ vm_test_per_mapping_internal_accounting(void)
 	    FALSE, 0, TRUE, NULL, 0);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == PAGE_SIZE, "balance=0x%llx", balance);
 	/* deallocate remapping */
 	kr = mach_vm_deallocate(user_map, user_remap, PAGE_SIZE);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	/* check ledger */
-	kr = ledger_get_balance(ledger, task_ledgers.internal, &balance);
+	kr = ledger_get_balance(ledger, task_ledgers.internal, LEO_SETTLE, &balance);
 	assertf(kr == KERN_SUCCESS, "kr=0x%x", kr);
 	assertf(balance == 0, "balance=0x%llx", balance);
 	/* TODO: cleanup... */
@@ -1256,7 +1255,7 @@ vm_test_collapse_overflow(void)
 
 	/* remove the page from the backing object */
 	vm_object_lock(backing_object);
-	vm_page_remove(m, TRUE);
+	vm_page_remove(m);
 	vm_object_unlock(backing_object);
 	/* trigger a bypass */
 	vm_object_lock(object);
@@ -1353,12 +1352,76 @@ vm_test_physical_size_overflow(void)
 #define PTR_TAG_SHIFT 56
 #define PTR_BITS_MASK (((1ULL << PTR_TAG_SHIFT) - 1) | (0xfULL << PTR_UPPER_SHIFT))
 
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+static inline vm_map_t
+create_map(mach_vm_address_t map_start, mach_vm_address_t map_end, int pageshift);
+
+static inline void
+cleanup_map(vm_map_t *map);
+#endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
 
 __attribute__((noinline))
 static void
 vm_test_address_canonicalization(void)
 {
+#if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+	kern_return_t kr;
+	mach_vm_address_t kernel_addr, user_addr;
+	mach_vm_address_t canonicalized_addr;
+	mach_vm_address_t intended_result;
+	vm_address_t const tag = 0x5;
+	T_SETUPBEGIN;
+	T_LOG("%s: Allocating an address in the kernel map", __func__);
+	kr = mach_vm_allocate(kernel_map, &kernel_addr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "mach_vm_allocate in kernel map");
+	T_LOG("%s: Allocated kernel addr: 0x%llx", __func__, kernel_addr);
+	mach_vm_address_t const tagged_kernel_addr = (kernel_addr & PTR_BITS_MASK) |
+	    (tag << PTR_TAG_SHIFT);
+	T_LOG("%s: Tagged kernel address: 0x%llx", __func__, tagged_kernel_addr);
+
+	/* Create userland VM map and vm allocate an address from there */
+	vm_map_t user_map = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+	T_ASSERT_NOTNULL(user_map, "VM map creation");
+	kr = mach_vm_allocate(user_map, &user_addr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "mach_vm_allocate in user map");
+	T_LOG("%s: Allocated user address: 0x%llx", __func__, user_addr);
+	mach_vm_address_t const tagged_user_addr = (user_addr & PTR_BITS_MASK) |
+	    (tag << PTR_TAG_SHIFT);
+	T_LOG("%s: Tagged user address: 0x%llx", __func__, tagged_user_addr);
+	T_SETUPEND;
+
+	T_BEGIN("VM address canonicalization test");
+	/* canonicalize kernel address with kernel map */
+	intended_result = kernel_addr;
+	canonicalized_addr = (mach_vm_address_t)vm_memtag_canonicalize(kernel_map, tagged_kernel_addr);
+	T_EXPECT_EQ_ULLONG(canonicalized_addr, intended_result,
+	    "kernel address with kernel map: canonicalized kernel addr: 0x%llx, intended addr: 0x%llx",
+	    canonicalized_addr, intended_result);
+
+	/* canonicalize kernel address with user map */
+	intended_result = (kernel_addr & PTR_BITS_MASK) | ((mach_vm_address_t)0x0 << PTR_TAG_SHIFT);
+	canonicalized_addr = (mach_vm_address_t)vm_memtag_canonicalize(user_map, tagged_kernel_addr);
+	T_EXPECT_EQ_ULLONG(canonicalized_addr, intended_result,
+	    "kernel address with user map: canonicalized kernel addr: 0x%llx, intended addr: 0x%llx",
+	    canonicalized_addr, intended_result);
+
+	/* canonicalize user address with kernel map */
+	intended_result = (user_addr & PTR_BITS_MASK) | ((mach_vm_address_t)0xf << PTR_TAG_SHIFT);
+	canonicalized_addr = (mach_vm_address_t)vm_memtag_canonicalize(kernel_map, tagged_user_addr);
+	T_EXPECT_EQ_ULLONG(canonicalized_addr, intended_result,
+	    "user address with kernel map: canonicalized user addr: 0x%llx, intended addr: 0x%llx",
+	    canonicalized_addr, intended_result);
+
+	/* canonicalize user address with user map */
+	intended_result = user_addr;
+	canonicalized_addr = (mach_vm_address_t)vm_memtag_canonicalize(user_map, tagged_user_addr);
+	T_EXPECT_EQ_ULLONG(canonicalized_addr, intended_result,
+	    "user address with user map: canonicalized user addr: 0x%llx, intended addr: 0x%llx",
+	    canonicalized_addr, intended_result);
+	cleanup_map(&user_map);
+#else /* !HAS_MTE && !HAS_MTE_EMULATION_SHIMS */
 	T_SKIP("System not designed to support this test, skipping...");
+#endif /* !HAS_MTE && !HAS_MTE_EMULATION_SHIMS */
 }
 
 
@@ -1395,14 +1458,28 @@ vm_tests(void)
 	return kr;
 }
 
-static inline vm_map_t
-create_map(mach_vm_address_t map_start, mach_vm_address_t map_end)
+#if MACH_ASSERT
+static int
+vm_startup_tests(__unused int64_t in, int64_t *out)
 {
-	ledger_t ledger = ledger_instantiate(task_ledger_template, LEDGER_CREATE_ACTIVE_ENTRIES);
+	kern_return_t kr = vm_tests();
+	assert(kr == KERN_SUCCESS);
+	*out = 1;
+	return 0;
+}
+/* make the startup test also available as sysctl for systems that don't run it at startup */
+SYSCTL_TEST_REGISTER(vm_startup_tests, vm_startup_tests);
+#endif /* MACH_ASSERT */
+
+static inline vm_map_t
+create_map(mach_vm_address_t map_start, mach_vm_address_t map_end, int pageshift)
+{
+	ledger_t ledger = ledger_instantiate(&task_ledger_template);
 	pmap_t pmap = pmap_create_options(ledger, 0, PMAP_CREATE_64BIT);
 	assert(pmap);
 	ledger_dereference(ledger);  // now retained by pmap
-	vm_map_t map = vm_map_create_options(pmap, map_start, map_end, VM_MAP_CREATE_PAGEABLE);//vm_compute_max_offset
+	vm_map_t map = vm_map_create_with_page_shift(pmap, map_start, map_end,
+	    pageshift, VM_MAP_CREATE_DEFAULT);//vm_compute_max_offset
 	assert(map);
 
 #if CONFIG_SPTM
@@ -1532,8 +1609,8 @@ vm_map_null_tests(__unused int64_t in, int64_t *out)
 	vm_throwaway_region_recurse_info = 0;
 	vm_throwaway_attr_val = MATTR_VAL_OFF;
 
-	map64 = create_map(0, vm_compute_max_offset(true));
-	map32 = create_map(0, vm_compute_max_offset(false));
+	map64 = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT);
+	map32 = create_map(0, vm_compute_max_offset(false), PAGE_SHIFT);
 
 	prot_allexec_u = vm_sanitize_wrap_prot(VM_PROT_ALLEXEC);
 	prot_default_ut = vm_sanitize_wrap_prot(VM_PROT_DEFAULT);
@@ -1775,6 +1852,13 @@ vm_map_null_tests(__unused int64_t in, int64_t *out)
 	kr = vm32_vm_map_page_query(VM_MAP_NULL, throwaway_addr32_u, &throwaway_state, &throwaway_state);
 	assert(kr != KERN_SUCCESS);
 
+	kr = mach_vm_reallocate(VM_MAP_NULL, alloced_addr, size_16kb, &throwaway_addr, 2 * size_16kb, 0, VM_BEHAVIOR_DEFAULT, VM_FLAGS_ANYWHERE);
+	assert(kr != KERN_SUCCESS);
+	kr = vm_reallocate(VM_MAP_NULL, alloced_addr, size_16kb, (vm_address_t *)&throwaway_addr, 2 * size_16kb, 0, VM_BEHAVIOR_DEFAULT, VM_FLAGS_ANYWHERE);
+	assert(kr != KERN_SUCCESS);
+	kr = vm32_vm_reallocate(VM_MAP_NULL, alloced_addr32, size32_16kb, &throwaway_addr32_u, 2 * size32_16kb, 0, VM_BEHAVIOR_DEFAULT, VM_FLAGS_ANYWHERE);
+	assert(kr != KERN_SUCCESS);
+
 	/*
 	 * Cleanup our allocations and maps
 	 */
@@ -1795,12 +1879,78 @@ vm_map_null_tests(__unused int64_t in, int64_t *out)
 }
 SYSCTL_TEST_REGISTER(vm_map_null, vm_map_null_tests);
 
+#if HAS_MTE
+static unsigned int const MTE_GRANULE_SIZE = 16;
+
+static inline unsigned int
+extract_mte_tag(void *ptr)
+{
+	/* TODO: Eventually refactor this symbol entirely */
+	return vm_memtag_extract_tag((vm_offset_t)ptr);
+}
+#endif /* HAS_MTE */
 
 static int
 vm_map_copyio_test(__unused int64_t in, int64_t *out)
 {
+#if HAS_MTE
+	T_SETUPBEGIN;
+	uint64_t const test_buf_size = (32 * 1024) + 1; /* 32K + 1 */
+
+	/* Allocate a tagged kernel buffer to copy from */
+	vm_offset_t kern_addr;
+	kern_return_t kr = kmem_alloc(
+		kernel_map,
+		&kern_addr,
+		test_buf_size,
+		KMA_ZERO | KMA_TAG | KMA_KOBJECT, VM_KERN_MEMORY_DIAG);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "kmem_alloc(KMA_TAG) - allocate an MTE enabled page");
+	char *tagged_ptr = (char *)kern_addr;
+	T_ASSERT_NOTNULL(tagged_ptr, "kmem_alloc(KMA_TAG) ptr not null");
+	unsigned int tag = extract_mte_tag(tagged_ptr);
+	T_LOG("Allocated ptr: %p, tag assigned: %zx", tagged_ptr, tag);
+
+	/* Put some data in the kernel buffer */
+	for (size_t i = 0; i < test_buf_size; ++i) {
+		tagged_ptr[i] = (char)i;
+	}
+	T_SETUPEND;
+
+	T_BEGIN("vm_map_copy test");
+	/* Do a vm_map_copyin from a kernel buffer */
+	vm_map_address_ut tagged_ptr_u;
+	vm_map_size_ut len_u;
+	vm_map_copy_t copy;
+	VM_SANITIZE_UT_SET(tagged_ptr_u, (vm_map_address_t)tagged_ptr);
+	VM_SANITIZE_UT_SET(len_u, msg_ool_size_small);
+	kr = vm_map_copyin(kernel_map, tagged_ptr_u, len_u, false, &copy);
+	T_EXPECT_EQ_INT(kr, KERN_SUCCESS, "vm_map_copyin on 32K");
+
+	/* Do a vm_map_copyout into this process's address space */
+	vm_map_address_t dst_addr;
+	kr = vm_map_copyout(kernel_map, &dst_addr, copy);
+	T_EXPECT_EQ_INT(kr, KERN_SUCCESS, "vm_map_copyout");
+
+	/* Make sure we read back the same data */
+	char *dst_ptr = (char *)dst_addr;
+	T_LOG("dst_ptr: %p", dst_ptr);
+	int ret = memcmp(tagged_ptr, dst_ptr, msg_ool_size_small);
+	T_EXPECT_EQ_INT(0, ret, "memcmp");
+
+	/* Do a vm_map_copyin that's > msg_ool_size_small, should fail */
+	vm_map_size_ut len_large_u;
+	VM_SANITIZE_UT_SET(len_large_u, test_buf_size);
+	kr = vm_map_copyin(kernel_map, tagged_ptr_u, len_large_u, false, &copy);
+	T_EXPECT_EQ_INT(kr, KERN_NOT_SUPPORTED, "vm_map_copyin on 32K+1");
+
+	/* Clean up */
+	kmem_free(kernel_map, kern_addr, test_buf_size, KMF_TAG);
+	T_END;
+	*out = 1;
+#else /* !HAS_MTE */
 	/* Test is not supported */
 	*out = ENOTSUP;
+#endif /* HAS_MTE */
 	return 0;
 }
 SYSCTL_TEST_REGISTER(vm_map_copyio, vm_map_copyio_test);
@@ -1808,8 +1958,98 @@ SYSCTL_TEST_REGISTER(vm_map_copyio, vm_map_copyio_test);
 static int
 vm_page_relocate_test(__unused int64_t in, int64_t *out)
 {
+#if HAS_MTE
+	VM_MAP_FIND_LOCK_CTX_DECLARE(ctx);
+	vm_map_t map = current_map();
+
+	/* `in` will contain the address of the memory we have written to */
+	vm_map_entry_t entry = NULL;
+	vm_map_offset_t tagged_addr = (vm_map_offset_t)in;
+	vm_map_offset_t canonical_addr = vm_memtag_canonicalize(map, tagged_addr);
+
+	vm_page_t m = VM_PAGE_NULL;
+	vm_object_t object = VM_OBJECT_NULL;
+	ppnum_t old_phys_page = 0;
+	kern_return_t kr;
+	while (true) {
+		if (!pmap_find_phys(map->pmap, canonical_addr)) {
+			/*
+			 * There's no physical page associated with the memory;
+			 * we need to fault it in
+			 */
+			/* Fault in the page with the data we care about */
+			kr = vm_fault(
+				map,
+				tagged_addr,
+				VM_PROT_WRITE,
+				FALSE, /* change_wiring */
+				VM_KERN_MEMORY_NONE,
+				THREAD_INTERRUPTIBLE, /* interruptible */
+				NULL, /* caller pmap */
+				0);
+			T_EXPECT_EQ_INT(kr, 0, "vm_fault");
+		}
+
+		/* Look up page */
+		kr = vm_map_find_entry_sh_locked(ctx, &map, canonical_addr, VMRL_FIND_SH_DEFAULT);
+		T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "vm_map_find_entry_sh_locked");
+		entry = vm_map_found_entry_get_entry(ctx);
+		object = VME_OBJECT(entry);
+		T_ASSERT_NOTNULL(object, "vm object should not be null");
+		vm_object_lock(object);
+		/* There shouldn't be a shadow chain for MTE objects */
+		T_ASSERT_EQ_INT(object->shadowed, FALSE, "vm object should not have a shadow");
+		m = vm_page_lookup(
+			object,
+			(VME_OFFSET(entry) + (canonical_addr - entry->vme_start)));
+		old_phys_page = VM_PAGE_GET_PHYS_PAGE(m);
+		T_QUIET; T_ASSERT_NE_UINT(old_phys_page, 0, "physical page should not be 0");
+		T_LOG("old physical page: 0x%x, vm_page_t: 0x%llx", old_phys_page, m);
+		if (m != VM_PAGE_NULL) {
+			break;
+		}
+		vm_object_unlock(object);
+		vm_map_found_entry_sh_unlock(ctx, &map);
+	}
+	vm_object_lock_assert_held(object);
+	int compressed_pages = 0;
+	vm_page_lock_queues();
+	kr = vm_page_relocate(m, &compressed_pages, VM_RELOCATE_REASON_CONTIGUOUS, NULL);
+	vm_page_unlock_queues();
+	T_EXPECT_EQ_INT(kr, 0, "vm_page_relocate");
+	vm_page_t new_m = vm_page_lookup(
+		object,
+		(VME_OFFSET(entry) + (canonical_addr - entry->vme_start)));
+	T_EXPECT_NOTNULL(new_m, "new VM page is not null");
+	ppnum_t new_phys_page = VM_PAGE_GET_PHYS_PAGE(new_m);
+	T_LOG("ppnum of relocated page: %u", new_phys_page);
+	T_EXPECT_NE_UINT(old_phys_page, new_phys_page,
+	    "old and new physical pages should be different");
+	vm_object_unlock(object);
+	vm_map_found_entry_sh_unlock(ctx, &map);
+
+	/* There shouldn't be a PTE associated with addr at the moment */
+	ppnum_t phys_page = pmap_find_phys(map->pmap, canonical_addr);
+	T_EXPECT_EQ_UINT(phys_page, 0, "pmap_find_phys should return 0");
+
+	/* Kernel touches the page, faulting in new page if not already resident */
+	char c = 'b';
+	int result = copyout((void *)&c, (user_addr_t)tagged_addr, sizeof(c));
+	T_EXPECT_EQ_INT(result, 0, "copyout %c to 0x%llx", c, tagged_addr);
+	c = 'c';
+	result = copyout((void *)&c, (user_addr_t)(canonical_addr + MTE_GRANULE_SIZE), sizeof(c));
+	T_EXPECT_EQ_INT(result, 0, "copyout %c to 0x%llx", c, (canonical_addr + MTE_GRANULE_SIZE));
+
+	/* There should be a physical page now */
+	phys_page = pmap_find_phys(map->pmap, canonical_addr);
+	T_EXPECT_NE_UINT(phys_page, 0,
+	    "there's a PTE for 0x%llx after writing to it, phys_page: 0x%x",
+	    canonical_addr, phys_page);
+	*out = 1;
+#else /* !HAS_MTE */
 	/* Test is not supported */
 	*out = ENOTSUP;
+#endif /* HAS_MTE */
 	return 0;
 }
 SYSCTL_TEST_REGISTER(vm_page_relocate, vm_page_relocate_test);
@@ -1833,10 +2073,8 @@ vm_map_copy_entry_subrange_test(__unused int64_t in, int64_t *out)
 	size_4kb = 4 * 1024;
 	size_16kb = 16 * 1024;
 
-	map_4k = create_map(0, vm_compute_max_offset(true));
-	kr = vm_map_set_page_shift(map_4k, PAGE_SHIFT_4K);
-	map_16k = create_map(0, vm_compute_max_offset(true));
-	kr = vm_map_set_page_shift(map_16k, PAGE_SHIFT_16K);
+	map_4k = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT_4K);
+	map_16k = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT_16K);
 
 	/*
 	 * Test mapping a portion of a copy entry from a 4k map to a 16k one.
@@ -1889,7 +2127,7 @@ vm_memory_entry_map_size_null_test(__unused int64_t in, int64_t *out)
 
 	kern_return_t kr;
 
-	map = create_map(0, vm_compute_max_offset(true));
+	map = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT);
 	size_16kb = 16 * 1024;
 
 	map_size = 0xdeadbeef;
@@ -1917,7 +2155,7 @@ vm_memory_entry_map_size_overflow_tests(__unused int64_t in, int64_t *out)
 	kern_return_t kr;
 
 	size_16kb = 16 * 1024;
-	map = create_map(0, vm_compute_max_offset(true));
+	map = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT);
 	/*
 	 * (1) Attempt to overflow offset + mem_entry->offset
 	 */
@@ -1991,9 +2229,7 @@ vm_memory_entry_map_size_copy_tests(__unused int64_t in, int64_t *out)
 	 * Setup - initialize maps and create copy entries for each
 	 */
 	// 4k map and entry
-	map_4k = create_map(0, vm_compute_max_offset(true));
-	kr = vm_map_set_page_shift(map_4k, PAGE_SHIFT_4K);
-	assert(kr == KERN_SUCCESS);
+	map_4k = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT_4K);
 
 	kr = mach_vm_allocate(map_4k, &alloced_addr_4k, size_16kb, VM_FLAGS_ANYWHERE);
 	assert(kr == KERN_SUCCESS);
@@ -2005,9 +2241,7 @@ vm_memory_entry_map_size_copy_tests(__unused int64_t in, int64_t *out)
 	assert(entry_size_4k == size_16kb);
 
 	// 16k map and entry
-	map_16k = create_map(0, vm_compute_max_offset(true));
-	kr = vm_map_set_page_shift(map_16k, PAGE_SHIFT_16K);
-	assert(kr == KERN_SUCCESS);
+	map_16k = create_map(0, vm_compute_max_offset(true), PAGE_SHIFT_16K);
 
 	kr = mach_vm_allocate(map_16k, &alloced_addr_16k, size_16kb, VM_FLAGS_ANYWHERE);
 	assert(kr == KERN_SUCCESS);
@@ -2137,9 +2371,104 @@ SYSCTL_TEST_REGISTER(vm_memory_entry_parent_submap, vm_memory_entry_parent_subma
 static int
 vm_cpu_map_pageout_test(int64_t in, int64_t *out)
 {
+#if HAS_MTE
+	/*
+	 * Since we now allow untagged kernel mappings of tagged user data, we want
+	 * to be sure that the underlying physical page is always handled correctly.
+	 *
+	 * The following sequence may be of particular concern:
+	 * 1. We create & populate an MTE userspace mapping
+	 * 2. We create an untagged kernel mapping of the user tagged memory
+	 * 3. The page is paged out
+	 * 4. We fault in the kernel mapping (without first faulting on the user mapping)
+	 *
+	 * We want to be certain that in this case, we set the correct (MTE-enabled)
+	 * cache attributes on the underlying physical page when we fault on our
+	 * (non-MTE-enabled) kernel mapping.
+	 */
+
+	/* Get the tagged userspace mapping from the userspace side of the test */
+	struct {
+		mach_vm_size_t size;
+		char *ptr;
+		char value;
+	} args;
+	kern_return_t kr = copyin(in, &args, sizeof(args));
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "copyin arguments from userspace");
+
+	/*
+	 * Create an untagged kernel mapping of the user tagged memory.
+	 */
+	memory_object_size_ut size = vm_sanitize_wrap_size(args.size);
+	memory_object_offset_t offset = (memory_object_offset_t)vm_memtag_canonicalize_user((vm_map_address_t)args.ptr);
+	/*
+	 * This path is specifically intended for IOMD::map(), so we pretend to be
+	 * an IOKit caller to get the correct security policies.
+	 */
+	vm_named_entry_kernel_flags_t vmne_kflags = { .vmnekf_is_iokit = true };
+	ipc_port_t memory_entry;
+	kr = mach_make_memory_entry_internal(current_map(), &size, offset,
+	    MAP_MEM_VM_SHARE | VM_PROT_DEFAULT, vmne_kflags, &memory_entry,
+	    /* parent = */ MACH_PORT_NULL);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "make memory entry from tagged user memory");
+
+	mach_vm_offset_t kernel_address = 0;
+	kr = mach_vm_map_kernel(kernel_map, (mach_vm_offset_ut*)&kernel_address,
+	    args.size, /* mask = */ 0,
+	    /* IOMD mappings of user memory are bucketed into the shared data range */
+	    VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmkf_range_id = KMEM_RANGE_ID_DATA_SHARED, .vmf_mte = true),
+	    memory_entry,
+	    /* offset = */ 0, /* copy = */ false, VM_PROT_DEFAULT, VM_PROT_DEFAULT,
+	    VM_INHERIT_DEFAULT);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "remap userspace memory into kernel");
+
+	/* Validate that the mapping is correct and untagged: */
+	assert(extract_mte_tag((void*)kernel_address) == 0xF);
+	assert(extract_mte_tag(args.ptr) != 0xF);
+	char *kernel_ptr = (char*)kernel_address;
+	assert(kernel_ptr[0] == args.value);
+	kernel_ptr[0]++;
+
+	/* Force pageout */
+	kr = vm_map_behavior_set(kernel_map, kernel_address,
+	    kernel_address + args.size, VM_BEHAVIOR_PAGEOUT);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "force pageout of tagged mapping");
+
+	/*
+	 * Page in kernel mapping and validate cache attributes. Wire the memory
+	 * first to ensure the mapping doesn't go away while we're doing checks on
+	 * it.
+	 */
+	kr = vm_map_wire_kernel(kernel_map, kernel_address, kernel_address + args.size,
+	    VM_PROT_READ | VM_PROT_WRITE, VM_KERN_MEMORY_DIAG, false);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "wire user-tagged memory");
+	kernel_ptr[0]++;
+	ppnum_t pn = vm_map_get_phys_page(kernel_map, kernel_address);
+	assert(pn);
+	T_ASSERT(pmap_is_tagged_page(pn), "page has MTE cache attribute");
+	T_ASSERT(!pmap_is_tagged_mapping(vm_map_pmap(kernel_map), kernel_address), "kernel mapping is untagged");
+
+	/* Now, fault in the user mapping... */
+	kr = vm_fault(current_map(), offset, VM_PROT_READ | VM_PROT_WRITE,
+	    /* change_wiring */ FALSE, VM_KERN_MEMORY_NONE, THREAD_ABORTSAFE,
+	    /* caller_pmap */ NULL, /* caller_pmap_addr */ 0);
+
+	/* ... and make sure everything still looks good */
+	T_ASSERT(pmap_is_tagged_page(pn), "page retains MTE cache attribute");
+	T_ASSERT(!pmap_is_tagged_mapping(vm_map_pmap(kernel_map), kernel_address), "kernel mapping remains untagged");
+	T_ASSERT(pmap_is_tagged_mapping(vm_map_pmap(current_map()), offset), "user mapping is tagged");
+
+	/* Cleanup */
+	kr = vm_map_unwire(kernel_map, kernel_address, kernel_address + args.size, false);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "unwire user-tagged memory");
+	kr = mach_vm_deallocate(kernel_map, kernel_address, args.size);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "remove kernel mapping");
+	*out = 1;
+#else /* HAS_MTE */
 	/* Test is not supported */
 	(void)in;
 	*out = ENOTSUP;
+#endif /* HAS_MTE */
 	return 0;
 }
 SYSCTL_TEST_REGISTER(vm_cpu_map_pageout, vm_cpu_map_pageout_test);
@@ -2147,18 +2476,20 @@ SYSCTL_TEST_REGISTER(vm_cpu_map_pageout, vm_cpu_map_pageout_test);
 static int
 vm_get_wimg_mode(int64_t in, int64_t *out)
 {
+	VM_MAP_FIND_LOCK_CTX_DECLARE(ctx);
+	kern_return_t kr;
 	mach_vm_offset_t addr = (mach_vm_offset_t)in;
-	vm_map_entry_t entry;
 	vm_map_t map = current_map();
-	vm_map_lock_read(map);
-	bool map_contains_addr = vm_map_lookup_entry(map, addr, &entry);
-	if (!map_contains_addr) {
-		vm_map_unlock_read(map);
+
+	kr = vm_map_find_entry_sh_locked(ctx, &map, addr, VMRL_FIND_SH_DEFAULT);
+	if (kr != KERN_SUCCESS) {
+		/* entry not found in map */
 		return EINVAL;
 	}
 
+	vm_map_entry_t entry = vm_map_found_entry_get_entry(ctx);
 	if (entry->is_sub_map) {
-		vm_map_unlock_read(map);
+		vm_map_found_entry_sh_unlock(ctx, &map);
 		return ENOTSUP;
 	}
 
@@ -2168,7 +2499,7 @@ vm_get_wimg_mode(int64_t in, int64_t *out)
 		*out = obj->wimg_bits;
 	}
 
-	vm_map_unlock_read(map);
+	vm_map_found_entry_sh_unlock(ctx, &map);
 	return 0;
 }
 SYSCTL_TEST_REGISTER(vm_get_wimg_mode, vm_get_wimg_mode);
@@ -2180,6 +2511,8 @@ static int
 vm_map_4k_16k_test(int64_t in, int64_t *out)
 {
 #if PMAP_CREATE_FORCE_4K_PAGES
+	VM_MAP_FIND_LOCK_CTX_DECLARE(ctx);
+
 	const mach_vm_size_t alloc_size = (36 * 1024);
 	assert((alloc_size % FOURK_PAGE_SHIFT) == 0);
 	assert((alloc_size % SIXTEENK_PAGE_SHIFT) != 0);
@@ -2190,13 +2523,14 @@ vm_map_4k_16k_test(int64_t in, int64_t *out)
 	vm_map_t map_4k, map_16k;
 	pmap_4k = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT | PMAP_CREATE_FORCE_4K_PAGES);
 	assert(pmap_4k);
-	map_4k = vm_map_create_options(pmap_4k, MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, VM_MAP_CREATE_PAGEABLE);
+	map_4k = vm_map_create_with_page_shift(pmap_4k, MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS,
+	    FOURK_PAGE_SHIFT, VM_MAP_CREATE_DEFAULT);
 	assert(map_4k != VM_MAP_NULL);
-	vm_map_set_page_shift(map_4k, FOURK_PAGE_SHIFT);
 
 	pmap_16k = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT);
 	assert(pmap_16k);
-	map_16k = vm_map_create_options(pmap_16k, MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, VM_MAP_CREATE_PAGEABLE);
+	map_16k = vm_map_create_with_page_shift(pmap_16k, MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS,
+	    SIXTEENK_PAGE_SHIFT, VM_MAP_CREATE_DEFAULT);
 	assert(map_16k != VM_MAP_NULL);
 	assert(VM_MAP_PAGE_SHIFT(map_16k) == SIXTEENK_PAGE_SHIFT);
 
@@ -2237,6 +2571,9 @@ vm_map_4k_16k_test(int64_t in, int64_t *out)
 
 		/* do the overwrite */
 		kr = vm_map_copy_overwrite(map_16k, address_16k, copy, alloc_size,
+#if HAS_MTE
+		    false,
+#endif
 		    true);
 		assert3u(kr, ==, KERN_SUCCESS); /* copy_overwrite into 16k map succeds */
 	} else {
@@ -2245,12 +2582,11 @@ vm_map_4k_16k_test(int64_t in, int64_t *out)
 
 	/* validate that everything is combined into one large 16k-aligned entry */
 	mach_vm_size_t expected_size = VM_MAP_ROUND_PAGE(alloc_size, SIXTEENK_PAGE_MASK);
-	vm_map_lock_read(map_16k);
-	vm_map_entry_t entry;
-	bool address_in_map = vm_map_lookup_entry(map_16k, address_16k, &entry);
-	assert(address_in_map); /* address_16k found in map_16k */
+	kr = vm_map_find_entry_sh_locked(ctx, &map_16k, address_16k, VMRL_FIND_SH_DEFAULT);
+	assert3u(kr, ==, KERN_SUCCESS); /* address_16k found in map_16k */
+	vm_map_entry_t entry = vm_map_found_entry_get_entry(ctx);
 	assert3u((entry->vme_end - entry->vme_start), ==, expected_size); /* 4k entries combined into a single 16k entry */
-	vm_map_unlock_read(map_16k);
+	vm_map_found_entry_sh_unlock(ctx, &map_16k);
 #else /* !PMAP_CREATE_FORCE_4K_PAGES */
 	(void)in;
 #endif /* !PMAP_CREATE_FORCE_4K_PAGES */
@@ -2258,6 +2594,57 @@ vm_map_4k_16k_test(int64_t in, int64_t *out)
 	return 0;
 }
 SYSCTL_TEST_REGISTER(vm_map_4k_16k, vm_map_4k_16k_test);
+
+
+static void
+vm_map_get_phys_page_test()
+{
+	kern_return_t kr;
+	mach_vm_offset_t addr = 0;
+	ppnum_t physpage;
+	VM_MAP_LOCK_CTX_DECLARE(ctx);
+	vm_map_t map = kernel_map;
+
+	kr = mach_vm_allocate_kernel(map, (mach_vm_offset_ut *) &addr, PAGE_SIZE, VM_MAP_KERNEL_FLAGS_ANYWHERE());
+	assert(kr == KERN_SUCCESS);
+
+	/* wire the mapping */
+	kr = vm_map_wire_kernel(map, addr, addr + PAGE_SIZE,
+	    VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert(kr == KERN_SUCCESS);
+
+	kr = vm_map_range_sh_lock(ctx, &map, addr, addr + PAGE_SIZE, VMRL_SH_ATOMIC);
+	assert(kr == KERN_SUCCESS);
+
+	vm_map_entry_t entry = vm_map_range_atomic_next(ctx);
+	assert(entry);
+
+	vm_object_t object = VME_OBJECT(entry);
+
+	vm_object_lock_shared(object);
+	vm_page_t page = vm_page_lookup(object, VME_OFFSET(entry));
+	assert(page->vmp_wire_count);
+	physpage = VM_PAGE_GET_PHYS_PAGE(page);
+	vm_object_unlock(object);
+
+	vm_map_range_sh_unlock(ctx, &map);
+
+	ppnum_t pn = vm_map_get_phys_page(map, addr);
+	assert(pn == physpage);
+}
+
+
+
+static int
+vm_misc_tests(int64_t in __unused, int64_t *out)
+{
+	vm_map_get_phys_page_test();
+	*out = 1;
+	return 0;
+}
+
+SYSCTL_TEST_REGISTER(vm_misc_tests, vm_misc_tests);
+
 
 static int
 vm_vector_upl_test(int64_t in, int64_t *out)
@@ -2369,17 +2756,16 @@ SYSCTL_TEST_REGISTER(vm_vector_upl, vm_vector_upl_test);
 static int
 vm_map_wire_copy_delay_memory_test(__unused int64_t in, int64_t *out)
 {
+	VM_MAP_FIND_LOCK_CTX_DECLARE(ctx);
 	kern_return_t kr;
 	vm_map_t map;
 	mach_vm_address_t address_a, address_b, address_c;
 	vm_prot_t cur_prot, max_prot;
-	vm_map_entry_t entry;
 	vm_object_t object;
 	vm_page_t m;
-	bool result;
 
 	T_BEGIN("vm_map_wire_copy_delay_memory_test");
-	map = create_map(0x100000000ULL, 0x200000000ULL);
+	map = create_map(0x100000000ULL, 0x200000000ULL, PAGE_SHIFT);
 
 	address_a = 0;
 	kr = mach_vm_allocate(
@@ -2436,11 +2822,10 @@ vm_map_wire_copy_delay_memory_test(__unused int64_t in, int64_t *out)
 		false);
 	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "vm_map_wire_kernel B");
 
-	vm_map_lock(map);
-	result = vm_map_lookup_entry(map, address_c, &entry);
-	T_ASSERT_EQ_INT(result, true, "vm_map_lookup_entry");
+	kr = vm_map_find_entry_sh_locked(ctx, &map, address_c, VMRL_FIND_SH_DEFAULT);
+	T_ASSERT_EQ_INT(kr, KERN_SUCCESS, "vm_map_find_entry_sh_locked");
 
-	object = VME_OBJECT(entry);
+	object = VME_OBJECT(vm_map_found_entry_get_entry(ctx));
 	T_ASSERT_NOTNULL(object, "C's object should not be null");
 	vm_object_lock(object);
 
@@ -2449,7 +2834,7 @@ vm_map_wire_copy_delay_memory_test(__unused int64_t in, int64_t *out)
 
 	/* cleanup */
 	vm_object_unlock(object);
-	vm_map_unlock(map);
+	vm_map_found_entry_sh_unlock(ctx, &map);
 	cleanup_map(&map);
 
 	T_END;
@@ -2458,6 +2843,428 @@ vm_map_wire_copy_delay_memory_test(__unused int64_t in, int64_t *out)
 }
 SYSCTL_TEST_REGISTER(vm_map_wire_copy_delay_memory, vm_map_wire_copy_delay_memory_test);
 
+#if HAS_MTE
+
+static void
+create_two_mte_maps(vm_map_t* out_mte_map1, vm_map_t* out_mte_map2)
+{
+	*out_mte_map1 = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+	vm_map_set_sec_enabled(*out_mte_map1);
+	*out_mte_map2 = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+	vm_map_set_sec_enabled(*out_mte_map2);
+
+	/* And the second map receives a new ID */
+	if ((*out_mte_map1)->serial_id == (*out_mte_map2)->serial_id) {
+		panic("Expected each map to receive a new ID");
+	}
+}
+
+static void
+create_mte_and_non_mte_map(vm_map_t* out_mte_map, vm_map_t* out_non_mte_map)
+{
+	*out_mte_map = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+	vm_map_set_sec_enabled(*out_mte_map);
+	*out_non_mte_map = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+
+	/* And the second map receives a new ID */
+	if ((*out_mte_map)->serial_id == (*out_non_mte_map)->serial_id) {
+		panic("Expected each map to receive a new ID");
+	}
+}
+
+static vm_object_t
+create_mte_vm_object(vm_object_size_t size, vm_map_serial_t provenance)
+{
+	vm_object_t mte_object = vm_object_allocate(size, provenance);
+	assert(mte_object != VM_OBJECT_NULL);
+	mte_object->wimg_bits = VM_WIMG_MTE;
+	/* Specify the expected copy strategy for MTE objects */
+	mte_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+	return mte_object;
+}
+
+static vm_object_t
+vm_object_for_address(vm_map_t map, vm_map_offset_t address)
+{
+	vm_map_entry_t map_entry;
+
+	vm_map_ilk_lock(map);
+	map_entry = vm_map_lookup(map, address);
+	assert(map_entry);
+	vm_map_ilk_unlock(map);
+
+	vm_object_t object = VME_OBJECT(map_entry);
+	assert(object);
+	return object;
+}
+
+static vm_map_offset_t
+map_object_and_expect_mte(vm_map_t map, vm_object_t obj)
+{
+	vm_map_offset_t mapped_address;
+	kern_return_t kr = vm_map_enter(map, &mapped_address, obj->vo_size, 0,
+	    /* We want the object to be mapped as MTE-enabled */
+	    VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmf_mte = true),
+	    obj, 0, false,
+	    VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_DEFAULT);
+	assert(kr == KERN_SUCCESS);
+
+	/* And the entry is MTE-enabled as expected */
+	assert(vm_object_is_mte_mappable(vm_object_for_address(map, mapped_address)));
+
+	return mapped_address;
+}
+
+static vm_object_t
+expect_object_at_address_to_be_mapped_with_mte_state(
+	vm_map_t map,
+	vm_map_offset_t address,
+	bool expect_mapping_to_be_mte_enabled
+	)
+{
+	vm_object_t alias_object = vm_object_for_address(map, address);
+	ppnum_t pn = vm_map_get_phys_page(map, address);
+	T_ASSERT(pn != 0, "Expected a non-zero page number");
+	/* The page itself should be tagged */
+	assert(vm_object_is_mte_mappable(alias_object));
+	T_ASSERT(pmap_is_tagged_page(pn), "Expected backing page to be tagged");
+
+	if (expect_mapping_to_be_mte_enabled) {
+		/* And our specific mapping should be tagged */
+		T_ASSERT(pmap_is_tagged_mapping(vm_map_pmap(map), address), "Expected alias mapping to be tagged");
+	} else {
+		/* But our mapping should not be tagged */
+		T_ASSERT(!pmap_is_tagged_mapping(vm_map_pmap(map), address), "Expected alias mapping to be untagged");
+	}
+
+	return alias_object;
+}
+
+static vm_object_t
+expect_object_at_address_to_be_mte_mapped(
+	vm_map_t map,
+	vm_map_offset_t address)
+{
+	return expect_object_at_address_to_be_mapped_with_mte_state(
+		map,
+		address,
+		true);
+}
+
+static void
+share_object_and_expect_mapped_with_mte_state(
+	vm_map_t src_map,
+	vm_map_t dst_map,
+	vm_map_offset_t src_address,
+	vm_object_t obj,
+	vm_map_offset_t* out_dst_address,
+	vm_object_t* out_dst_object,
+	bool expect_mapping_to_be_mte_enabled)
+{
+	assert(out_dst_address && out_dst_object);
+
+	/* Share the object into the target map */
+	vm_map_offset_t alias_mapped_address = 0;
+	vm_prot_t cur_prot = VM_PROT_DEFAULT;
+	vm_prot_t max_prot = VM_PROT_DEFAULT;
+	kern_return_t kr = vm_map_remap(
+		dst_map,
+		vm_sanitize_wrap_addr_ref(&alias_mapped_address),
+		obj->vo_size,
+		0,
+		/* The object may be MTE enabled */
+		VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmf_mte = true),
+		src_map,
+		src_address,
+		false,
+		vm_sanitize_wrap_prot_ref(&cur_prot),
+		vm_sanitize_wrap_prot_ref(&max_prot),
+		VM_INHERIT_DEFAULT
+		);
+	assert(kr == KERN_SUCCESS);
+
+	/* Fault in the object so we can inspect the pmap state */
+	kr = vm_fault(
+		dst_map,
+		alias_mapped_address,
+		VM_PROT_READ,
+		false,
+		VM_KERN_MEMORY_NONE,
+		THREAD_UNINT,
+		NULL, 0);
+	assert(kr == KERN_SUCCESS);
+
+	vm_object_t alias_object = expect_object_at_address_to_be_mapped_with_mte_state(
+		dst_map,
+		alias_mapped_address,
+		expect_mapping_to_be_mte_enabled);
+
+	*out_dst_address = alias_mapped_address;
+	*out_dst_object = alias_object;
+}
+
+static void
+share_object_and_expect_non_mte(
+	vm_map_t src_map,
+	vm_map_t dst_map,
+	vm_map_offset_t src_address,
+	vm_object_t obj,
+	vm_map_offset_t* out_dst_address,
+	vm_object_t* out_dst_object
+	)
+{
+	share_object_and_expect_mapped_with_mte_state(
+		src_map,
+		dst_map,
+		src_address,
+		obj,
+		out_dst_address,
+		out_dst_object,
+		false);
+}
+
+static void
+share_object_and_expect_mte(
+	vm_map_t src_map,
+	vm_map_t dst_map,
+	vm_map_offset_t src_address,
+	vm_object_t obj,
+	vm_map_offset_t* out_dst_address,
+	vm_object_t* out_dst_object
+	)
+{
+	share_object_and_expect_mapped_with_mte_state(
+		src_map,
+		dst_map,
+		src_address,
+		obj,
+		out_dst_address,
+		out_dst_object,
+		true);
+}
+
+static int
+vm_map_id_fork_test(__unused int64_t in, int64_t *out)
+{
+	/* Given a map */
+	vm_map_t parent_map = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+
+	/* When we fork it into a new map */
+	ledger_t map_ledger = parent_map->pmap->ledger;
+	vm_map_t child_map = vm_map_fork(map_ledger, parent_map, 0);
+
+	/* Then the forked map shares the same ID as its parent map */
+	if (parent_map->serial_id != child_map->serial_id) {
+		panic("Expected a forked map to share its parent's ID");
+	}
+
+	/* Cleanup */
+	cleanup_map(&child_map);
+	cleanup_map(&parent_map);
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_id_fork, vm_map_id_fork_test);
+
+static int
+vm_map_alias_mte_mapping_in_other_non_mte_map_test(__unused int64_t in, int64_t *out)
+{
+	/* Given an MTE map and a non-MTE map */
+	vm_map_t mte_map, non_mte_map;
+	create_mte_and_non_mte_map(&mte_map, &non_mte_map);
+
+	/* And an MTE-enabled object in the MTE map */
+	vm_object_t mte_object = create_mte_vm_object(PAGE_SIZE, mte_map->serial_id);
+	vm_map_offset_t mte_map_mapped_address = map_object_and_expect_mte(mte_map, mte_object);
+
+	/* When the mapping is entered into a non-MTE map */
+	/* Then the object has been entered as non-MTE in the non-MTE map */
+	vm_map_offset_t alias_address;
+	vm_object_t alias_object;
+	share_object_and_expect_non_mte(mte_map, non_mte_map, mte_map_mapped_address, mte_object, &alias_address, &alias_object);
+
+	/* And when we remap again back into the original map */
+	/* Then the object has been entered as MTE, because it went back to its original map */
+	vm_map_offset_t remapped_address;
+	vm_object_t remapped_object;
+	share_object_and_expect_mte(non_mte_map, mte_map, alias_address, alias_object, &remapped_address, &remapped_object);
+
+	/* Cleanup */
+	cleanup_map(&non_mte_map);
+	cleanup_map(&mte_map);
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_alias_mte_mapping_in_other_non_mte_map, vm_map_alias_mte_mapping_in_other_non_mte_map_test);
+
+static int
+vm_map_alias_mte_mapping_in_other_mte_map_test(__unused int64_t in, int64_t *out)
+{
+	/* Given two MTE maps */
+	vm_map_t mte_map1, mte_map2;
+	create_two_mte_maps(&mte_map1, &mte_map2);
+
+	/* And an MTE-enabled object in the first map */
+	vm_object_t mte_object = create_mte_vm_object(PAGE_SIZE, mte_map1->serial_id);
+	vm_map_offset_t mte_map1_mapped_address = map_object_and_expect_mte(mte_map1, mte_object);
+
+	/* When the mapping is entered into the second MTE map */
+	/* Then the object has been entered as non-MTE (because the MTE state of the destination map doesn't matter) */
+	vm_map_offset_t alias_address;
+	vm_object_t alias_object;
+	share_object_and_expect_non_mte(
+		mte_map1,
+		mte_map2,
+		mte_map1_mapped_address,
+		mte_object,
+		&alias_address,
+		&alias_object);
+
+	/* And when we remap again back into the original map */
+	/* Then the object has been entered as MTE, because it went back to its original map */
+	vm_map_offset_t remapped_address;
+	vm_object_t remapped_object;
+	share_object_and_expect_mte(
+		mte_map2,
+		mte_map1,
+		alias_address,
+		alias_object,
+		&remapped_address,
+		&remapped_object);
+
+	/* Cleanup */
+	cleanup_map(&mte_map2);
+	cleanup_map(&mte_map1);
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_alias_mte_mapping_in_other_mte_map, vm_map_alias_mte_mapping_in_other_mte_map_test);
+
+static int
+vm_map_alias_mte_mapping_in_fork_map_test(__unused int64_t in, int64_t *out)
+{
+	/* Given an MTE parent map */
+	vm_map_t parent_map = create_map(MACH_VM_MIN_ADDRESS, MACH_VM_MAX_ADDRESS, PAGE_SHIFT);
+	vm_map_set_sec_enabled(parent_map);
+
+	/* And an MTE mapping that was created prior to forking */
+	vm_object_t mte_object_from_before_fork = create_mte_vm_object(PAGE_SIZE, parent_map->serial_id);
+	vm_map_offset_t mapped_address_of_mte_object_from_before_fork = map_object_and_expect_mte(parent_map, mte_object_from_before_fork);
+
+	/* And a forked child map */
+	vm_map_t child_map = vm_map_fork(parent_map->pmap->ledger, parent_map, 0);
+
+	/*
+	 * Then the MTE object that was present in the child is also MTE in the parent
+	 * (which is expected via our forking strategy).
+	 * (We also need to fault in the mapping in the child first.)
+	 */
+	kern_return_t kr = vm_fault(
+		child_map,
+		mapped_address_of_mte_object_from_before_fork,
+		VM_PROT_READ,
+		false,
+		VM_KERN_MEMORY_NONE,
+		THREAD_UNINT,
+		NULL, 0);
+	assert(kr == KERN_SUCCESS);
+
+	expect_object_at_address_to_be_mte_mapped(
+		child_map,
+		mapped_address_of_mte_object_from_before_fork
+		);
+
+	/* And when we enter a new MTE object into the parent after the fork() */
+	vm_object_t mte_object_after_fork = create_mte_vm_object(PAGE_SIZE, parent_map->serial_id);
+	vm_map_offset_t mapped_address_of_mte_object_after_fork = map_object_and_expect_mte(parent_map, mte_object_after_fork);
+
+	/* And we share this object into the child */
+	/* Then the child's alias to this object is MTE enabled (because fork maps share the same serial as their parent) */
+	vm_map_offset_t aliased_address;
+	vm_object_t aliased_object;
+	share_object_and_expect_mte(
+		parent_map,
+		child_map,
+		mapped_address_of_mte_object_after_fork,
+		mte_object_after_fork,
+		&aliased_address,
+		&aliased_object);
+
+	/* And when we remap again back into the original parent map */
+	/* Then the object has been entered as MTE, because it went back to its original map */
+	vm_map_offset_t remapped_address;
+	vm_object_t remapped_object;
+	share_object_and_expect_mte(
+		parent_map,
+		child_map,
+		mapped_address_of_mte_object_after_fork,
+		mte_object_after_fork,
+		&remapped_address,
+		&remapped_object);
+
+	/* Cleanup */
+	cleanup_map(&child_map);
+	cleanup_map(&parent_map);
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_alias_mte_mapping_in_fork_map, vm_map_alias_mte_mapping_in_fork_map_test);
+
+static int
+vm_object_transpose_provenance_test(__unused int64_t in, int64_t *out)
+{
+	/* Given two MTE maps */
+	vm_map_t mte_map1, mte_map2;
+	create_two_mte_maps(&mte_map1, &mte_map2);
+
+	/* And an object from each map */
+	vm_object_t obj1 = create_mte_vm_object(PAGE_SIZE, mte_map1->serial_id);
+	vm_object_t obj2 = create_mte_vm_object(PAGE_SIZE, mte_map2->serial_id);
+
+	/* When we transpose the objects */
+	vm_map_serial_t original_obj1_prov = obj1->vmo_provenance;
+	vm_map_serial_t original_obj2_prov = obj2->vmo_provenance;
+
+	vm_object_lock(obj1);
+	vm_object_activity_begin(obj1);
+	obj1->blocked_access = TRUE;
+	vm_object_unlock(obj1);
+	vm_object_lock(obj2);
+	vm_object_activity_begin(obj2);
+	obj2->blocked_access = TRUE;
+	vm_object_unlock(obj2);
+
+	vm_object_transpose(obj2, obj1, PAGE_SIZE);
+
+	vm_object_lock(obj1);
+	vm_object_activity_end(obj1);
+	obj1->blocked_access = FALSE;
+	vm_object_unlock(obj1);
+	vm_object_lock(obj2);
+	vm_object_activity_end(obj2);
+	obj2->blocked_access = FALSE;
+	vm_object_unlock(obj2);
+
+	/* Then the IDs have been transposed */
+	assert(obj1->vmo_provenance == original_obj2_prov);
+	assert(obj2->vmo_provenance == original_obj1_prov);
+
+	/* Cleanup */
+	cleanup_map(&mte_map2);
+	cleanup_map(&mte_map1);
+
+	*out = 1;
+	return 0;
+}
+
+SYSCTL_TEST_REGISTER(vm_object_transpose_provenance, vm_object_transpose_provenance_test);
+
+
+#endif /* HAS_MTE */
 
 /*
  * Compare the contents of an original userspace buffer with that kernel mapping of a UPL created
@@ -2692,11 +3499,15 @@ vm_upl_submap_test(int64_t in, int64_t *out __unused)
 
 	/* Validate that the nesting operation produced the expected submap entry in 'temp_map'. */
 	vm_map_entry_t submap_entry;
-	if (!vm_map_lookup_entry(temp_map, args.upl_base, &submap_entry) || !submap_entry->is_sub_map) {
+	vm_map_ilk_lock(temp_map);
+	submap_entry = vm_map_lookup(temp_map, args.upl_base);
+	if (submap_entry == VM_MAP_ENTRY_NULL || !submap_entry->is_sub_map) {
+		vm_map_ilk_unlock(temp_map);
 		error = ENOENT;
-		printf("%s: did not find submap entry at beginning up UPL region\n", __func__);
+		printf("%s: did not find submap entry at beginning of UPL region\n", __func__);
 		goto upl_submap_test_done;
 	}
+	vm_map_ilk_unlock(temp_map);
 
 	upl_size_t upl_size = args.upl_size;
 	unsigned int upl_count = 0;
@@ -2720,11 +3531,15 @@ vm_upl_submap_test(int64_t in, int64_t *out __unused)
 	}
 
 	/* Validate that UPL creation unnested a portion of the submap entry. */
-	if (!vm_map_lookup_entry(temp_map, args.upl_base, &submap_entry) || submap_entry->is_sub_map) {
+	vm_map_ilk_lock(temp_map);
+	submap_entry = vm_map_lookup(temp_map, args.upl_base);
+	if (submap_entry == VM_MAP_ENTRY_NULL || submap_entry->is_sub_map) {
+		vm_map_ilk_unlock(temp_map);
 		error = ENOENT;
-		printf("%s: did not find non-submap entry at beginning up UPL region\n", __func__);
+		printf("%s: did not find non-submap entry at beginning of UPL region\n", __func__);
 		goto upl_submap_test_done;
 	}
+	vm_map_ilk_unlock(temp_map);
 
 	kr = vm_upl_map(kernel_map, upl, &kva);
 	if (kr != KERN_SUCCESS) {
@@ -2781,6 +3596,886 @@ upl_submap_test_done:
 }
 SYSCTL_TEST_REGISTER(vm_upl_submap, vm_upl_submap_test);
 
+static int
+vm_map_cs_associated_obj_test(int64_t in __unused, int64_t *out)
+{
+	mach_vm_offset_t user_addr = (mach_vm_address_t) in;
+	kern_return_t kr;
+	vm_map_offset_t kernel_addr;
+	vm_map_copy_t copy;
+
+	/*
+	 * Copy the mapping from user -> kernel, and fault it.
+	 */
+	printf("running %s(%llx)\n", __func__, user_addr);
+
+	kr = vm_map_copyin_internal(current_map(), user_addr, PAGE_SIZE, VM_MAP_COPYIN_ENTRY_LIST, &copy);
+	assert(kr == KERN_SUCCESS);
+
+	kr = vm_map_copyout(kernel_map, &kernel_addr, copy);
+	assert(kr == KERN_SUCCESS);
+
+	kr = vm_fault(kernel_map, kernel_addr, VM_PROT_READ, false, VM_KERN_MEMORY_NONE, THREAD_UNINT, NULL, 0);
+	assert(kr == KERN_SUCCESS);
+
+	kr = vm_deallocate(kernel_map, kernel_addr, PAGE_SIZE);
+	assert(kr == KERN_SUCCESS);
+
+	*out = 1;
+	return 0;
+}
+
+SYSCTL_TEST_REGISTER(vm_map_cs_associated_obj, vm_map_cs_associated_obj_test);
+
+
+#ifdef HAS_MTE
+#include <arm64/mte_xnu.h>
+
+static int
+vm_map_page_tags_get_test(int64_t in __unused, int64_t *out)
+{
+	uint64_t MAP_BASE = 0x10000000;
+	vm_map_t map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, 0xffffffffff00000, 0);
+	kern_return_t kr;
+	uint64_t buf[64];
+
+	/* empty map */
+	kr = vm_map_page_tags_get(map, MAP_BASE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_INVALID_ADDRESS);
+
+	vm_map_entry_t entry = vm_test_add_map_entry(map, MAP_BASE, MAP_BASE + PAGE_SIZE);
+
+	/* null objs */
+	kr = vm_map_page_tags_get(map, MAP_BASE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_FAILURE);
+
+	/* submap test */
+	vm_map_entry_t entry2 = vm_test_add_map_entry(map, MAP_BASE + PAGE_SIZE, MAP_BASE + PAGE_SIZE * 2);
+	entry2->is_sub_map = true;
+	vm_map_t submap = vm_map_create_options(NULL, MAP_BASE, 0xfffffffffffff, 0);
+	assert(vm_entry_try_lock_exclusive(entry2));
+	VME_SUBMAP_SET(entry2, submap);
+	vm_entry_unlock_exclusive(map, entry2);
+
+	kr = vm_map_page_tags_get(map, MAP_BASE + PAGE_SIZE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_FAILURE);
+
+	vm_object_t obj = vm_object_allocate(PAGE_SIZE, map->serial_id);
+	assert(vm_entry_try_lock_exclusive(entry));
+	VME_OBJECT_SET(entry, obj, false, 0);
+	vm_entry_unlock_exclusive(map, entry);
+
+	/* with an obj */
+	kr = vm_map_page_tags_get(map, MAP_BASE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_FAILURE);
+
+	/* with a mte obj but no page */
+	obj->wimg_bits = VM_WIMG_MTE;
+	kr = vm_map_page_tags_get(map, MAP_BASE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_FAILURE);
+
+	/* grab a page, mark it wired, fill the tag buffer */
+	vm_page_t page = VM_PAGE_NULL;
+	while (page == VM_PAGE_NULL) {
+		page = vm_page_grab_options(VM_PAGE_GRAB_MTE);
+		if (page == VM_PAGE_NULL) {
+			VM_PAGE_WAIT();
+		}
+	}
+
+	vm_object_lock(obj);
+	page->vmp_wire_count++;
+	vm_page_insert(page, obj, 0);
+	vm_page_wakeup_done(obj, page);
+	vm_object_unlock(obj);
+
+
+	uint64_t written_tags[64];
+	written_tags[0] = 1;
+	ppnum_t page_phys = VM_PAGE_GET_PHYS_PAGE(page);
+	/* fill the buffer with the page's tags */
+	vm_address_t vcur = phystokv(ptoa(page_phys));
+	mte_bulk_write_tags((caddr_t)vcur, PAGE_SIZE, (mte_bulk_taglist_t *)written_tags, sizeof(written_tags));
+
+	/* with a page */
+	kr = vm_map_page_tags_get(map, MAP_BASE, buf, sizeof(buf));
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	page->vmp_wire_count--;
+
+	vm_map_ilk_lock(map);
+	assert(vm_entry_try_lock_exclusive(entry2));
+	vm_map_store_remove(map, entry2,
+	    VMS_REMOVE_FREE_ENTRY | VMS_REMOVE_FREE_SLOTS);
+	vm_map_ilk_unlock(map);
+	vm_map_destroy(map);
+
+	/* make sure the tags are what we wrote */
+	assert3u(0, ==, memcmp(&buf, &written_tags, sizeof(buf)));
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_page_tags_get_test, vm_map_page_tags_get_test);
+#endif
+
+#define VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS 50
+#define VM_MAP_WIRE_RACE_TEST_SIZE (PAGE_SIZE * 250)
+struct vm_map_wire_race_test_ctx {
+	vm_object_t * objects;
+	vm_map_entry_t entry;
+	vm_address_t addr;
+	bool done;
+	int races_at_start;
+	vm_map_t map;
+};
+
+struct vm_map_wire_race_test_ctx * wire_test_ctx;
+extern int wire_restarts_due_to_kernel_wiring;
+
+static int
+vm_map_wire_race_test_setup(int64_t in __unused, int64_t *out)
+{
+	wire_test_ctx = kalloc_type(struct vm_map_wire_race_test_ctx, Z_ZERO | Z_WAITOK);
+	wire_test_ctx->done = false;
+	wire_test_ctx->addr = 0;
+	wire_test_ctx->races_at_start = os_atomic_load(&wire_restarts_due_to_kernel_wiring, relaxed);
+	wire_test_ctx->objects = kalloc_type(vm_object_t, VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS, Z_ZERO | Z_WAITOK);
+
+	pmap_t pmap = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT);
+	vm_map_t map = vm_map_create_options(pmap, 0, 0xfffffffffffff, 0);
+	wire_test_ctx->map = map;
+
+	for (int i = 0; i < VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS; i++) {
+		wire_test_ctx->objects[i] = vm_object_allocate(VM_MAP_WIRE_RACE_TEST_SIZE, map->serial_id);
+	}
+
+	kern_return_t kr = vm_allocate_external(map, &wire_test_ctx->addr, VM_MAP_WIRE_RACE_TEST_SIZE, VM_FLAGS_ANYWHERE);
+	assert(kr == KERN_SUCCESS);
+
+	vm_map_ilk_lock(map);
+	wire_test_ctx->entry = vm_map_lookup(map, wire_test_ctx->addr);
+	assert(wire_test_ctx->entry);
+
+	/* give the entry some object to start */
+	assert(vm_entry_lock_exclusive(map, LCK_RW_TYPE_EXCLUSIVE,
+	    wire_test_ctx->entry, wire_test_ctx->addr, THREAD_UNINT) == KERN_SUCCESS);
+	VME_OBJECT_SET(wire_test_ctx->entry, wire_test_ctx->objects[0], false, 0);
+	vm_entry_unlock_exclusive(map, wire_test_ctx->entry);
+	vm_map_ilk_unlock(map);
+
+
+	*out = 1;
+	return 0;
+}
+
+static int
+vm_map_wire_race_test_thread_one(int64_t in __unused, int64_t *out)
+{
+	/* Just do kernel wire and unwire in a loop */
+	while (!wire_test_ctx->done) {
+		kern_return_t kr = vm_map_wire_kernel(wire_test_ctx->map, wire_test_ctx->addr,
+		    wire_test_ctx->addr + VM_MAP_WIRE_RACE_TEST_SIZE, VM_PROT_DEFAULT, VM_KERN_MEMORY_OSFMK, false);
+		assert(kr == KERN_SUCCESS);
+		kr = vm_map_unwire(wire_test_ctx->map, wire_test_ctx->addr, wire_test_ctx->addr + VM_MAP_WIRE_RACE_TEST_SIZE, false);
+		assert(kr == KERN_SUCCESS);
+	}
+
+	*out = 1;
+	return 0;
+}
+
+static int
+vm_map_wire_race_test_thread_two(int64_t in __unused, int64_t *out)
+{
+	int index = 1;
+
+	/* Change the object from the pool of allocated objects */
+	while (!wire_test_ctx->done) {
+		vm_map_ilk_lock(wire_test_ctx->map);
+		if (vm_entry_lock_exclusive(wire_test_ctx->map, LCK_RW_TYPE_EXCLUSIVE,
+		    wire_test_ctx->entry, 0, THREAD_UNINT) == KERN_SUCCESS) {
+			if (wire_test_ctx->entry->wired_count == 0) {
+				/*
+				 * Given it's not wired, it's valid for us to change the object.
+				 * Additionally remove any old pmap mappings to the old object.
+				 */
+				pmap_remove(wire_test_ctx->map->pmap, wire_test_ctx->entry->vme_start, wire_test_ctx->entry->vme_end);
+
+				VME_OBJECT_SET(wire_test_ctx->entry, wire_test_ctx->objects[(index++) % VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS], false, 0);
+			}
+			vm_entry_unlock_exclusive(wire_test_ctx->map, wire_test_ctx->entry);
+		}
+		vm_map_ilk_unlock(wire_test_ctx->map);
+	}
+	*out = 1;
+	return 0;
+}
+
+static int
+vm_map_wire_race_test_signal_end(int64_t in __unused, int64_t *out)
+{
+	wire_test_ctx->done = true;
+
+	*out = os_atomic_load(&wire_restarts_due_to_kernel_wiring, relaxed) - wire_test_ctx->races_at_start;
+	return 0;
+}
+
+static int
+vm_map_wire_race_test_cleanup(int64_t in __unused, int64_t *out)
+{
+	vm_object_t * objects = wire_test_ctx->objects;
+
+	assert(vm_entry_try_lock_exclusive(wire_test_ctx->entry));
+	pmap_remove(wire_test_ctx->map->pmap, wire_test_ctx->entry->vme_start, wire_test_ctx->entry->vme_end);
+	VME_OBJECT_SET(wire_test_ctx->entry, VM_OBJECT_NULL, false, 0);
+	vm_entry_unlock_exclusive(wire_test_ctx->map, wire_test_ctx->entry);
+
+	vm_map_destroy(wire_test_ctx->map);
+
+	for (int i = 0; i < VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS; i++) {
+		vm_object_deallocate(wire_test_ctx->objects[i]);
+	}
+
+	kfree_type(vm_object_t, VM_MAP_WIRE_RACE_TEST_NUM_OBJECTS, objects);
+	kfree_type(struct vm_map_wire_race_test_ctx, wire_test_ctx);
+
+
+	*out = 1;
+	return 0;
+}
+
+
+/*
+ * This group of tests is meant to test concurrent changing of objects (which wire sees as deletion)
+ * against kernel wiring calls.
+ * This provokes wire to take a special restart path that would be otherwise
+ * uncovered.
+ */
+SYSCTL_TEST_REGISTER(vm_map_wire_race_test_setup, vm_map_wire_race_test_setup);
+SYSCTL_TEST_REGISTER(vm_map_wire_race_test_thread_one, vm_map_wire_race_test_thread_one);
+SYSCTL_TEST_REGISTER(vm_map_wire_race_test_thread_two, vm_map_wire_race_test_thread_two);
+SYSCTL_TEST_REGISTER(vm_map_wire_race_test_signal_end, vm_map_wire_race_test_signal_end);
+SYSCTL_TEST_REGISTER(vm_map_wire_race_test_cleanup, vm_map_wire_race_test_cleanup);
+
+struct vm_copy_overwrite_busy_race_ctx {
+	vm_map_entry_t entry;
+	vm_address_t addr;
+	bool done;
+	vm_map_t map;
+};
+
+struct vm_copy_overwrite_busy_race_ctx * copy_overwrite_ctx;
+
+
+#define REGION_SIZE PAGE_SIZE * 10
+static int
+vm_map_copy_overwrite_wire_race_setup(int64_t  in __unused, int64_t *out __unused)
+{
+	pmap_t pmap = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT);
+	vm_map_t map = vm_map_create_options(pmap, 0, 0xfffffffffffff, 0);
+
+	vm_object_t dst_object = vm_object_allocate(PAGE_SIZE * 12, map->serial_id);
+	dst_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+
+	/* to take slow_copy path */
+
+	copy_overwrite_ctx = kalloc_type(struct vm_copy_overwrite_busy_race_ctx, Z_ZERO | Z_WAITOK);
+	copy_overwrite_ctx->map = map;
+
+	copy_overwrite_ctx->addr = 0;
+	kern_return_t kr = vm_allocate(map, &copy_overwrite_ctx->addr, REGION_SIZE, VM_FLAGS_ANYWHERE);
+	assert(kr == KERN_SUCCESS);
+
+	vm_map_ilk_lock(map);
+	copy_overwrite_ctx->entry = vm_map_lookup(map, copy_overwrite_ctx->addr);
+	assert(copy_overwrite_ctx->entry);
+	assert(vm_entry_lock_exclusive(map, LCK_RW_TYPE_EXCLUSIVE, copy_overwrite_ctx->entry, copy_overwrite_ctx->addr, THREAD_UNINT) == KERN_SUCCESS);
+	VME_OBJECT_SET(copy_overwrite_ctx->entry, dst_object, false, 0);
+	copy_overwrite_ctx->entry->is_shared = true;
+	vm_entry_unlock_exclusive(map, copy_overwrite_ctx->entry);
+	vm_map_ilk_unlock(map);
+
+	*out = 1;
+	return 0;
+}
+
+
+static int
+vm_map_copy_overwrite_wire_race_copy_thread(int64_t  in __unused, int64_t *out __unused)
+{
+	size_t copied_size = 0;
+	while (!copy_overwrite_ctx->done) {
+		kern_return_t kr;
+		vm_map_entry_t entry;
+		vm_map_t cur_map = copy_overwrite_ctx->map;
+
+		/* Call vm_fault_copy in a loop. Make sure we don't have any deadlocks. */
+		VM_MAP_LOCK_CTX_DECLARE(vml_ctx);
+		kr = vm_map_range_ex_lock(vml_ctx, &cur_map, copy_overwrite_ctx->addr, copy_overwrite_ctx->addr + PAGE_SIZE, VMRL_EX_STREAM);
+		while ((entry = vm_map_range_stream_next(vml_ctx))) {
+			vm_object_t object = VME_OBJECT(entry);
+			vm_map_size_t copy_size = REGION_SIZE - PAGE_SIZE;
+			vm_object_reference(object);
+			kr = vm_fault_copy(vml_ctx, object, PAGE_SIZE, &copy_size, &entry, object, 0, true);
+			vm_object_deallocate(object);
+			assert(kr == KERN_SUCCESS);
+			copied_size += copy_size;
+		}
+		vm_map_range_ex_unlock(vml_ctx, &cur_map);
+	}
+
+	*out = 1;
+	return 0;
+}
+
+/*
+ * This a thread simulating the lock ordering of wire.
+ * We take a range lock, and take the object lock
+ * We then take and release the busy bit under that lock.
+ * */
+static int
+vm_map_copy_overwrite_wire_race_busy_thread(int64_t  in __unused, int64_t *out __unused)
+{
+	while (!copy_overwrite_ctx->done) {
+		kern_return_t kr;
+		vm_map_entry_t entry;
+		VM_MAP_LOCK_CTX_DECLARE(vml_ctx);
+		vm_map_t cur_map = copy_overwrite_ctx->map;
+
+		kr = vm_map_range_ex_lock(vml_ctx, &cur_map, copy_overwrite_ctx->addr, copy_overwrite_ctx->addr + PAGE_SIZE, VMRL_EX_STREAM);
+		if (kr == KERN_SUCCESS) {
+			while ((entry = vm_map_range_stream_next(vml_ctx))) {
+				vm_object_t object = VME_OBJECT(entry);
+				vm_object_lock(object);
+				for (vm_object_offset_t offset = 0; offset < object->vo_size; offset += PAGE_SIZE) {
+					/* for every page, busy it */
+relookup_page:                          ;
+					vm_page_t page = vm_page_lookup(object, offset);
+					if (page == VM_PAGE_NULL) {
+						continue;
+					}
+					if (page->vmp_busy) {
+						wait_result_t wait_result = vm_page_sleep(object, page, THREAD_UNINT, LCK_SLEEP_DEFAULT);
+
+						if (wait_result != THREAD_AWAKENED) {
+							continue;
+						}
+						goto relookup_page;
+					}
+					/* Page isn't busy. Let's busy it */
+					page->vmp_busy = true;
+					/* Busied it, do the wakeup */
+					vm_page_wakeup_done(object, page);
+				}
+				vm_object_unlock(object);
+			}
+			vm_map_range_ex_unlock(vml_ctx, &cur_map);
+		}
+	}
+
+	*out = 1;
+	return 0;
+}
+
+static int
+vm_map_copy_overwrite_wire_race_signal_end(int64_t in __unused, int64_t *out)
+{
+	copy_overwrite_ctx->done = true;
+
+	*out = 1;
+	return 0;
+}
+
+static int
+vm_map_copy_overwrite_wire_race_cleanup(int64_t in __unused, int64_t *out)
+{
+	vm_map_destroy(copy_overwrite_ctx->map);
+	kfree_type(struct vm_copy_overwrite_busy_race_ctx, copy_overwrite_ctx);
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_copy_overwrite_wire_race_setup, vm_map_copy_overwrite_wire_race_setup);
+SYSCTL_TEST_REGISTER(vm_map_copy_overwrite_wire_race_copy_thread, vm_map_copy_overwrite_wire_race_copy_thread);
+SYSCTL_TEST_REGISTER(vm_map_copy_overwrite_wire_race_busy_thread, vm_map_copy_overwrite_wire_race_busy_thread);
+SYSCTL_TEST_REGISTER(vm_map_copy_overwrite_wire_race_signal_end, vm_map_copy_overwrite_wire_race_signal_end);
+SYSCTL_TEST_REGISTER(vm_map_copy_overwrite_wire_race_cleanup, vm_map_copy_overwrite_wire_race_cleanup);
+
+struct vm_map_remove_test_unwire_args {
+	vm_map_t map;
+	vm_map_address_t start;
+	vm_map_address_t end;
+	bool called;
+};
+
+static void
+vm_map_remove_test_unwire_async(thread_call_param_t param0, __unused thread_call_param_t param1)
+{
+	struct vm_map_remove_test_unwire_args *args = (struct vm_map_remove_test_unwire_args*)param0;
+
+	args->called = true;
+	kern_return_t kr = vm_map_unwire(args->map, args->start, args->end, false /* kernel wire */);
+	assert3u(kr, ==, KERN_SUCCESS);
+}
+
+static void
+vm_map_remove_test_add_entry(vm_map_t map, vm_offset_t *start,
+    vm_map_size_t size)
+{
+	kern_return_t kr;
+	*start = 0;
+	kr = mach_vm_map_kernel(map,
+	    (mach_vm_offset_ut*)start,
+	    size,
+	    0,
+	    VM_MAP_KERNEL_FLAGS_ANYWHERE(),
+	    IP_NULL,
+	    0,
+	    false,
+	    VM_PROT_DEFAULT,
+	    VM_PROT_DEFAULT,
+	    VM_INHERIT_DEFAULT);
+	assert3u(kr, ==, KERN_SUCCESS);
+}
+
+static vm_map_t
+vm_map_remove_test_setup(vm_offset_t *start, vm_map_size_t size)
+{
+	pmap_t pmap = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT);
+
+	vm_map_t map = vm_map_create_options(pmap, 0, 0xfffffffffffff, 0);
+
+	vm_map_remove_test_add_entry(map, start, size);
+
+	return map;
+}
+
+static void
+vm_map_remove_test_kernel_unwire_simple()
+{
+	kern_return_t kr;
+	vm_offset_t  start;
+	vm_map_size_t size = 0x20000;
+
+	vm_map_remove_test_add_entry(kernel_map, &start, size);
+	vm_map_address_t end = start + size;
+
+	kr = vm_map_wire_kernel(kernel_map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	kr = vm_map_remove_guard(kernel_map, start, end, VM_MAP_REMOVE_KUNWIRE, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+}
+
+static void
+vm_map_remove_test_kernel_unwire_block_with_kunwire()
+{
+	kern_return_t kr;
+	vm_offset_t  start;
+	vm_map_size_t size = 0x20000;
+
+	vm_map_remove_test_add_entry(kernel_map, &start, size);
+
+	kr = vm_map_wire_kernel(kernel_map, start, start + size, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	kr = vm_map_wire_kernel(kernel_map, start, start + size, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	struct vm_map_remove_test_unwire_args args = {
+		.map = kernel_map,
+		.start = start,
+		.end = start + size,
+		.called = false
+	};
+
+	thread_call_t wakeup = thread_call_allocate_with_priority(&vm_map_remove_test_unwire_async, (thread_call_param_t)&args, THREAD_CALL_PRIORITY_LOW);
+
+	uint64_t deadline;
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(wakeup, deadline);
+	kr = vm_map_remove_guard(kernel_map, start, start + size, VM_MAP_REMOVE_KUNWIRE, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert(args.called);
+
+	thread_call_free(wakeup);
+}
+
+static void
+vm_map_remove_test_kernel_unwire_block_without_kunwire()
+{
+	kern_return_t kr;
+	vm_offset_t  start;
+	vm_map_size_t size = 0x20000;
+
+	vm_map_remove_test_add_entry(kernel_map, &start, size);
+	vm_map_address_t end = start + size;
+
+	kr = vm_map_wire_kernel(kernel_map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	struct vm_map_remove_test_unwire_args args = {
+		.map = kernel_map,
+		.start = start,
+		.end = end,
+		.called = false
+	};
+
+	thread_call_t wakeup = thread_call_allocate_with_priority(&vm_map_remove_test_unwire_async, (thread_call_param_t)&args, THREAD_CALL_PRIORITY_LOW);
+
+	uint64_t deadline;
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(wakeup, deadline);
+	kr = vm_map_remove_guard(kernel_map, start, end, VM_MAP_REMOVE_NO_FLAGS, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert(args.called);
+
+	thread_call_free(wakeup);
+}
+
+static void
+vm_map_remove_test_user_unwire_simple()
+{
+	kern_return_t kr;
+	vm_offset_t start;
+	vm_map_size_t size = 0x20000;
+	vm_map_t map = vm_map_remove_test_setup(&start, size);
+	vm_map_address_t end = start + size;
+
+	kr = vm_map_wire_kernel(map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, true);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	assert3u(map->hdr.links.next->wired_count, ==, 1);
+
+	kr = vm_map_remove_guard(map, start, end, 0, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+}
+
+static void
+vm_map_remove_test_user_unwire_block()
+{
+	kern_return_t kr;
+	vm_offset_t start;
+	vm_map_size_t size = 0x20000;
+	vm_map_t map = vm_map_remove_test_setup(&start, size);
+	vm_map_address_t end = start + size;
+
+	kr = vm_map_wire_kernel(map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, true);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	kr = vm_map_wire_kernel(map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, true);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	// Increase the kernel wire count to block
+	kr = vm_map_wire_kernel(map, start, end, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	assert3u(map->hdr.links.next->wired_count, ==, 2);
+
+	struct vm_map_remove_test_unwire_args args = {
+		.map = map,
+		.start = start,
+		.end = end,
+		.called = false
+	};
+
+	thread_call_t wakeup = thread_call_allocate_with_priority(&vm_map_remove_test_unwire_async, (thread_call_param_t)&args, THREAD_CALL_PRIORITY_LOW);
+
+	uint64_t deadline;
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(wakeup, deadline);
+
+	kr = vm_map_remove_guard(map, start, end, 0, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	thread_call_free(wakeup);
+}
+
+static void
+vm_map_remove_test_unwire()
+{
+	printf("%s: Remove an entry with VM_MAP_REMOVE_KUNWIRE\n", __func__);
+	vm_map_remove_test_kernel_unwire_simple();
+
+	printf("%s: Remove an entry, block waiting for an unwire with a pending VM_MAP_REMOVE_KUNWIRE\n", __func__);
+	vm_map_remove_test_kernel_unwire_block_with_kunwire();
+
+	printf("%s: Remove an entry, block waiting without a pending VM_MAP_REMOVE_KUNWIRE\n", __func__);
+	vm_map_remove_test_kernel_unwire_block_without_kunwire();
+
+	printf("%s: Remove an entry with any user_wire_count without waiting\n", __func__);
+	vm_map_remove_test_user_unwire_simple();
+
+	printf("%s: Remove an entry with any user_wire_count by waiting for wired_count to drop to 1\n", __func__);
+	vm_map_remove_test_user_unwire_block();
+}
+
+struct vm_map_remove_test_remover_args {
+	vm_map_t map;
+	vm_offset_t start;
+	vm_offset_t end;
+};
+
+static void
+vm_map_remove_test_remove_async(thread_call_param_t param0,
+    __unused thread_call_param_t param1)
+{
+	struct vm_map_remove_test_remover_args *args = (struct vm_map_remove_test_remover_args*)param0;
+
+	kern_return_t kr = vm_map_remove_guard(args->map, args->start, args->end, VM_MAP_REMOVE_NO_FLAGS, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_SUCCESS);
+};
+
+static void __attribute__((noreturn))
+vm_map_remove_wait_detect_hang(__unused thread_call_param_t param0,
+    __unused thread_call_param_t param1)
+{
+	panic("Failed to wakeup vm_map_enter");
+}
+
+static void
+vm_map_remove_test_wait_for_space()
+{
+	printf("%s: Removing an entry should wake any thread waiting for free space\n", __func__);
+
+	vm_offset_t start;
+	vm_map_size_t size = 0x20000;
+	vm_map_t map = vm_map_create_options(NULL, 0, 2 * size - 1, VM_MAP_CREATE_DEFAULT);
+
+	vm_map_remove_test_add_entry(map, &start, size);
+	vm_map_address_t end = start + size;
+
+	map->wait_for_space = true;
+
+	struct vm_map_remove_test_remover_args args = {
+		.map = map,
+		.start = start,
+		.end = end,
+	};
+
+	thread_call_t async_remover = thread_call_allocate_with_priority(
+		&vm_map_remove_test_remove_async,
+		(thread_call_param_t)&args,
+		THREAD_CALL_PRIORITY_HIGH);
+
+	thread_call_t hang_detector = thread_call_allocate_with_priority(
+		&vm_map_remove_wait_detect_hang,
+		(thread_call_param_t)0,
+		THREAD_CALL_PRIORITY_HIGH);
+
+	uint64_t deadline;
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(async_remover, deadline);
+
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(hang_detector, deadline);
+
+	vm_map_remove_test_add_entry(map, &start, size);
+
+	thread_call_cancel(hang_detector);
+
+	assert(thread_call_free(hang_detector));
+	assert(thread_call_free(async_remover));
+}
+
+static void __attribute__((noreturn))
+vm_map_remove_interruptible_test_lock_entry(thread_call_param_t param0,
+    thread_call_param_t param1)
+{
+	kern_return_t kr = vm_map_dbg_lock_vm_entry_and_block((vm_map_t)param0, *(vm_address_t*)param1, PAGE_SIZE,
+	    DBG_LCK_FLAG_EXCLUSIVE | DBG_LCK_FLAG_ATOMIC);
+	panic("interruptible blocker returned with %d", kr);
+}
+
+static void
+vm_map_remove_interruptible_wake_delayed(thread_call_param_t param0,
+    __unused thread_call_param_t param1)
+{
+	clear_wait((thread_t)param0, THREAD_INTERRUPTED);
+}
+
+static void __attribute__((noreturn))
+vm_map_remove_interruptible_detect_hang(__unused thread_call_param_t param0,
+    __unused thread_call_param_t param1)
+{
+	panic("Failed to interrupt vm_map_remove\n");
+}
+
+static void
+vm_map_remove_test_interruptible(bool terminated)
+{
+	printf("%s: Removing an entry should be interruptible if requested\n", __func__);
+
+	kern_return_t kr;
+	uint64_t deadline;
+	vm_address_t start;
+	vm_map_size_t size = 0x20000;
+	vm_map_t map = vm_map_remove_test_setup(&start, size);
+
+	vm_map_ilk_lock(map);
+	map->terminated = terminated;
+	vm_map_ilk_unlock(map);
+
+	thread_call_t blocker = thread_call_allocate_with_priority(&vm_map_remove_interruptible_test_lock_entry,
+	    (thread_call_param_t)map,
+	    THREAD_CALL_PRIORITY_HIGH);
+
+	thread_call_t interrupter = thread_call_allocate_with_priority(&vm_map_remove_interruptible_wake_delayed,
+	    (thread_call_param_t)current_thread(),
+	    THREAD_CALL_PRIORITY_HIGH);
+
+	thread_call_t hang_detector = thread_call_allocate_with_priority(&vm_map_remove_interruptible_detect_hang,
+	    (thread_call_param_t)0,
+	    THREAD_CALL_PRIORITY_HIGH);
+
+	thread_call_enter1(blocker, &start);
+
+	// Allow the blocker to take exclusive access
+	delay_for_interval(100, NSEC_PER_MSEC);
+
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(interrupter, deadline);
+
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(hang_detector, deadline);
+
+	kr = vm_map_remove_guard(map, start, start + size, VM_MAP_REMOVE_INTERRUPTIBLE, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_ABORTED);
+
+	thread_call_cancel(hang_detector);
+
+	thread_call_free(hang_detector);
+	thread_call_free(blocker);
+	thread_call_free(interrupter);
+}
+
+static void
+vm_map_remove_test_interruptible_unwire()
+{
+	printf("%s: Removing an entry should be interruptible if requested\n", __func__);
+
+	kern_return_t kr;
+	uint64_t deadline;
+	vm_address_t start;
+	vm_map_size_t size = 0x20000;
+	vm_map_t map = vm_map_remove_test_setup(&start, size);
+
+	kr = vm_map_wire_kernel(map, start, start + size, VM_PROT_DEFAULT, VM_KERN_MEMORY_DIAG, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	thread_call_t interrupter = thread_call_allocate_with_priority(&vm_map_remove_interruptible_wake_delayed,
+	    (thread_call_param_t)current_thread(),
+	    THREAD_CALL_PRIORITY_HIGH);
+
+	thread_call_t hang_detector = thread_call_allocate_with_priority(&vm_map_remove_interruptible_detect_hang,
+	    (thread_call_param_t)0,
+	    THREAD_CALL_PRIORITY_HIGH);
+
+	clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(interrupter, deadline);
+
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(hang_detector, deadline);
+
+	kr = vm_map_remove_guard(map, start, start + size, VM_MAP_REMOVE_INTERRUPTIBLE, KMEM_GUARD_NONE);
+	assert3u(kr, ==, KERN_ABORTED);
+
+	thread_call_cancel(hang_detector);
+
+	thread_call_free(hang_detector);
+	thread_call_free(interrupter);
+}
+
+static int
+vm_map_remove_test(__unused int64_t in, int64_t *out)
+{
+	printf("%s: test running\n", __func__);
+
+	vm_map_remove_test_unwire();
+	vm_map_remove_test_wait_for_space();
+	vm_map_remove_test_interruptible(false);
+	vm_map_remove_test_interruptible(true);
+	vm_map_remove_test_interruptible_unwire();
+
+	printf("%s: test complete\n", __func__);
+
+	*out = 1;
+	return 0;
+}
+
+SYSCTL_TEST_REGISTER(vm_map_remove_test, vm_map_remove_test);
+
+static int
+vm_map_range_configure_test(__unused int64_t in, int64_t *out)
+{
+#if CONFIG_MAP_RANGES
+	vm_map_address_t MAP_BASE = 0x010000000; // avoid the pmap_shared_region
+
+	/* invalid configuration to create ranges, it's a 32 bit addr space */
+	vm_map_t map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, MAP_BASE + PAGE_SIZE * 20, 0);
+	kern_return_t kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_NOT_SUPPORTED);
+	vm_map_destroy(map);
+
+	/* invalid config, it's already jumboed */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, 0x61ull << 40, 0); /* from range_configure */
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_NO_SPACE);
+	vm_map_destroy(map);
+
+	/* try with no entries */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+
+	/* try with entry way late in the map, after the jumbo space. This entry is like the commpage */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	vm_test_add_map_entry(map, MACH_VM_JUMBO_ADDRESS, MACH_VM_JUMBO_ADDRESS + PAGE_SIZE);
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+
+	/* try with entry way late in the map, after the jumbo space. (this one starts PAGE_SIZE after the map end. may never exist) */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	vm_test_add_map_entry(map, MACH_VM_JUMBO_ADDRESS + PAGE_SIZE, MACH_VM_JUMBO_ADDRESS + PAGE_SIZE * 2);
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+
+	/* try with an entry in the jumbo space. This probably never happens realistically. */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	vm_test_add_map_entry(map, MACH_VM_JUMBO_ADDRESS - PAGE_SIZE, MACH_VM_JUMBO_ADDRESS);
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+
+	/* try with entry before the jumbo space. This is just like a normal entry such as the program text. */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	vm_test_add_map_entry(map, MAP_BASE, MAP_BASE + PAGE_SIZE);
+	kr = vm_map_range_configure(map, false);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+
+	/* try extra jumbo */
+	map = vm_map_create_options(pmap_create_options(NULL, 0, PMAP_CREATE_64BIT), MAP_BASE, vm_compute_max_offset(true), 0);
+	kr = vm_map_range_configure(map, true);
+	assert3u(kr, ==, KERN_SUCCESS);
+	assert3u((int)map->uses_user_ranges, ==, true);
+	vm_map_destroy(map);
+#endif /* CONFIG_MAP_RANGES */
+
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_range_configure_test, vm_map_range_configure_test);
+
 #if CONFIG_SPTM
 
 static void
@@ -2813,7 +4508,7 @@ vm_upl_object_test(int64_t in, int64_t *out __unused)
 		uint32_t size; /* Size of userspace buffer (in bytes) */
 		bool upl_rw;
 		bool should_fail; /* Is UPL creation expected to fail due to permissions checking? */
-		bool exec_fault;
+		uint8_t fault_prot;
 	} args;
 	int error = copyin((user_addr_t)in, &args, sizeof(args));
 	if ((error != 0) || (args.size == 0)) {
@@ -2833,11 +4528,15 @@ vm_upl_object_test(int64_t in, int64_t *out __unused)
 	vm_object_t object;
 	vm_page_t m __unused;
 
-	if (!vm_map_lookup_entry(current_map(), args.ptr, &entry) || entry->is_sub_map) {
+	vm_map_ilk_lock(current_map());
+	entry = vm_map_lookup(current_map(), args.ptr);
+	if (entry == VM_MAP_ENTRY_NULL || entry->is_sub_map) {
+		vm_map_ilk_unlock(current_map());
 		error = ENOENT;
-		printf("%s: did not find entry at beginning up UPL region\n", __func__);
+		printf("%s: did not find entry at beginning of UPL region\n", __func__);
 		goto upl_object_test_done;
 	}
+	vm_map_ilk_unlock(current_map());
 
 	object = VME_OBJECT(entry);
 	if (object == VM_OBJECT_NULL) {
@@ -2857,7 +4556,7 @@ vm_upl_object_test(int64_t in, int64_t *out __unused)
 	    upl_flags,
 	    VM_KERN_MEMORY_DIAG);
 
-	if (args.exec_fault) {
+	if (args.fault_prot != VM_PROT_NONE) {
 		/*
 		 * The page may have already been retyped to its "final" executable type by a prior fault,
 		 * so simulate a page recycle operation in order to ensure that our simulated exec fault below
@@ -2866,14 +4565,15 @@ vm_upl_object_test(int64_t in, int64_t *out __unused)
 		vm_object_lock(object);
 		m = vm_page_lookup(object, (VME_OFFSET(entry) + ((vm_map_address_t)args.ptr - entry->vme_start)));
 		assert(m != VM_PAGE_NULL);
-		assert(m->vmp_iopl_wired);
+		assert(VM_PAGE_IOPL_WIRED(m));
 		ppnum_t pn = VM_PAGE_GET_PHYS_PAGE(m);
 		pmap_disconnect(pn);
 		pmap_lock_phys_page(pn);
 		pmap_recycle_page(pn);
 		pmap_unlock_phys_page(pn);
-		assertf(pmap_will_retype(current_map()->pmap, (vm_map_address_t)args.ptr, VM_PAGE_GET_PHYS_PAGE(m), VM_PROT_EXECUTE | VM_PROT_READ, 0, PMAP_MAPPING_TYPE_INFER),
-		    "pmap will not retype for vm_page_t %p", m);
+		assertf(pmap_will_retype(current_map()->pmap, (vm_map_address_t)args.ptr, VM_PAGE_GET_PHYS_PAGE(m), args.fault_prot,
+		    (entry->vme_xnu_user_debug ? PMAP_OPTIONS_XNU_USER_DEBUG : 0), PMAP_MAPPING_TYPE_INFER),
+		    "pmap will not retype for vm_page_t %p, prot 0x%x", m, (unsigned int)args.fault_prot);
 		vm_object_unlock(object);
 	}
 
@@ -2891,23 +4591,24 @@ vm_upl_object_test(int64_t in, int64_t *out __unused)
 		goto upl_object_test_done;
 	}
 
-	if (args.exec_fault) {
+	if (args.fault_prot != VM_PROT_NONE) {
 		kr = vm_fault(current_map(),
 		    (vm_map_address_t)args.ptr,
-		    VM_PROT_EXECUTE | VM_PROT_READ,
+		    args.fault_prot,
 		    FALSE,
 		    VM_KERN_MEMORY_NONE,
 		    THREAD_UNINT,
 		    NULL,
 		    0);
-		/* Exec page retype attempt with in-flight IOPL should be forbidden. */
+		/* Page retype attempt with in-flight IOPL should be forbidden. */
 		if (kr != KERN_PROTECTION_FAILURE) {
 			printf("%s: vm_fault(%p) did not fail as expected\n", __func__, (void*)args.ptr);
 			error = ((kr == KERN_SUCCESS) ? EIO : kr);
 			goto upl_object_test_done;
 		}
-		assertf(pmap_will_retype(current_map()->pmap, (vm_map_address_t)args.ptr, VM_PAGE_GET_PHYS_PAGE(m), VM_PROT_EXECUTE | VM_PROT_READ, 0, PMAP_MAPPING_TYPE_INFER),
-		    "pmap will not retype for vm_page_t %p", m);
+		assertf(pmap_will_retype(current_map()->pmap, (vm_map_address_t)args.ptr, VM_PAGE_GET_PHYS_PAGE(m), args.fault_prot,
+		    (entry->vme_xnu_user_debug ? PMAP_OPTIONS_XNU_USER_DEBUG : 0), PMAP_MAPPING_TYPE_INFER),
+		    "pmap will not retype for vm_page_t %p, prot 0x%x", m, (unsigned int)args.fault_prot);
 	}
 
 upl_object_test_done:
@@ -2917,14 +4618,14 @@ upl_object_test_done:
 		upl_deallocate(upl);
 	}
 
-	if ((error == 0) && args.exec_fault) {
+	if ((error == 0) && (args.fault_prot != VM_PROT_NONE)) {
 		/*
 		 * Exec page retype attempt without in-flight IOPL should ultimately succeed, but should
 		 * block if the page is being cleaned.  Simulate that scenario with a thread call to "finish"
 		 * the clean operation and wake up the waiting fault handler after 1s.
 		 */
 		vm_object_lock(object);
-		assert(!m->vmp_iopl_wired);
+		assert(!VM_PAGE_IOPL_WIRED(m));
 		m->vmp_cleaning = true;
 		vm_object_unlock(object);
 		thread_call_t page_clean_timer_call = thread_call_allocate(page_clean_timeout, m);
@@ -2933,7 +4634,7 @@ upl_object_test_done:
 		thread_call_enter_delayed(page_clean_timer_call, deadline);
 		kr = vm_fault(current_map(),
 		    (vm_map_address_t)args.ptr,
-		    VM_PROT_EXECUTE | VM_PROT_READ,
+		    args.fault_prot,
 		    FALSE,
 		    VM_KERN_MEMORY_NONE,
 		    THREAD_UNINT,
@@ -2960,3 +4661,55 @@ upl_object_test_done:
 SYSCTL_TEST_REGISTER(vm_upl_object, vm_upl_object_test);
 
 #endif /* CONFIG_SPTM */
+
+static int
+vm_test_vm_map_protect_pmap_max(int64_t in __unused, int64_t *out)
+{
+#if CONFIG_KERNEL_TAGGING || HAS_MTE_EMULATION_SHIMS
+	vm_map_t map = current_map();
+	vm_map_address_t pmap_max = 0;
+	mach_vm_offset_t addr = 0;
+	kern_return_t kr;
+	mach_vm_size_t size;
+	vm_map_kernel_flags_t flags;
+
+	assert(map->pmap);
+	pmap_max = map->pmap->max;
+	assert(!(pmap_max & (PAGE_SIZE - 1)));
+	if (pmap_max > map->max_offset) {
+		size = roundup(pmap_max - (map->max_offset - 1), PAGE_SIZE);
+	} else {
+		size = PAGE_SIZE;
+	}
+	/* Make sure that `addr` is below map->max_offset so mach_vm_protect works */
+	addr = pmap_max - size;
+	assert3u(addr, <, map->max_offset);
+
+	flags = VM_MAP_KERNEL_FLAGS_FIXED();
+	/* It's possible for pmap->max > map->max */
+	flags.vmkf_beyond_max = true;
+
+	/* Allocate a page at addr */
+	kr = mach_vm_allocate_kernel(
+		map,
+		(mach_vm_offset_ut *)&addr,
+		size,
+		flags);
+	assert3u(kr, ==, KERN_SUCCESS);
+
+	mach_vm_offset_t end = addr + size;
+	assert3u(end, ==, pmap_max);
+
+	/* Change the protections for the entry. */
+	kr = mach_vm_protect(
+		map,
+		addr,
+		size,
+		FALSE,
+		VM_PROT_READ);
+	assert3u(kr, ==, KERN_SUCCESS);
+#endif /* CONFIG_KERNEL_TAGGING || HAS_MTE_EMULATION_SHIMS */
+	*out = 1;
+	return 0;
+}
+SYSCTL_TEST_REGISTER(vm_map_protect_pmap_max, vm_test_vm_map_protect_pmap_max);

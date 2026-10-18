@@ -257,8 +257,48 @@ typedef union {
 /* H16C Brava C p-Core. */
 #define CPU_PART_PCORE_BRAVA_C 0x59
 
+/* H17P Tahiti e-Core. */
+#define CPU_PART_ECORE_TAHITI 0x60
+
+/* H17P Tahiti p-Core. */
+#define CPU_PART_PCORE_TAHITI 0x61
+
+/* H17A Tupai e-Core. */
+#define CPU_PART_ECORE_TUPAI 0x6a
+
+/* H17A Tupai p-Core. */
+#define CPU_PART_PCORE_TUPAI 0x6b
+
+/* H17G Hidra e-Core. */
+#define CPU_PART_ECORE_HIDRA 0x62
+
+/* H17G Hidra p-Core. */
+#define CPU_PART_PCORE_HIDRA 0x63
+
+/* H17S Sotra S m-Core. */
+#define CPU_PART_MCORE_SOTRA_S 0x64
+
+/* H17S Sotra S p-Core. */
+#define CPU_PART_PCORE_SOTRA_S 0x65
+
+/* H17C Sotra C m-Core. */
+#define CPU_PART_MCORE_SOTRA_C 0x68
+
+/* H17C Sotra C p-Core. */
+#define CPU_PART_PCORE_SOTRA_C 0x69
 
 
+/* H18P Thera e-Core. */
+#define CPU_PART_ECORE_THERA 0x70
+
+/* H18P Thera p-Core. */
+#define CPU_PART_PCORE_THERA 0x71
+
+/* H18P Thera e-Core. */
+#define CPU_PART_ECORE_TILOS 0x7a
+
+/* H18P Thera p-Core. */
+#define CPU_PART_PCORE_TILOS 0x7b
 
 
 

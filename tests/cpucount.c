@@ -457,19 +457,23 @@ T_DECL(hw_perflevels_order_and_cpu_counts,
 	int efficient_pos = -1;
 	int performance_pos = -1;
 	int standard_pos = -1;
+	int super_pos = -1;
 	for (int p = 0; p < level_count; p++) {
 		snprintf(sysctlname, sizeof(sysctlname), "hw.perflevel%d.name", p);
 		ret = sysctlbyname(sysctlname, perflevel_name[p], &(size_t){ sizeof(perflevel_name[p]) }, NULL, 0);
 		T_QUIET; T_ASSERT_POSIX_SUCCESS(ret, sysctlname);
+		T_EXPECT_GT(strlen(perflevel_name[p]), 0, "%s should be non-empty, got: '%s'", sysctlname, perflevel_name[p]);
 		if (strcmp(perflevel_name[p], "Efficiency") == 0) {
 			efficient_pos = p;
 		} else if (strcmp(perflevel_name[p], "Performance") == 0) {
 			performance_pos = p;
 		} else if (strcmp(perflevel_name[p], "Standard") == 0) {
 			standard_pos = p;
+		} else if (strcmp(perflevel_name[p], "Super") == 0) {
+			super_pos = p;
 		}
 	}
-	T_ASSERT_TRUE((efficient_pos >= 0) || (performance_pos >= 0) || (standard_pos >= 0),
+	T_ASSERT_NE((standard_pos >= 0), ((efficient_pos >= 0) || (performance_pos >= 0) || (super_pos >= 0)),
 	    "valid perflevels detected (\"Efficient\" %d, \"Performance\" %d, \"Standard\" %d)",
 	    efficient_pos, performance_pos, standard_pos);
 	if (standard_pos >= 0) {
@@ -478,8 +482,11 @@ T_DECL(hw_perflevels_order_and_cpu_counts,
 	if (efficient_pos >= 0) {
 		T_ASSERT_EQ(efficient_pos, level_count - 1, "\"Efficiency\" is the highest index perflevel");
 	}
-	if (performance_pos >= 0) {
-		T_ASSERT_EQ(performance_pos, 0, "\"Performance\" is the lowest index perflevel");
+	if (super_pos >= 0) {
+		T_ASSERT_EQ(super_pos, 0, "\"Super\" is the lowest index perflevel");
+	}
+	if (performance_pos >= 0 && super_pos >= 0) {
+		T_ASSERT_EQ(performance_pos, super_pos + 1, "\"Performance\" comes after \"Super\" (if it exists) or is 0");
 	}
 
 	/*
@@ -503,4 +510,21 @@ T_DECL(hw_perflevels_order_and_cpu_counts,
 		}
 		T_EXPECT_EQ(total_amount, amount_from_perflevels, "all %u %s accounted for", total_amount, cpu_count_variants[v]);
 	}
+
+	/* Validate cpusperl2 <= logicalcpu_max for all perflevels */
+	for (int p = 0; p < level_count; p++) {
+		unsigned int cpusperl2 = 0;
+		unsigned int logicalcpu_max = 0;
+
+		snprintf(sysctlname, sizeof(sysctlname), "hw.perflevel%d.cpusperl2", p);
+		ret = sysctlbyname(sysctlname, &cpusperl2, &(size_t){ sizeof(cpusperl2) }, NULL, 0);
+		T_QUIET; T_ASSERT_POSIX_SUCCESS(ret, "%s", sysctlname);
+
+		snprintf(sysctlname, sizeof(sysctlname), "hw.perflevel%d.logicalcpu_max", p);
+		ret = sysctlbyname(sysctlname, &logicalcpu_max, &(size_t){ sizeof(logicalcpu_max) }, NULL, 0);
+		T_QUIET; T_ASSERT_POSIX_SUCCESS(ret, "%s", sysctlname);
+
+		T_EXPECT_LE(cpusperl2, logicalcpu_max, "hw.perflevel%d.cpusperl2 (%u) should be <= hw.perflevel%d.logicalcpu_max (%u)", p, cpusperl2, p, logicalcpu_max);
+	}
 }
+

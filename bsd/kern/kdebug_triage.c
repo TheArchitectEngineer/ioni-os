@@ -431,6 +431,7 @@ const char *vm_triage_strings[] =
 	[KDBG_TRIAGE_VM_COMPRESSOR_GET_OUT_OF_RANGE] = "Compressor offset requested out of range\n",
 	[KDBG_TRIAGE_VM_COMPRESSOR_GET_NO_PAGE] = "Compressor doesn't have this page\n",
 	[KDBG_TRIAGE_VM_COMPRESSOR_DECOMPRESS_FAILED] = "Decompressor hit a failure\n",
+	[KDBG_TRIAGE_VM_COMPRESSOR_DECOMPRESS_POPCNT_MISMATCH] = "Decompressor popcnt mismatch\n",
 	[KDBG_TRIAGE_VM_SUBMAP_NO_COW_ON_EXECUTABLE] = "Submap disallowed cow on executable range\n",
 	[KDBG_TRIAGE_VM_SUBMAP_COPY_SLOWLY_FAILED] = "Submap object copy_slowly failed\n",
 	[KDBG_TRIAGE_VM_SUBMAP_COPY_STRAT_FAILED] = "Submap object copy_strategically failed\n",
@@ -442,10 +443,10 @@ const char *vm_triage_strings[] =
 	[KDBG_TRIAGE_VM_ECC_CLEAN] = "Clean page had an uncorrected ECC error\n",
 	[KDBG_TRIAGE_VM_COPYOUTMAP_SAMEMAP_ERROR] = "vm_copyout_map failed with same src-dest map\n",
 	[KDBG_TRIAGE_VM_COPYOUTMAP_DIFFERENTMAP_ERROR] = "vm_copyout_map failed with different src-dest map\n",
-	[KDBG_TRIAGE_VM_COPYOVERWRITE_FULL_NESTED_ERROR] = "vm_map_copy_overwrite_nested failed when trying full copy\n",
-	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_NESTED_ERROR] = "vm_map_copy_overwrite_nested failed when trying partial copy\n",
-	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_HEAD_NESTED_ERROR] = "vm_map_copy_overwrite_nested failed when trying misaligned head copy\n",
-	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_TAIL_NESTED_ERROR] = "vm_map_copy_overwrite_nested failed when trying misaligned tail copy\n",
+	[KDBG_TRIAGE_VM_COPYOVERWRITE_FULL_ERROR] = "vm_map_copy_overwrite failed when trying full copy\n",
+	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_ERROR] = "vm_map_copy_overwrite failed when trying partial copy\n",
+	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_HEAD_ERROR] = "vm_map_copy_overwrite failed when trying misaligned head copy\n",
+	[KDBG_TRIAGE_VM_COPYOVERWRITE_PARTIAL_TAIL_ERROR] = "vm_map_copy_overwrite failed when trying misaligned tail copy\n",
 	[KDBG_TRIAGE_VM_COPYOUT_INTERNAL_SIZE_ERROR] = "vm_map_copyout_internal failed due to bad size\n",
 	[KDBG_TRIAGE_VM_COPYOUT_KERNEL_BUFFER_ERROR] = "vm_map_copyout_kernel_buffer failed\n",
 	[KDBG_TRIAGE_VM_COPYOUT_INTERNAL_ADJUSTING_ERROR] = "vm_map_copyout_internal failed when trying to adjust src-dest params\n",
@@ -457,6 +458,8 @@ const char *vm_triage_strings[] =
 	[KDBG_TRIAGE_VM_IOPL_ON_EXEC_PAGE] = "Attempted I/O wiring of page with executable mapping\n",
 	[KDBG_TRIAGE_VM_EXEC_ON_IOPL_PAGE] = "Attempted executable mapping of page already wired for I/O\n",
 	[KDBG_TRIAGE_VM_UPL_WRITE_ON_EXEC_REGION] = "Attempted writable UPL against executable VM region\n",
+	[KDBG_TRIAGE_VM_SOFT_MODE_DISABLE_TRACED] = "Soft mode disabled because process was ptraced\n",
+	[KDBG_TRIAGE_VM_MAP_ENTER_MEM_ENTRY_PARTIAL] = "Partial mapping of a memory entry\n",
 };
 /* VM end */
 

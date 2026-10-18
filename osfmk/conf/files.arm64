@@ -1,3 +1,4 @@
+OPTIONS/config_ecc_logging	optional config_ecc_logging
 OPTIONS/fb			optional fb
 
 OPTIONS/debug			optional debug
@@ -22,6 +23,7 @@ osfmk/arm64/sptm/pmap/pmap_ppl_interface.c	optional nos_arm_asm config_sptm
 osfmk/arm64/sptm/start_sptm.s		optional nos_arm_asm config_sptm
 osfmk/arm64/amcc_rorgn_sptm.c		optional nos_arm_asm config_sptm
 osfmk/arm64/sptm/arm_init_sptm.c	optional config_sptm
+osfmk/arm64/sop.c			optional config_sptm
 
 osfmk/arm64/bsd_arm64.c		optional mach_bsd
 osfmk/arm/machdep_call.c	optional mach_bsd
@@ -88,7 +90,6 @@ osfmk/arm/commpage/commpage_asm.s	optional config_arm_pfz
 
 osfmk/kdp/ml/arm/kdp_machdep.c	optional	mach_kdp
 osfmk/kdp/ml/arm/kdp_vm.c	optional	mach_kdp
-osfmk/kdp/sk_core.c		optional config_exclaves
 
 osfmk/arm64/hibernate_arm64.c        optional hibernation
 osfmk/arm64/hibernate_restore.c      optional hibernation
@@ -103,8 +104,9 @@ osfmk/OPTIONS/hi_res_clock	optional hi_res_clock
 
 # Kernel performance monitoring
 osfmk/arm64/monotonic_arm64.c           optional config_cpu_counters
+osfmk/arm64/cpc_arm64.c                 optional config_cpu_counters
 osfmk/arm64/cpc_arm64_events.c          optional config_cpu_counters
-osfmk/arm64/kpc.c		                optional config_cpu_counters
+osfmk/arm64/kpc.c                       optional config_cpu_counters
 
 osfmk/arm64/platform_tests.c			optional config_xnupost
 osfmk/arm64/platform_tests_asm.s		optional config_xnupost
@@ -113,8 +115,17 @@ osfmk/arm64/alternate_debugger.c		optional alternate_debugger
 osfmk/arm64/alternate_debugger_asm.s		optional alternate_debugger
 
 osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+osfmk/arm64/mte.c	standard
+osfmk/arm64/vm_mte_compress.c   standard
 osfmk/arm64/sme.c		standard
 osfmk/arm64/static_if.c	standard
 osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
+osfmk/arm64/x86_64_compat.c	standard
 
 osfmk/arm/counter.c	standard
+
+# ECC Support
+osfmk/kern/ecc_init.c		standard
+osfmk/kern/ecc_logging.c	optional config_ecc_logging
+
+osfmk/kern/memory_error_logging.c	standard

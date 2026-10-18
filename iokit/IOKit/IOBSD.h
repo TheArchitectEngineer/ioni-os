@@ -78,6 +78,13 @@ extern boolean_t IOVnodeGetBooleanEntitlement(
 	int64_t off,
 	const char *entitlement,
 	bool *value);
+extern boolean_t IOVnodeGetIntegerEntitlement(struct vnode *vnode, int64_t off, const char *entitlement, uint64_t *value);
+/*
+ * Returns whether the entitlement is present with any value (including `false`,
+ *  which many other accessors smear to appear the same as if the entitlement is not specified).
+ */
+extern boolean_t IOVnodeIsEntitlementPresentWithAnyValue(struct vnode *vnode, int64_t off, const char *entitlement);
+
 extern char * IOCurrentTaskGetEntitlement(const char * entitlement);
 extern char * IOTaskGetEntitlement(task_t task, const char * entitlement);
 /*
@@ -112,6 +119,7 @@ enum {
 	kIOPMNetworkStackFullWakeFlag = 0x000000001,
 };
 extern void IOPMNetworkStackFullWake(uint64_t flags, const char * reason);
+extern void IOPMNetworkStackWillSleepFromAOT(void);
 
 #ifdef __cplusplus
 }

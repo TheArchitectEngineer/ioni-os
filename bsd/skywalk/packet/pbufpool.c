@@ -31,6 +31,9 @@
 #include <sys/sdt.h>
 #include <net/droptap.h>
 #include <kern/uipc_domain.h>
+#if HAS_MTE
+#include <arm64/mte_xnu.h>
+#endif /* HAS_MTE */
 
 static struct kern_pbufpool *pp_alloc(zalloc_flags_t);
 static void pp_free(struct kern_pbufpool *);
@@ -55,7 +58,7 @@ static struct __metadata_preamble *pp_metadata_fini(struct __kern_quantum *,
     struct kern_pbufpool *, struct mbuf **, struct __kern_packet **,
     struct skmem_obj **, struct skmem_obj **, struct skmem_obj **, struct skmem_obj **);
 static void pp_purge_upp_locked(struct kern_pbufpool *pp, pid_t pid);
-static void pp_buf_seg_ctor(struct sksegment *, IOSKMemoryBufferRef, void *);
+static int pp_buf_seg_ctor(struct sksegment *, IOSKMemoryBufferRef, void *);
 static void pp_buf_seg_dtor(struct sksegment *, IOSKMemoryBufferRef, void *);
 static void pp_destroy_upp_locked(struct kern_pbufpool *);
 static void pp_destroy_upp_bft_locked(struct kern_pbufpool *);
@@ -95,7 +98,6 @@ static SKMEM_TAG_DEFINE(skmem_tag_pbufpool_hash, SKMEM_TAG_PBUFPOOL_HASH);
 
 #define SKMEM_TAG_PBUFPOOL_BFT_HASH  "com.apple.skywalk.pbufpool.bft.hash"
 static SKMEM_TAG_DEFINE(skmem_tag_pbufpool_bft_hash, SKMEM_TAG_PBUFPOOL_BFT_HASH);
-
 
 struct kern_pbufpool_u_htbl {
 	struct kern_pbufpool_u_bkt upp_hash[KERN_PBUFPOOL_U_HASH_SIZE];
@@ -601,6 +603,13 @@ pp_metadata_construct(struct __kern_quantum *kqum, struct __user_quantum *uqum,
 				goto fail;
 			}
 
+#if HAS_MTE && CONFIG_KERNEL_TAGGING
+			if (mte_kern_enabled()) {
+				/* Checking to ensure the object address is tagged */
+				ASSERT((vm_offset_t)kbuf !=
+				    vm_memtag_canonicalize_kernel((vm_offset_t)kbuf));
+			}
+#endif /* HAS_MTE && CONFIG_KERNEL_TAGGING */
 
 			blistn = (*blist)->mo_next;
 			(*blist)->mo_next = NULL;
@@ -789,7 +798,7 @@ pp_metadata_destruct_common(struct __kern_quantum *kqum,
 			 * into magzine layer to prevent immediate reuse of the buffer and
 			 * data corruption.
 			 */
-			if (nbuf->buf_ctl->bc_usecnt > 1) {
+			if (os_atomic_load(&nbuf->buf_ctl->bc_usecnt, relaxed) > 1) {
 				*pp_blist_nocache_large = (struct skmem_obj *)(void *)nbuf;
 				pp_blist_nocache_large =
 				    &((struct skmem_obj *)(void *)nbuf)->mo_next;
@@ -799,7 +808,7 @@ pp_metadata_destruct_common(struct __kern_quantum *kqum,
 				    &((struct skmem_obj *)(void *)nbuf)->mo_next;
 			}
 		} else {
-			if (nbuf->buf_ctl->bc_usecnt > 1) {
+			if (os_atomic_load(&nbuf->buf_ctl->bc_usecnt, relaxed) > 1) {
 				*pp_blist_nocache_def = (struct skmem_obj *)(void *)nbuf;
 				pp_blist_nocache_def =
 				    &((struct skmem_obj *)(void *)nbuf)->mo_next;
@@ -902,14 +911,17 @@ pp_metadata_dtor(void *addr, void *arg)
 	    METADATA_PREAMBLE_SZ), arg, TRUE);
 }
 
-static void
+static int
 pp_buf_seg_ctor(struct sksegment *sg, IOSKMemoryBufferRef md, void *arg)
 {
 	struct kern_pbufpool *__single pp = arg;
+	int ret;
 
+	ret = 0;
 	if (pp->pp_pbuf_seg_ctor != NULL) {
-		pp->pp_pbuf_seg_ctor(pp, sg, md);
+		ret = pp->pp_pbuf_seg_ctor(pp, sg, md);
 	}
+	return ret;
 }
 
 static void
@@ -1623,8 +1635,8 @@ pp_remove_upp_bft_chain_locked(struct kern_pbufpool *pp,
 	obj_idx_t bft_idx;
 
 	ASSERT(!(kqum->qum_qflags & QUM_F_INTERNALIZED));
-	bft_idx = kqum->qum_user->qum_buf[0].buf_nbft_idx;
 	kbft = &kqum->qum_buf[0];
+	bft_idx = kbft->buf_nbft_idx;
 	if (bft_idx == OBJ_IDX_NONE) {
 		return 0;
 	}
@@ -1646,7 +1658,6 @@ pp_remove_upp_bft_chain_locked(struct kern_pbufpool *pp,
 
 	do {
 		struct __kern_buflet *pbft = kbft;
-		struct __kern_buflet_ext *kbe;
 
 		kbft = pp_remove_upp_bft_locked(pp, bft_idx);
 		if (__improbable(kbft == NULL)) {
@@ -1659,8 +1670,7 @@ pp_remove_upp_bft_chain_locked(struct kern_pbufpool *pp,
 		ASSERT(kbft->buf_flag & BUFLET_FLAG_EXTERNAL);
 		BUF_NBFT_IDX(pbft, bft_idx);
 		BUF_NBFT_ADDR(pbft, kbft);
-		kbe = __container_of(kbft, struct __kern_buflet_ext, kbe_overlay);
-		bft_idx = kbe->kbe_buf_user->buf_nbft_idx;
+		bft_idx = kbft->buf_nbft_idx;
 		++nbfts;
 	} while ((bft_idx != OBJ_IDX_NONE) && (nbfts < upkt_nbfts));
 
@@ -2016,6 +2026,13 @@ pp_alloc_packet_common(struct kern_pbufpool *pp, uint16_t bufcnt,
 			break;
 		}
 
+#if HAS_MTE && CONFIG_KERNEL_TAGGING
+		if (mte_kern_enabled()) {
+			/* Checking to ensure the object address is tagged */
+			ASSERT((vm_offset_t)kqum !=
+			    vm_memtag_canonicalize_kernel((vm_offset_t)kqum));
+		}
+#endif /* HAS_MTE && CONFIG_KERNEL_TAGGING */
 
 		if (tagged) {
 			*array_cp = SK_PTR_ENCODE(kqum, METADATA_TYPE(kqum),
@@ -2136,6 +2153,13 @@ pp_alloc_pktq(struct kern_pbufpool *pp, uint16_t bufcnt,
 			break;
 		}
 
+#if HAS_MTE && CONFIG_KERNEL_TAGGING
+		if (mte_kern_enabled()) {
+			/* Checking to ensure the object address is tagged */
+			ASSERT((vm_offset_t)kpkt !=
+			    vm_memtag_canonicalize_kernel((vm_offset_t)kpkt));
+		}
+#endif /* HAS_MTE && CONFIG_KERNEL_TAGGING */
 
 		KPKTQ_ENQUEUE(pktq, kpkt);
 
@@ -2234,6 +2258,38 @@ pp_metadata_fini(struct __kern_quantum *kqum, struct kern_pbufpool *pp,
 	return mdp;
 }
 
+/*
+ * Free a chain of attached packets that may belong to different pools.
+ * Accumulates runs of same-pool packets and batch-frees each run.
+ */
+static void
+pp_free_attached_packets(struct __kern_packet *pkt_chain)
+{
+	struct __kern_packet *pkt, *next;
+
+	while (pkt_chain != NULL) {
+		const struct kern_pbufpool *pp = pkt_chain->pkt_qum.qum_pp;
+		struct __kern_packet *subchain = pkt_chain;
+		struct __kern_packet **tail = &pkt_chain->pkt_nextpkt;
+		int cnt = 0;
+
+		for (pkt = pkt_chain->pkt_nextpkt; pkt != NULL; pkt = next) {
+			next = pkt->pkt_nextpkt;
+			if (pkt->pkt_qum.qum_pp != pp) {
+				break;
+			}
+			tail = &pkt->pkt_nextpkt;
+		}
+
+		/* Terminate subchain and advance to remainder */
+		*tail = NULL;
+		pkt_chain = pkt;
+
+		pp_free_packet_chain(subchain, &cnt);
+		DTRACE_SKYWALK1(free__attached__pkt, int, cnt);
+	}
+}
+
 void
 pp_free_packet_chain(struct __kern_packet *pkt_chain, int *npkt)
 {
@@ -2289,9 +2345,7 @@ pp_free_packet_chain(struct __kern_packet *pkt_chain, int *npkt)
 		}
 	}
 	if (kptop != NULL) {
-		int cnt = 0;
-		pp_free_packet_chain(kptop, &cnt);
-		DTRACE_SKYWALK1(free__attached__pkt, int, cnt);
+		pp_free_attached_packets(kptop);
 	}
 	if (npkt != NULL) {
 		*npkt = c;
@@ -2392,9 +2446,7 @@ pp_free_packet_array(struct kern_pbufpool *pp, uint64_t *__counted_by(num)array,
 		}
 	}
 	if (kptop != NULL) {
-		int cnt = 0;
-		pp_free_packet_chain(kptop, &cnt);
-		DTRACE_SKYWALK1(free__attached__pkt, int, cnt);
+		pp_free_attached_packets(kptop);
 	}
 }
 
@@ -2558,6 +2610,13 @@ pp_alloc_buflet_common(struct kern_pbufpool *pp,
 		list->mo_next = NULL;
 		kbft = (kern_buflet_t)(void *)list;
 
+#if HAS_MTE && CONFIG_KERNEL_TAGGING
+		if (mte_kern_enabled()) {
+			/* Checking to ensure the object address is tagged */
+			ASSERT((vm_offset_t)kbft !=
+			    vm_memtag_canonicalize_kernel((vm_offset_t)kbft));
+		}
+#endif /* HAS_MTE && CONFIG_KERNEL_TAGGING */
 
 		KBUF_EXT_INIT(kbft, pp);
 		*array_cp = (uint64_t)kbft;
@@ -2622,7 +2681,7 @@ pp_free_buflet_common(const kern_pbufpool_t pp, kern_buflet_t kbft)
 		ASSERT(kbft->buf_ctl != NULL);
 		ASSERT(((struct __kern_buflet_ext *)kbft)->
 		    kbe_buf_upp_link.sle_next == NULL);
-		if (kbft->buf_ctl->bc_usecnt > 1) {
+		if (os_atomic_load(&kbft->buf_ctl->bc_usecnt, relaxed) > 1) {
 			skmem_cache_free_nocache(BUFLET_HAS_LARGE_BUF(kbft) ?
 			    PP_KBFT_CACHE_LARGE(pp) : PP_KBFT_CACHE_DEF(pp),
 			    (void *)kbft);

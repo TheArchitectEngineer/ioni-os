@@ -152,7 +152,7 @@
  * |[63:61] RESOURCE |[60:58] FLAVOR_HIGH_ |[57:32] |
  * |_TYPE_MEMORY     |WATERMARK            |Unused  |
  * +------------------------------------------------+
- * |                         | [12:0] HWM limit (MB)|
+ * |[31:17] Unused | [16] Active | [15:0] HWM limit |
  * +------------------------------------------------+
  *
  * subcode:
@@ -162,8 +162,13 @@
  *
  */
 
+#define EXC_RESOURCE_HWM_LIMIT_MASK  0xFFFFULL     /* Bits 0-15 */
+#define EXC_RESOURCE_HWM_ACTIVE_BIT (0x1ULL << 16) /* Bit 16 */
+
 #define EXC_RESOURCE_HWM_DECODE_LIMIT(code) \
-	((code) & 0x1FFFULL)
+	((code) & EXC_RESOURCE_HWM_LIMIT_MASK)
+#define EXC_RESOURCE_HWM_IS_ACTIVE(code) \
+	(!!((code) & EXC_RESOURCE_HWM_ACTIVE_BIT))
 
 /* RESOURCE_TYPE_IO flavors */
 #define FLAVOR_IO_PHYSICAL_WRITES               1
@@ -265,7 +270,7 @@
 
 /* RESOURCE_TYPE_MEMORY::FLAVOR_HIGH_WATERMARK specific encoding macros */
 #define EXC_RESOURCE_HWM_ENCODE_LIMIT(code, num) \
-	((code) |= ((uint64_t)(num) & 0x1FFFULL))
+	((code) |= ((uint64_t)(num) & EXC_RESOURCE_HWM_LIMIT_MASK))
 
 /* RESOURCE_TYPE_IO::FLAVOR_IO_PHYSICAL_WRITES/FLAVOR_IO_LOGICAL_WRITES specific encoding macros */
 #define EXC_RESOURCE_IO_ENCODE_INTERVAL(code, interval) \

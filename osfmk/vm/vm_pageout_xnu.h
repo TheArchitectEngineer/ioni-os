@@ -143,8 +143,6 @@ extern void vector_upl_set_iostate(upl_t, upl_t, upl_offset_t, upl_size_t);
  */
 extern void             vm_pageout(void);
 
-__startup_func extern void             vm_config_init(void);
-
 extern kern_return_t    vm_pageout_internal_start(void);
 
 extern void             vm_pageout_object_terminate(
@@ -253,29 +251,30 @@ struct upl {
 };
 
 /* upl struct flags */
-#define UPL_PAGE_LIST_MAPPED    0x1
-#define UPL_KERNEL_MAPPED       0x2
-#define UPL_CLEAR_DIRTY         0x4
-#define UPL_COMPOSITE_LIST      0x8
-#define UPL_INTERNAL            0x10
-#define UPL_PAGE_SYNC_DONE      0x20
-#define UPL_DEVICE_MEMORY       0x40
-#define UPL_PAGEOUT             0x80
-#define UPL_LITE                0x100
-#define UPL_IO_WIRE             0x200
-#define UPL_ACCESS_BLOCKED      0x400
-#define UPL_SHADOWED            0x1000
-#define UPL_KERNEL_OBJECT       0x2000
-#define UPL_VECTOR              0x4000
-#define UPL_SET_DIRTY           0x8000
-#define UPL_HAS_BUSY            0x10000
-#define UPL_TRACKED_BY_OBJECT   0x20000
-#define UPL_EXPEDITE_SUPPORTED  0x40000
-#define UPL_DECMP_REQ           0x80000
-#define UPL_DECMP_REAL_IO       0x100000
-#define UPL_MAP_EXCLUSIVE_WAIT  0x200000
-#define UPL_HAS_FS_VERIFY_INFO  0x400000
-#define UPL_HAS_WIRED           0x800000
+#define UPL_PAGE_LIST_MAPPED    0x00000001
+#define UPL_KERNEL_MAPPED       0x00000002
+#define UPL_CLEAR_DIRTY         0x00000004
+#define UPL_COMPOSITE_LIST      0x00000008
+#define UPL_INTERNAL            0x00000010
+#define UPL_PAGE_SYNC_DONE      0x00000020
+#define UPL_DEVICE_MEMORY       0x00000040
+#define UPL_PAGEOUT             0x00000080
+#define UPL_LITE                0x00000100
+#define UPL_IO_WIRE             0x00000200
+#define UPL_ACCESS_BLOCKED      0x00000400
+#define UPL_PAGEIN              0x00000800
+#define UPL_SHADOWED            0x00001000
+#define UPL_KERNEL_OBJECT       0x00002000
+#define UPL_VECTOR              0x00004000
+#define UPL_SET_DIRTY           0x00008000
+#define UPL_HAS_BUSY            0x00010000
+#define UPL_TRACKED_BY_OBJECT   0x00020000
+#define UPL_EXPEDITE_SUPPORTED  0x00040000
+#define UPL_DECMP_REQ           0x00080000
+#define UPL_DECMP_REAL_IO       0x00100000
+#define UPL_MAP_EXCLUSIVE_WAIT  0x00200000
+#define UPL_HAS_FS_VERIFY_INFO  0x00400000
+#define UPL_HAS_WIRED           0x00800000
 
 /* flags for upl_create flags parameter */
 #define UPL_CREATE_EXTERNAL     0
@@ -318,7 +317,9 @@ struct vm_pageout_state {
 
 	unsigned int vm_pageout_inactive;
 	unsigned int vm_pageout_inactive_used;  /* debugging */
-	unsigned int vm_pageout_inactive_clean; /* debugging */
+
+	unsigned int vm_pageout_clean_no_shadowing; /* debugging */
+	unsigned int vm_pageout_clean_but_shadowing; /* debugging */
 
 	uint32_t vm_page_filecache_min;
 	uint32_t vm_page_filecache_min_divisor;
@@ -355,6 +356,10 @@ struct vm_pageout_vminfo {
 	unsigned long vm_pageout_freed_speculative;
 	unsigned long vm_pageout_freed_external;
 	unsigned long vm_pageout_freed_internal;
+	unsigned long vm_pageout_inactive_clean;
+	unsigned long vm_pageout_inactive_absent;
+	unsigned long vm_pageout_inactive_not_alive;
+	unsigned long vm_pageout_inactive_error;
 	unsigned long vm_pageout_inactive_dirty_internal;
 	unsigned long vm_pageout_inactive_dirty_external;
 	unsigned long vm_pageout_inactive_referenced;
@@ -378,11 +383,52 @@ struct vm_pageout_vminfo {
 	unsigned long vm_pageout_forcereclaimed_sharedcache;
 	unsigned long vm_pageout_protected_realtime;
 	unsigned long vm_pageout_forcereclaimed_realtime;
+
+	uint64_t vm_compactor_major_compactions_completed;
+	uint64_t vm_compactor_major_compactions_considered;
+	uint64_t vm_compactor_major_compactions_bailed;
+	uint64_t vm_compactor_major_compaction_bytes_freed;
+	uint64_t vm_compactor_major_compaction_bytes_moved;
+	uint64_t vm_compactor_major_compaction_slots_moved;
+	uint64_t vm_compactor_major_compaction_segments_freed;
+	uint64_t vm_compactor_swapouts_queued;
+	uint64_t vm_compactor_swapout_bytes_wasted;
+
+	uint64_t vm_regular_swapouts_queued;
+	uint64_t vm_freezer_swapouts_queued;
+	uint64_t vm_donate_swapouts_queued;
+	uint64_t vm_darkwake_swapouts_queued;
+	uint64_t vm_scavenger_swapouts_queued;
+
+	/* Swapouts in bytes */
+	atomic_counter_t vm_regular_swapouts;
+	atomic_counter_t vm_freezer_swapouts;
+	atomic_counter_t vm_donate_swapouts;
+	atomic_counter_t vm_darkwake_swapouts;
+	atomic_counter_t vm_scavenger_swapouts;
+
+	/* Swapins in bytes */
+	atomic_counter_t vm_regular_swapins;
+	atomic_counter_t vm_freezer_swapins;
+	atomic_counter_t vm_donate_swapins;
+	atomic_counter_t vm_darkwake_swapins;
+	atomic_counter_t vm_scavenger_swapins;
+
+	uint64_t vm_fault_busy_trylock_count;
+	uint64_t vm_fault_busy_retry_count;
+	uint64_t vm_fault_excl_count;
+	uint64_t vm_fault_excl_busy_count;
+	uint64_t vm_fault_page_excl_count;
+	uint64_t vm_fault_page_excl_busy_count;
+	uint64_t vm_fault_page_excl_clean_count;
+	uint64_t vm_fault_page_excl_busy_copy_count;
+	uint64_t vm_fault_page_excl_blocked_obj_count;
+	uint64_t vm_fault_page_excl_pager_not_ready_count;
+	uint64_t vm_fault_copy_busy_trylock_count;
+	uint64_t vm_fault_copy_busy_retry_count;
 };
 
 extern struct vm_pageout_vminfo vm_pageout_vminfo;
-
-extern void vm_swapout_thread(void);
 
 #if DEVELOPMENT || DEBUG
 
@@ -397,9 +443,6 @@ struct vm_pageout_debug {
 	uint32_t vm_pageout_speculative_dirty;
 
 	uint32_t vm_pageout_inactive_busy;
-	uint32_t vm_pageout_inactive_absent;
-	uint32_t vm_pageout_inactive_notalive;
-	uint32_t vm_pageout_inactive_error;
 	uint32_t vm_pageout_inactive_deactivated;
 
 	uint32_t vm_pageout_enqueued_cleaned;

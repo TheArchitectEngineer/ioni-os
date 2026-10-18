@@ -232,8 +232,6 @@ private:
 	void findExistingEntry(const uuid_t varGuid, const char *varName, struct nvram_v3_var_entry **existing, unsigned int *existingIndex);
 	IOReturn syncRaw(void);
 	IOReturn syncBlock(void);
-	IOReturn handleEphDM(void);
-
 public:
 	virtual
 	~IONVRAMV3Handler() APPLE_KEXT_OVERRIDE;
@@ -416,7 +414,7 @@ IONVRAMV3Handler::reloadInternal(void)
 
 	_currentBank = controllerBank;
 
-	controllerImage = (uint8_t *)IOMallocData(_bankSize);
+	controllerImage = (uint8_t *)IOMallocZeroData(_bankSize);
 
 	_nvramController->select(_currentBank);
 	_nvramController->read(0, controllerImage, _bankSize);
@@ -551,8 +549,7 @@ IONVRAMV3Handler::setEntryForRemove(struct nvram_v3_var_entry *v3Entry, bool sys
 		if (_provider->_diags) {
 			_provider->_diags->logVariable(getPartitionTypeForGUID(v3Entry->header.guid),
 			    kIONVRAMOperationDelete,
-			    variableName,
-			    nullptr);
+			    variableName);
 		}
 	}
 
@@ -633,79 +630,6 @@ IONVRAMV3Handler::unserializeImage(const uint8_t *image, IOByteCount length)
 	bcopy(image, _nvramImage, _bankSize);
 
 	ret = kIOReturnSuccess;
-
-exit:
-	return ret;
-}
-
-typedef struct {
-	const char            *name;
-	OSSharedPtr<OSObject> value;
-} ephDMAllowListEntry;
-
-static
-ephDMAllowListEntry ephDMEntries[] = {
-	// Mobile Obliteration clears the following variables after it runs
-	{ .name = "oblit-begins" },
-	{ .name = "orig-oblit" },
-	{ .name = "oblit-failure" },
-	{ .name = "oblit-inprogress" },
-	{ .name = "obliteration" },
-	// darwin-init is used for configuring internal builds
-	{ .name = "darwin-init" }
-};
-
-IOReturn
-IONVRAMV3Handler::handleEphDM(void)
-{
-	OSSharedPtr<IORegistryEntry> entry;
-	OSData*                      data;
-	OSSharedPtr<OSObject>        prop;
-	uint32_t                     ephDM = 0;
-	IOReturn                     ret = kIOReturnSuccess;
-	OSSharedPtr<const OSSymbol>  canonicalKey;
-	uint32_t                     skip = 0;
-
-	// For ephemeral data mode, NVRAM needs to be cleared on every boot
-	// For system region supported targets, iBoot clears the system region
-	// For other targets, iBoot clears all the persistent variables
-	// So xnu only needs to clear the common region
-	entry = IORegistryEntry::fromPath("/product", gIODTPlane);
-	if (entry) {
-		prop = entry->copyProperty("ephemeral-data-mode");
-		if (prop) {
-			data = OSDynamicCast(OSData, prop.get());
-			if (data) {
-				ephDM = *((uint32_t *)data->getBytesNoCopy());
-			}
-		}
-	}
-
-	require_action(ephDM != 0, exit, DEBUG_ALWAYS("ephemeral-data-mode not supported\n"));
-	require_action(_systemSize != 0, exit, DEBUG_ALWAYS("No system region, no need to clear\n"));
-
-	if (PE_parse_boot_argn("epdm-skip-nvram", &skip, sizeof(skip))) {
-		require_action(!(gInternalBuild && (skip == 1)), exit, DEBUG_ALWAYS("Internal build + epdm-skip-nvram set to true, skip nvram clearing\n"));
-	}
-
-	// Go through the allowlist and stash the values
-	for (uint32_t entry = 0; entry < ARRAY_SIZE(ephDMEntries); entry++) {
-		canonicalKey = keyWithGuidAndCString(gAppleNVRAMGuid, ephDMEntries[entry].name);
-		ephDMEntries[entry].value.reset(OSDynamicCast(OSData, _varDict->getObject(canonicalKey.get())), OSRetain);
-	}
-
-	DEBUG_ALWAYS("Obliterating common region\n");
-	ret = flush(gAppleNVRAMGuid, kIONVRAMOperationObliterate);
-	require_noerr_action(ret, exit, DEBUG_ERROR("Flushing common region failed, ret=%#08x\n", ret));
-
-	// Now write the allowlist variables back
-	for (uint32_t entry = 0; entry < ARRAY_SIZE(ephDMEntries); entry++) {
-		if (ephDMEntries[entry].value.get() == nullptr) {
-			continue;
-		}
-		ret = setVariableInternal(gAppleNVRAMGuid, ephDMEntries[entry].name, ephDMEntries[entry].value.get());
-		require_noerr_action(ret, exit, DEBUG_ERROR("Setting allowlist variable %s failed, ret=%#08x\n", ephDMEntries[entry].name, ret));
-	}
 
 exit:
 	return ret;
@@ -808,15 +732,16 @@ IONVRAMV3Handler::unserializeVariables(void)
 		    propSymbol, propObject)) {
 			OSSharedPtr<const OSSymbol> canonicalKey = keyWithGuidAndCString(v3Entry->header.guid, (const char *)v3Entry->header.name_data_buf);
 
-			DEBUG_INFO("adding %s, dataLength=%u, system=%d\n",
-			    canonicalKey->getCStringNoCopy(), v3Entry->header.dataSize, system);
+			DEBUG_INFO("adding %s, variableLength=%zu, dataLength=%u, system=%d\n",
+			    canonicalKey->getCStringNoCopy(), variable_length(header), v3Entry->header.dataSize, system);
 
 			_varDict->setObject(canonicalKey.get(), propObject.get());
 
 			if (_provider->_diags) {
 				_provider->_diags->logVariable(getPartitionTypeForGUID(v3Entry->header.guid),
 				    kIONVRAMOperationInit, propSymbol.get()->getCStringNoCopy(),
-				    (void *)(uintptr_t)(header->name_data_buf + header->nameSize));
+				    (void *)(uintptr_t)v3Entry->header.dataSize,
+				    (void *)(uintptr_t)offset);
 			}
 		}
 		IOFreeData(v3Entry, nvram_v3_var_container_size(header));
@@ -1070,7 +995,7 @@ IONVRAMV3Handler::reclaim(void)
 	DEBUG_INFO("called\n");
 	NVRAMLOCKASSERTHELD(_controllerLock);
 
-	bankData = (uint8_t *)IOMallocData(_bankSize);
+	bankData = (uint8_t *)IOMallocZeroData(_bankSize);
 	require_action(bankData != nullptr, exit, ret = kIOReturnNoMemory);
 
 	ret = _nvramController->select(next_bank);
@@ -1171,7 +1096,6 @@ IONVRAMV3Handler::syncRaw(void)
 	size_t                    *invalidateOffsets = nullptr;
 	size_t                    invalidateOffsetsCount = 0;
 	size_t                    invalidateOffsetIndex = 0;
-	size_t                    invalidatedSize = 0;
 
 	require_action(_nvramController != nullptr, exit, DEBUG_INFO("No _nvramController\n"));
 	require_action(_newData == true, exit, DEBUG_INFO("No _newData to sync\n"));
@@ -1184,11 +1108,11 @@ IONVRAMV3Handler::syncRaw(void)
 		// No reclaim, build append and invalidate list
 		remainingEntries = OSArray::withCapacity(_varEntries->getCapacity());
 
-		appendBuffer = (uint8_t *)IOMallocData(_bankSize);
+		appendBuffer = (uint8_t *)IOMallocZeroData(_bankSize);
 		require_action(appendBuffer, unlock, ret = kIOReturnNoMemory);
 
 		invalidateOffsetsCount = _varEntries->getCount();
-		invalidateOffsets = (size_t *)IOMallocData(invalidateOffsetsCount * sizeof(size_t));
+		invalidateOffsets = (size_t *)IOMallocZeroData(invalidateOffsetsCount * sizeof(size_t));
 		require_action(invalidateOffsets, unlock, ret = kIOReturnNoMemory);
 
 		for (unsigned int i = 0; i < _varEntries->getCount(); i++) {
@@ -1216,16 +1140,13 @@ IONVRAMV3Handler::syncRaw(void)
 
 				if (prevOffset) {
 					invalidateOffsets[invalidateOffsetIndex++] = prevOffset;
-					invalidatedSize += variable_length((struct v3_var_header *)prevOffset);
 				}
 
 				remainingEntries->setObject(entryContainer);
 			} else if (varEntry->new_state == VAR_NEW_STATE_REMOVE) {
 				if (varEntry->existing_offset) {
 					DEBUG_INFO("marking entry at offset %#lx deleted\n", varEntry->existing_offset);
-
 					invalidateOffsets[invalidateOffsetIndex++] = varEntry->existing_offset;
-					invalidatedSize += variable_length((struct v3_var_header *)varEntry->existing_offset);
 				} else {
 					DEBUG_INFO("No existing_offset , removing\n");
 				}
@@ -1297,7 +1218,7 @@ IONVRAMV3Handler::syncBlock(void)
 	require_action(_newData == true, exit, DEBUG_INFO("No _newData to sync\n"));
 	require_action(_bankSize != 0, exit, DEBUG_INFO("No nvram size info\n"));
 
-	block = (uint8_t *)IOMallocData(_bankSize);
+	block = (uint8_t *)IOMallocZeroData(_bankSize);
 
 	NVRAMREADLOCK(_variableLock);
 	remainingEntries = OSArray::withCapacity(_varEntries->getCapacity());
@@ -1340,6 +1261,10 @@ IONVRAMV3Handler::syncBlock(void)
 			DEBUG_INFO("Dropping %s\n", varEntry->header.name_data_buf);
 		}
 	}
+
+	// 0xFF out the remaining space, this will allow banks to switch between append mode and
+	// block mode if ever needed
+	memset(block + new_bank_offset, 0xFF, _bankSize - (uint32_t)new_bank_offset);
 
 	ret = _nvramController->write(0, block, _bankSize);
 	verify_noerr_action(ret, DEBUG_ERROR("w fail, ret=%#x\n", ret));

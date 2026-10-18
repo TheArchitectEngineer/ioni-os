@@ -121,7 +121,7 @@ common_hook(void)
 	return rv;
 }
 
-#if (MAC_POLICY_OPS_VERSION != 91)
+#if (MAC_POLICY_OPS_VERSION != 93)
 # error "struct mac_policy_ops doesn't match definition in mac_policy.h"
 #endif
 /*
@@ -194,7 +194,7 @@ const static struct mac_policy_ops policy_ops = {
 	.mpo_reserved16 = (mpo_reserved_hook_t *)common_hook,
 	.mpo_reserved17 = (mpo_reserved_hook_t *)common_hook,
 	.mpo_reserved18 = (mpo_reserved_hook_t *)common_hook,
-	.mpo_reserved19 = (mpo_reserved_hook_t *)common_hook,
+	CHECK_SET_HOOK(vnode_notify_will_rename_swap)
 	.mpo_reserved20 = (mpo_reserved_hook_t *)common_hook,
 	.mpo_reserved21 = (mpo_reserved_hook_t *)common_hook,
 	.mpo_reserved22 = (mpo_reserved_hook_t *)common_hook,
@@ -273,7 +273,7 @@ const static struct mac_policy_ops policy_ops = {
 	CHECK_SET_HOOK(proc_notify_exec_complete)
 	CHECK_SET_HOOK(proc_notify_cs_invalidated)
 	CHECK_SET_HOOK(proc_check_syscall_unix)
-	.mpo_reserved45 = (mpo_reserved_hook_t *)common_hook,
+	CHECK_SET_HOOK(vnode_check_lookup_postflight)
 	CHECK_SET_HOOK(proc_check_set_host_special_port)
 	CHECK_SET_HOOK(proc_check_set_host_exception_port)
 	CHECK_SET_HOOK(exc_action_check_exception_send)

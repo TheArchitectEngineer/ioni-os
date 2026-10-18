@@ -67,6 +67,7 @@
  * Version 2.0.
  */
 
+#include <stdint.h>
 #define _IP_VHL
 
 #include "tcp_includes.h"
@@ -81,6 +82,7 @@
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <os/ptrtools.h>
+#include <kern/clock.h>
 
 #include <net/route.h>
 #include <net/ntstat.h>
@@ -164,6 +166,10 @@ SYSCTL_SKMEM_TCP_INT(OID_AUTO, link_heuristics_flags,
 
 SYSCTL_SKMEM_TCP_INT(OID_AUTO, link_heuristics_rto_min,
     CTLFLAG_RW | CTLFLAG_LOCKED, int, tcp_link_heuristics_rto_min, TCP_DEFAULT_LINK_HEUR_RTOMIN,
+    "");
+
+SYSCTL_SKMEM_TCP_INT(OID_AUTO, allow_syn_prio,
+    CTLFLAG_RW | CTLFLAG_LOCKED, int, tcp_allow_syn_prio, 0,
     "");
 
 
@@ -441,6 +447,64 @@ tcp_send_ecn_flags_on_syn(struct tcpcb *tp)
 
 	return !(tp->ecn_flags & (TE_SETUPSENT | TE_ACE_SETUPSENT)) || send_on_first_retrans;
 }
+
+/*
+ * Returns the RTO deadline as future Mach time value
+ * based on the TCPT_REXMT timer, if set.
+ */
+static uint64_t
+tcp_calculate_rto_deadline(const struct tcpcb *tp, uint32_t local_tcp_now)
+{
+	uint64_t rto_val = tp->t_timer[TCPT_REXMT];
+	uint64_t rto_deadline_hz;
+	uint64_t rto_offset_hz;
+	uint64_t rto_offset_nano;
+	uint64_t rto_deadline_mach;
+	int      sojourn_factor = tcp_rto_sojourn_factor;
+
+	/*
+	 * Check whether the TCPT_REXMT timer is set.
+	 */
+	if (rto_val == 0) {
+		DTRACE_TCP3(rto_deadline, struct tcpcb *, tp, uint32_t, local_tcp_now, uint64_t, 0);
+		return 0;
+	}
+
+	/*
+	 * Check whether the TCPT_REXMT timer has already expired.
+	 */
+	rto_deadline_hz = tp->tentry.te_timer_start + rto_val;
+	if (rto_deadline_hz < local_tcp_now) {
+		DTRACE_TCP3(rto_deadline, struct tcpcb *, tp, uint32_t, local_tcp_now, uint64_t, 0);
+		return 0;
+	}
+
+	/*
+	 * Sanity check the sojourn factor
+	 */
+	if (sojourn_factor < 25) {
+		sojourn_factor = 25;
+	} else if (125 <= sojourn_factor) {
+		sojourn_factor = 125; /* For testing */
+	}
+
+	/*
+	 * Convert the retransmit timer to Mach deadline in the future.
+	 * This is done in two steps:
+	 * 1. Convert the timer value from the TCP RETRANSHZ units to
+	 *    a wall-clock timestamp (in nanosecond resolution).
+	 * 2. Convert the wall-clock timestamp to a Mach timestamp.
+	 */
+	rto_offset_hz = rto_deadline_hz - local_tcp_now;
+	rto_offset_hz = (uint64_t)((rto_offset_hz * sojourn_factor) / 100);
+	rto_offset_nano = rto_offset_hz * TCP_RETRANSHZ_TO_USEC * NSEC_PER_USEC;
+	nanoseconds_to_deadline(rto_offset_nano, &rto_deadline_mach);
+
+	DTRACE_TCP3(rto_deadline, struct tcpcb *, tp, uint32_t, local_tcp_now, uint64_t, rto_deadline_mach);
+
+	return rto_deadline_mach;
+}
+
 
 void
 tcp_set_l4s(struct tcpcb *tp, struct ifnet *ifp)
@@ -955,10 +1019,10 @@ tcp_output(struct tcpcb *tp)
 	uint64_t pacing_tx_time;
 	struct inpcb *__single inp = tp->t_inpcb;
 	struct socket *__single so = inp->inp_socket;
-	int32_t len, recwin, sendwin, off;
+	int32_t len = 0, recwin = 0, sendwin = 0, off = 0;
 	uint32_t max_len = 0;
-	uint16_t flags;
-	int error;
+	uint16_t flags = 0;
+	int error = 0;
 	mbuf_ref_t m;
 	struct ip *ip = NULL;
 	struct ip6_hdr *ip6 = NULL;
@@ -1088,8 +1152,6 @@ again:
 	rt = inp->inp_route.ro_rt;
 	if (rt != NULL && ROUTE_UNUSABLE(&tp->t_inpcb->inp_route)) {
 		struct ifnet *ifp;
-		struct in_ifaddr *ia = NULL;
-		struct in6_ifaddr *ia6 = NULL;
 		int found_srcaddr = 0;
 
 		/* disable multipages at the socket */
@@ -1101,14 +1163,16 @@ again:
 		soif2kcl(so, FALSE);
 
 		if (isipv6) {
-			ia6 = ifa_foraddr6(&inp->in6p_laddr);
+			struct in6_ifaddr *ia6 = ifa_foraddr6(&inp->in6p_laddr);
 			if (ia6 != NULL) {
 				found_srcaddr = 1;
+				ifa_remref(&ia6->ia_ifa);
 			}
 		} else {
-			ia = ifa_foraddr(inp->inp_laddr.s_addr);
+			struct in_ifaddr *ia = ifa_foraddr(inp->inp_laddr.s_addr);
 			if (ia != NULL) {
 				found_srcaddr = 1;
+				ifa_remref(&ia->ia_ifa);
 			}
 		}
 
@@ -1123,12 +1187,10 @@ again:
 			}
 
 			/*
-			 * Set retransmit  timer if it wasn't set,
 			 * reset Persist timer and shift register as the
 			 * advertised peer window may not be valid anymore
 			 */
 			if (tp->t_timer[TCPT_REXMT] == 0) {
-				tcp_set_rto(tp);
 				if (tp->t_timer[TCPT_PERSIST] != 0) {
 					tp->t_timer[TCPT_PERSIST] = 0;
 					tp->t_persist_stop = 0;
@@ -1145,18 +1207,10 @@ again:
 			if (so->so_flags & SOF_NOADDRAVAIL) {
 				tcp_drop(tp, EADDRNOTAVAIL);
 				return EADDRNOTAVAIL;
-			} else {
-				TCP_LOG_OUTPUT(tp, "no source address silently ignored");
-				tcp_check_timer_state(tp);
-				return 0; /* silently ignore, keep data in socket: address may be back */
 			}
-		}
-		if (ia != NULL) {
-			ifa_remref(&ia->ia_ifa);
-		}
 
-		if (ia6 != NULL) {
-			ifa_remref(&ia6->ia_ifa);
+			error = EADDRNOTAVAIL;
+			goto out;
 		}
 
 		/*
@@ -3234,7 +3288,7 @@ timer:
 				    tp->t_timer[TCPT_REXMT] == 0) {
 					svc_flags |= PKT_SCF_TCP_ACK;
 				}
-				if (th->th_flags & TH_SYN) {
+				if (tcp_allow_syn_prio == 1 && (th->th_flags & TH_SYN)) {
 					svc_flags |= PKT_SCF_TCP_SYN;
 				}
 			}
@@ -3302,6 +3356,14 @@ timer:
 	}
 	TCP_LOG_TH_FLAGS(isipv6 ? (void *)ip6 : (void *)ip, th, tp, true,
 	    outifp != NULL ? outifp : inp->inp_boundifp);
+
+	if (__improbable((th->th_flags & TH_RST) != 0 && inp->inp_sndinprog_cnt == 0 &&
+	    sendalot == 0 && tp->t_pktlist_head == m)) {
+		if (tcp_rst_rlc_compress(mtod(m, void *), m->m_len, th) == true) {
+			error = 0;
+			goto out;
+		}
+	}
 
 	if (link_heuristics_enabled && (tcp_link_heuristics_flags & TCP_LINK_HEUR_RXMT_COMP) != 0 &&
 	    (len != 0 || (th->th_flags & TH_FIN) != 0)) {
@@ -3420,7 +3482,11 @@ out:
 		}
 		TCP_PKTLIST_CLEAR(tp);
 
-		if (error == ENOBUFS) {
+		switch (error) {
+		case ENOBUFS:
+		case EADDRNOTAVAIL:
+		case EHOSTUNREACH:
+		case ENETDOWN:
 			/*
 			 * Set retransmit timer if not currently set
 			 * when we failed to send a segment that can be
@@ -3432,6 +3498,10 @@ out:
 			    so->so_snd.sb_cc > 0)) {
 				tcp_set_rto(tp);
 			}
+			break;
+		}
+
+		if (error == ENOBUFS) {
 			tp->snd_cwnd = tp->t_maxseg;
 			tp->t_bytes_acked = 0;
 			tcp_check_timer_state(tp);
@@ -3498,6 +3568,51 @@ out:
 }
 
 static int
+tcp_set_rto_deadline(struct tcpcb *tp, struct mbuf *pkt, int isipv6, uint32_t tcp_now_local)
+{
+	struct tcphdr *th;
+	int th_offset = isipv6 ? sizeof(struct ip6_hdr) : sizeof(struct ip);
+
+	/*
+	 * Determine whether the RTO should be set
+	 */
+	if (tp->t_timer[TCPT_REXMT] == 0) {
+		/*
+		 * RTO is not set for the TP, can not set
+		 * the deadline.
+		 */
+		return ENOENT;
+	}
+
+	/*
+	 * RTO deadline is not applicable to pure ACK packets,
+	 * as well as to the SYN/RST/FIN packets.
+	 */
+	th = (struct tcphdr *)(void*)(mtod(pkt, caddr_t) + th_offset);
+
+	/*
+	 * Check whether the packet has any TCP payload, or is a pure ACK.
+	 */
+	if (pkt->m_pkthdr.len <= th_offset + (th->th_off << 2)) {
+		return ENOENT;
+	}
+
+	/*
+	 * Check whether this is an SYN/RST/FIN packet
+	 */
+	if ((th->th_flags & (TH_SYN | TH_RST | TH_FIN)) != 0) {
+		return ENOENT;
+	}
+
+	/*
+	 * Set the deadline.
+	 */
+	pkt->m_pkthdr.pkt_deadline = tcp_calculate_rto_deadline(tp, tcp_now_local);
+
+	return 0;
+}
+
+static int
 tcp_ip_output(struct socket *so, struct tcpcb *tp, struct mbuf *pkt,
     int cnt, struct mbuf *opt, int flags, int sack_in_progress, boolean_t isipv6)
 {
@@ -3509,6 +3624,7 @@ tcp_ip_output(struct socket *so, struct tcpcb *tp, struct mbuf *pkt,
 	struct ifnet *__single outif = NULL;
 	bool check_qos_marking_again = (so->so_flags1 & SOF1_QOSMARKING_POLICY_OVERRIDE) ? FALSE : TRUE;
 	bool fadv_congested = FALSE;
+	uint32_t tcp_now_local = os_access_once(tcp_now);
 
 	union {
 		struct route _ro;
@@ -3684,6 +3800,13 @@ tcp_ip_output(struct socket *so, struct tcpcb *tp, struct mbuf *pkt,
 
 	while (pkt != NULL) {
 		struct mbuf *npkt = pkt->m_nextpkt;
+
+		/*
+		 * If enabled, set the RTO deadline for the packet.
+		 */
+		if (tcp_use_rto_deadline) {
+			tcp_set_rto_deadline(tp, pkt, isipv6, tcp_now_local);
+		}
 
 		if (!chain) {
 			pkt->m_nextpkt = NULL;
