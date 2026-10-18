@@ -50,7 +50,10 @@ fi
 # ARM64 link needs sptm/txm platform libs from the KDK
 case " $ARCH_CONFIGS " in
 *" ARM64 "*)
-        if [ -z "${KDKROOT:-}" ] || [ ! -d "${KDKROOT:-/nonexistent}" ]; then
+        : "${KDK_VERSION:=26.5}"
+        : "${KDK_BUILD:=25F71}"
+        : "${KDKROOT:=/Library/Developer/KDKs/KDK_${KDK_VERSION}_${KDK_BUILD}.kdk}"
+        if [ ! -d "$KDKROOT" ]; then
                 echo "build: KDK required for ARM64, running deps.sh with IONI_KDK=1"
                 IONI_KDK=1 FAKEROOT="$(pwd)/$FAKEROOT" sh ./scripts/deps.sh
         fi
