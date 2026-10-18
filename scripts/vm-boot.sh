@@ -29,8 +29,11 @@ mkdir -p "$(dirname "$LOG")"
 say "kernel: $KERNEL"
 ls -lh "$KERNEL"
 
-brew install -q tart >/dev/null 2>&1 && say "tart installed"
-brew install -q cirruslabs/cli/sshpass >/dev/null 2>&1 && say "sshpass installed"
+brew install -q cirruslabs/cli/tart >/dev/null 2>&1 || true
+brew install -q cirruslabs/cli/sshpass >/dev/null 2>&1 || true
+command -v tart >/dev/null 2>&1 || { say "tart not installed"; exit 1; }
+command -v sshpass >/dev/null 2>&1 || { say "sshpass not installed"; exit 1; }
+say "tart $(tart --version 2>/dev/null | head -n 1)"
 
 security create-keychain -p "$PASS" login.keychain >/dev/null 2>&1 || true
 security unlock-keychain -p "$PASS" login.keychain >/dev/null 2>&1 || true

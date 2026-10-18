@@ -33,18 +33,23 @@ clone() {
 }
 
 xb() {
-        _src="$1"; _proj="$2"; _target="$3"; _name="$4"
+        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
+        if [ $# -gt 5 ]; then shift 5; else shift $#; fi
         # strip Apple-internal xcconfig includes (CoreOS/*) missing from public Xcode
         find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         cd "$_src"
+        _rc=0
         env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
                 ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" CODE_SIGN_IDENTITY="-" \
                 OBJROOT="$BUILD_DIR/obj.$_name" \
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
-                RC_ProjectNameAndSourceVersion="$_name"
+                RC_ProjectNameAndSourceVersion="$_name" \
+                HEADER_SEARCH_PATHS="$(inherited) $FAKEROOT/usr/local/include $_extra" \
+                "$@" || _rc=$?
         cd "$REPO_ROOT"
+        return $_rc
 }
 
 try() {
@@ -64,6 +69,10 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
         ditto "$DEPS_DIR/libplatform/include" "$FAKEROOT/usr/local/include"
         ditto "$DEPS_DIR/libplatform/private" "$FAKEROOT/usr/local/include"
+        clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        ditto "$DEPS_DIR/libpthread/private" "$FAKEROOT/usr/local/include"
+        mkdir -p "$FAKEROOT/usr/local/include/os"
+        cp "$REPO_ROOT/libkern/os/base_private.h" "$FAKEROOT/usr/local/include/os/"
         log "libplatform headers: ok"
 else
         log "libplatform headers: cached"
@@ -93,7 +102,8 @@ try libpthread build_libpthread
 
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
-        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc
+        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc "" \
+                'OTHER_CFLAGS=$(inherited) -fbounds-safety'
 }
 try libmalloc build_libmalloc
 
@@ -105,7 +115,7 @@ try libclosure build_libclosure
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
-        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch
+        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch "$DEPS_DIR/libdispatch"
 }
 try libdispatch build_libdispatch
 
