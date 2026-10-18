@@ -170,6 +170,13 @@ cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/spawn_private.h" 2>/dev/nul
 cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/sys/spawn_internal.h" 2>/dev/null || true
 # remaining libkern os headers (log_private and friends) the Libc sources expect
 cp "$REPO_ROOT"/libkern/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
+# mach eventlink types and disklabel, kernel-user headers the SDK omits
+cp "$REPO_ROOT/osfmk/mach/mach_eventlink_types.h" "$FROOT_INC/mach/" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/disklabel.h" "$FROOT_INC/sys/" 2>/dev/null || true
+# pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
+# includes <pthread/priority_private.h> which Apple ships only in the internal SDK
+mkdir -p "$FROOT_INC/pthread"
+cp "$REPO_ROOT/bsd/pthread/priority_private.h" "$FROOT_INC/pthread/priority_private.h" 2>/dev/null || true
 # libproc SPI: Apple-internal declarations, SDK libproc.h misses them
 if [ ! -f "$FROOT_INC/libproc_internal.h" ]; then
 cat > "$FROOT_INC/libproc_internal.h" <<'EOF'
@@ -197,6 +204,9 @@ cat > "$FROOT_INC/os/alloc_once_private.h" <<'EOF'
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD 61
 #endif
+#ifndef OS_ALLOC_ONCE_KEY_OS_TRACE
+#define OS_ALLOC_ONCE_KEY_OS_TRACE 62
+#endif
 #endif
 EOF
 fi
@@ -208,13 +218,13 @@ cat > "$FROOT_INC/os/feature_private.h" <<'EOF'
 #include <sys/types.h>
 #include <stdbool.h>
 static __inline bool
-os_feature_enabled_simple_impl(const void *lib, const char *feature, bool fallback)
+os_feature_enabled_simple_impl(const char *lib, const char *feature, bool fallback)
 {
         (void)lib; (void)feature;
         return fallback;
 }
 #define os_feature_enabled_simple(lib, name, fallback) \
-        os_feature_enabled_simple_impl((lib), #name, (fallback))
+        os_feature_enabled_simple_impl(#lib, #name, (fallback))
 #endif
 EOF
 fi
@@ -252,6 +262,9 @@ build_libpthread() {
         # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
         # has no THREAD_QOS graph - inject the constants through build settings
         xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t'
+        # priority_private.h rides on the qos constants above; place it on the
+        # pthread -I chain where qos_private.h expects it
+        cp "$REPO_ROOT/bsd/pthread/priority_private.h" "$DEPS_DIR/libpthread/private/pthread/priority_private.h" 2>/dev/null || true
         xb "$DEPS_DIR/libpthread" libpthread.xcodeproj libsystem_pthread pthread
 }
 try libpthread build_libpthread
@@ -318,6 +331,10 @@ build_libdispatch() {
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
 #include <time.h>
+/* firehose targets build with restrictive POSIX levels - lift them */
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
