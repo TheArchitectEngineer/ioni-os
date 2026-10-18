@@ -72,10 +72,6 @@ xb() {
         else
                 find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         fi
-        # the Xcode-shipped CoreOS xcconfig carries -Werror and -Wundef-prefix -
-        # cancel via leaf appends; SPI_AVAILABLE is Apple-internal, SDK lacks it
-        xcset "$_src" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
-        xcset "$_src" OTHER_CFLAGS '-Wno-error'
         strip_tree "$_src"
         cd "$_src"
         # fakeroot headers ride in via CPATH (clang-native), project search paths stay untouched
@@ -220,15 +216,23 @@ log "kernel header shims: ok"
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # the Xcode-shipped CoreOS xcconfig carries -Werror - cancel via leaf appends
+        xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error'
         # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
         # has no THREAD_QOS graph - inject the constants through build settings
-        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7'
+        xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t'
         xb "$DEPS_DIR/libpthread" libpthread.xcodeproj libsystem_pthread pthread
 }
 try libpthread build_libpthread
 
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
+        xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
+        if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
+                perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
+        fi
         xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc
 }
 try libmalloc build_libmalloc
@@ -247,6 +251,15 @@ if [ -f "$DEPS_DIR/libclosure/Block.h" ] && [ -f "$FROOT_INC/Block_private.h" ] 
         sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/Block.h" 2>/dev/null || true
         perl -0777 -pi -e "$STRIP_UNAVAIL" "$FROOT_INC/Block.h" 2>/dev/null || true
         log "Block.h shipped to fakeroot"
+fi
+# the consumer pulls our Block_private.h via CPATH but <Block.h> may resolve to a
+# different vintage through project search paths - pin the export macro ourselves
+if [ -f "$FROOT_INC/Block_private.h" ] \
+        && ! head -5 "$FROOT_INC/Block_private.h" | grep -q BLOCK_EXPORT; then
+        printf '#ifndef BLOCK_EXPORT\n#if defined(__cplusplus)\n#define BLOCK_EXPORT extern "C"\n#else\n#define BLOCK_EXPORT extern\n#endif\n#endif\n' \
+                | cat - "$FROOT_INC/Block_private.h" > "$FROOT_INC/Block_private.h.ioni" \
+                && mv "$FROOT_INC/Block_private.h.ioni" "$FROOT_INC/Block_private.h"
+        log "Block_private.h BLOCK_EXPORT pinned"
 fi
 
 build_libdispatch() {
@@ -268,7 +281,13 @@ build_libdispatch() {
 #define __OS_WORKGROUP_PRIVATE_INDIRECT__ 1
 #endif
 #include <dispatch/base.h>
+#include <mach/mach_time.h>
+/* mach clock SPI the SDK headers no longer declare */
+extern kern_return_t mach_get_times(uint64_t *absolute_time,
+        uint64_t *continuous_time, struct timespec *tp);
 EOF
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
+        xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
@@ -279,12 +298,16 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c
 }
 try libc_static build_libc_static
 
 build_libsystem_c() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c
 }
 try libsystem_c build_libsystem_c
