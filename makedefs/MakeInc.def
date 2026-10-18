@@ -250,6 +250,8 @@ WARNFLAGS_STD := $(WARNFLAGS_STD) \
 # bsd sysctl dispatch, nrvo in iokit C++ return paths
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wno-error=void-pointer-to-enum-cast \
+	-Wno-error=void-pointer-to-int-cast \
+	-Wno-error=implicit-fallthrough \
 	-Wno-error=nrvo
 # Opt-ins:
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
