@@ -185,6 +185,10 @@ cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null |
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
 cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
+# posix1e acl support references the closed membership framework header
+if [ ! -f "$FROOT_INC/membershipPriv.h" ]; then
+printf '/* Ioni: membership framework surface (declarations resolve at link) */\n#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <sys/types.h>\n#include <uuid/uuid.h>\nint mbr_uid_to_uuid(uid_t id, uuid_t uu);\nint mbr_gid_to_uuid(gid_t id, uuid_t uu);\nint mbr_uuid_to_uuid(const uuid_t uu, uuid_t suu);\nint mbr_check_membership(const uuid_t user, uuid_t group, int *ismember);\n#endif\n' > "$FROOT_INC/membershipPriv.h"
+fi
 # work intervals/personas: the shared headers hide the Libsyscall interface
 # behind #if PRIVATE - lift it for the vendored copies
 for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h"; do
@@ -326,9 +330,7 @@ try libpthread build_libpthread
 
 # dispatch workgroups drive the newer work interval instance SPI whose header
 # is internal - stand in the declarations the TU chain needs
-if ! grep -q "IONI_WORK_INTERVAL_INSTANCE" "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h"; then
-cat >> "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h" <<'EOF'
-
+cat > "$BUILD_DIR/work_interval_instance_ioni.h" <<'EOF'
 /* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
 struct work_interval_data { uint64_t _ioni_fields[8]; };
 typedef struct work_interval_instance *work_interval_instance_t;
@@ -344,7 +346,11 @@ int work_interval_instance_set_deadline(work_interval_instance_t wil, uint64_t d
 int work_interval_instance_set_complexity(work_interval_instance_t wil, uint64_t complexity);
 int work_interval_instance_get_telemetry_data(work_interval_instance_t wil, void *data, size_t size);
 EOF
-fi
+for _wgh in "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h" "$FROOT_INC/pthread/workgroup_private.h"; do
+        if [ -f "$_wgh" ] && ! grep -q "IONI_WORK_INTERVAL_INSTANCE" "$_wgh"; then
+                cat "$BUILD_DIR/work_interval_instance_ioni.h" >> "$_wgh"
+        fi
+done
 
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
@@ -358,7 +364,7 @@ build_libmalloc() {
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
         # voucher.c needs the private proc info structs the public header dropped
         if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
-                perl -pi -e 's{^(#include <sys/proc_info\.h>)$}{$1\n#include <sys/proc_info_private.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
+                perl -pi -e 's{^(#include <sys/proc_info\.h>)$}{$1\n#include <sys/proc_info_private.h>\n#include <sys/persona.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
         fi
         # xzone wakes waiters through ulocks; the TU misses the include
         if ! grep -q "include <sys/ulock.h>" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"; then
