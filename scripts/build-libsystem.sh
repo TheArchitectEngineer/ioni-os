@@ -66,7 +66,7 @@ xcset() {
 }
 
 xb() {
-        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
+        _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"; _xbs="${6:-}"
         # drop Apple-internal xcconfig includes, keep ones shipped with Xcode
         DEVDIR="$(xcode-select -p 2>/dev/null || true)"
         if [ -n "$DEVDIR" ] && [ -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
@@ -85,6 +85,7 @@ xb() {
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
                 ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" CODE_SIGN_IDENTITY="-" \
                 GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+                $_xbs \
                 OBJROOT="$BUILD_DIR/obj.$_name" \
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
@@ -152,6 +153,11 @@ cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || tr
 cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$FROOT_INC/i386/" 2>/dev/null || true
 clone dyld "$DYLD_TAG" "$DEPS_DIR/dyld"
 cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2>/dev/null || true
+# Libc is newer than the opensource dyld tag - add the version constants it uses
+if [ -f "$FROOT_INC/mach-o/dyld_priv.h" ] \
+        && ! grep -q DYLD_MACOSX_VERSION_15_4 "$FROOT_INC/mach-o/dyld_priv.h"; then
+printf '\n#ifndef DYLD_MACOSX_VERSION_15_4\n#define DYLD_MACOSX_VERSION_15_4 0x000F0400\n#endif\n' >> "$FROOT_INC/mach-o/dyld_priv.h"
+fi
 # malloc/pthread/Libc cross-headers absent from the SDK
 clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
 clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
@@ -202,11 +208,13 @@ cat > "$FROOT_INC/os/feature_private.h" <<'EOF'
 #include <sys/types.h>
 #include <stdbool.h>
 static __inline bool
-os_feature_enabled_simple(const void *lib, const char *feature, bool fallback)
+os_feature_enabled_simple_impl(const void *lib, const char *feature, bool fallback)
 {
         (void)lib; (void)feature;
         return fallback;
 }
+#define os_feature_enabled_simple(lib, name, fallback) \
+        os_feature_enabled_simple_impl((lib), #name, (fallback))
 #endif
 EOF
 fi
@@ -256,6 +264,8 @@ build_libmalloc() {
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 perl -pi -e 's{^#include <corecrypto/ccsha2\.h>$}{#if __has_include(<corecrypto/ccsha2.h>)\n#include <corecrypto/ccsha2.h>\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
         fi
+        # every malloc target variant must default the atomic config itself
+        perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
         xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj libmalloc malloc
 }
 try libmalloc build_libmalloc
@@ -311,11 +321,17 @@ build_libdispatch() {
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
+extern int kdebug_trace(uint32_t code, uint64_t a, uint64_t b,
+        uint64_t c, uint64_t d);
 /* mach message aux header, kernel-user shared struct from our xnu */
 typedef struct {
         uint32_t        msgdh_size;
         uint32_t        msgdh_reserved;
 } mach_msg_aux_header_t;
+/* set by the internal Apple build outside the opensource tree */
+#ifndef DISPATCH_SEND_ACTIVITY_IN_MSGV
+#define DISPATCH_SEND_ACTIVITY_IN_MSGV 1
+#endif
 EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
@@ -323,7 +339,8 @@ EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
                 -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +
-        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch "$DEPS_DIR/libdispatch"
+        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch \
+                "$DEPS_DIR/libdispatch" "" 'GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
 }
 try libdispatch build_libdispatch
 
