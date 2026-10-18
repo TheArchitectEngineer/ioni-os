@@ -155,8 +155,8 @@ clone dyld "$DYLD_TAG" "$DEPS_DIR/dyld"
 cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2>/dev/null || true
 # Libc is newer than the opensource dyld tag - add the version constants it uses
 if [ -f "$FROOT_INC/mach-o/dyld_priv.h" ] \
-        && ! grep -q DYLD_MACOSX_VERSION_15_4 "$FROOT_INC/mach-o/dyld_priv.h"; then
-printf '\n#ifndef DYLD_MACOSX_VERSION_15_4\n#define DYLD_MACOSX_VERSION_15_4 0x000F0400\n#endif\n' >> "$FROOT_INC/mach-o/dyld_priv.h"
+        && ! grep -q "dyld_platform_version_macOS_13_0" "$FROOT_INC/mach-o/dyld_priv.h"; then
+printf '\n/* Ioni: platform version constants from newer dyld_priv.h */\n#ifndef dyld_platform_version_macOS_11_0\n#define dyld_platform_version_macOS_11_0 0x000B0000\n#define dyld_platform_version_macOS_12_0 0x000C0000\n#define dyld_platform_version_macOS_13_0 0x000D0000\n#define dyld_platform_version_macOS_14_0 0x000E0000\n#define dyld_platform_version_macOS_15_0 0x000F0000\n#endif\n' >> "$FROOT_INC/mach-o/dyld_priv.h"
 fi
 # malloc/pthread/Libc cross-headers absent from the SDK
 clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
@@ -274,6 +274,15 @@ build_libpthread() {
         # priority_private.h rides on the qos constants above; place it on the
         # pthread -I chain where qos_private.h expects it
         cp "$REPO_ROOT/bsd/pthread/priority_private.h" "$DEPS_DIR/libpthread/private/pthread/priority_private.h" 2>/dev/null || true
+        # qos.c needs the priority encoding inlines unconditionally - append the
+        # header content minus its include guard so no outer #if can hide it
+        if ! grep -q "IONI_PRIORITY_INLINES" "$DEPS_DIR/libpthread/private/pthread/qos_private.h"; then
+                printf '\n/* IONI_PRIORITY_INLINES: priority_private.h content, guard-free */\n' \
+                        >> "$DEPS_DIR/libpthread/private/pthread/qos_private.h"
+                grep -v "_PTHREAD_PRIORITY_PRIVATE_H_" \
+                        "$DEPS_DIR/libpthread/private/pthread/priority_private.h" \
+                        >> "$DEPS_DIR/libpthread/private/pthread/qos_private.h"
+        fi
         xb "$DEPS_DIR/libpthread" libpthread.xcodeproj libsystem_pthread pthread
 }
 try libpthread build_libpthread
@@ -353,7 +362,7 @@ build_libdispatch() {
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
 #endif
-extern uint64_t clock_gettime_nsec_np(clockid_t __clock_id);
+extern uint64_t clock_gettime_nsec_np(unsigned int __clock_id);
 /* mach clock SPI the SDK headers no longer declare */
 extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
