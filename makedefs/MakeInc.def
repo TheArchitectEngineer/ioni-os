@@ -245,6 +245,12 @@ WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wno-ms-bitfield-padding \
 	-Wno-unnecessary-virtual-specifier \
 	-Wno-unused-but-set-variable
+
+# new diagnostics from public Xcode 26.6 clang: void* to enum casts in the
+# bsd sysctl dispatch, nrvo in iokit C++ return paths
+WARNFLAGS_STD := $(WARNFLAGS_STD) \
+	-Wno-error=void-pointer-to-enum-cast \
+	-Wno-error=nrvo
 # Opt-ins:
 WARNFLAGS_STD := $(WARNFLAGS_STD) \
 	-Wpointer-arith \
