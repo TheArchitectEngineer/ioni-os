@@ -163,7 +163,8 @@ install_kdk() {
         log "kdk: platform libs:"
         ls -l "$KDKROOT/usr/local/lib/kernel/platform" 2>/dev/null || true
         for A in $(find "$KDKROOT" -name "*.a" 2>/dev/null); do
-                _hits=$(nm -gU "$A" 2>/dev/null | grep -E "(_tb_client_connection_create|_ledger_tab_open|_KHEAP_DATA_PRIVATE|_free_debug_state)$" || true)
+                _hits=$(nm -arch arm64e -gU "$A" 2>/dev/null | grep -E "(_tb_client_connection_create|_ledger_tab_open|_KHEAP_DATA_PRIVATE|_free_debug_state|_vm_page_insert_flush_accounting)$" || true)
+                [ -z "$_hits" ] && _hits=$(nm -gU "$A" 2>/dev/null | grep -E "(_tb_client_connection_create|_ledger_tab_open|_KHEAP_DATA_PRIVATE|_free_debug_state|_vm_page_insert_flush_accounting)$" || true)
                 [ -n "$_hits" ] && log "kdk: symbols in ${A#"$KDKROOT"}:"
                 [ -n "$_hits" ] && log "$_hits"
         done || true
