@@ -17,7 +17,7 @@ fi
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/BUILD}"
 FAKEROOT="${FAKEROOT:-$BUILD_DIR/fakeroot}"
 DEPS_DIR="${DEPS_DIR:-$BUILD_DIR/deps}"
-DEPS_ARCHS="${DEPS_ARCHS:-x86_64 arm64}"
+DEPS_ARCHS="${DEPS_ARCHS:-x86_64 arm64 arm64e}"
 LIBDISPATCH_TAG="${LIBDISPATCH_TAG:-libdispatch-1542.100.32}"
 LIBPLATFORM_TAG="${LIBPLATFORM_TAG:-libplatform-375.120.2}"
 BOOTSTRAP_CMDS_TAG="${BOOTSTRAP_CMDS_TAG:-bootstrap_cmds-138}"
@@ -158,6 +158,15 @@ install_kdk() {
         hdiutil detach '/Volumes/Kernel Debug Kit' -quiet
         rm -f /tmp/KDK.dmg
         log "kdk: installed $KDKROOT"
+        log "kdk: KernelSupport contents:"
+        ls -l "$KDKROOT/System/Library/KernelSupport" 2>/dev/null || true
+        log "kdk: platform libs:"
+        ls -l "$KDKROOT/usr/local/lib/kernel/platform" 2>/dev/null || true
+        for A in "$KDKROOT"/System/Library/KernelSupport/*.a "$KDKROOT"/usr/local/lib/kernel/platform/*.a; do
+                [ -f "$A" ] || continue
+                _hits=$(nm -gU "$A" 2>/dev/null | grep -E "(_tb_client_connection_create|_ledger_tab_open|_KHEAP_DATA_PRIVATE|_free_debug_state)$" || true)
+                [ -n "$_hits" ] && log "kdk: symbols in $(basename "$A"): $_hits"
+        done || true
 }
 
 build_kernel_hdrs
