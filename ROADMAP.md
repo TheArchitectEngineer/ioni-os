@@ -2,6 +2,10 @@
 
 The plan of record for Ioni: big milestones first, smaller steps between them.
 
+Primary target: **x86_64 (PC hardware)**. ARM64 is paused as a product target; the tart guest (arm64-only by nature of Virtualization.framework) stays as the kernel boot/test vehicle — it is the fastest known path to boot and validate a custom XNU.
+
+Основная цель — **x86_64 (ПК)**. ARM64 как продуктовая цель на паузе; tart-гость (Virtualization.framework бывает только arm64) остаётся тестовым стендом — это самый короткий известный путь загрузить и проверить кастомный XNU.
+
 ## Stage 0 — Foundation
 
 - [x] Import the XNU source base (upstream: [apple-oss-distributions/xnu](https://github.com/apple-oss-distributions/xnu))
@@ -15,8 +19,9 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 - [x] Dependency chain in CI: fakeroot with exported kernel headers, libplatform headers and libdispatch firehose (mig/ctf only when Xcode lacks them)
 - [x] Full x86_64 kernel build on CI — `kernel-RELEASE-X86_64` artifact on every run
 - [x] ARM64 kernel link - RELEASE VMAPPLE kernel links in CI with KDK 26.5 (tree pinned to xnu-12377.121.6, libVMAPPLE.os.release.a force-loaded from KDK)
-- [ ] Kernel collection (kmutil create) for VM boot - experimental, host-KDK version matching in CI
-- [ ] Kernel boots in a VM with serial console output - tart/VZ job in CI, next: recoveryOS security policy automation or in-guest KC
+- [ ] Kernel collection (kmutil create) for VM boot - built in-guest by the boot job (KDK 26.5 inside the guest, kext list from the guest's own system), uploaded as the `ioni-kc-ARM64` artifact
+- [ ] Kernel boots in a VM with serial console output - tart guest (macOS 26), in-guest `kmutil create` + `kmutil configure-boot`; VZ guests since macOS 14.4 boot custom KCs without iBoot patches
+- [ ] x86_64 boot track (PC): QEMU/OVMF + OpenCore-style loader for the x86_64 kernel collection
 
 ## Stage 2 — Minimal userland
 
@@ -24,7 +29,7 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 - [x] POSIX shell with builtins: cd / echo / pwd / env / exit (`userland/ionish`)
 - [x] Rootfs layout and HFS+ image builder (`scripts/rootfs.sh`), CI artifact
 - [x] libsyscall from the Ioni kernel sources built into the fakeroot (xnu_libraries)
-- [ ] libSystem / libc built from source against the Ioni kernel - open parts (libpthread, libmalloc, libclosure, libdispatch) scaffolded in CI, Apple-internal CoreOS xcconfig includes stripped; full chain needs the closed-source pieces
+- [ ] libSystem / libc built from source against the Ioni kernel - libsyscall, libpthread, libmalloc, libclosure, libdispatch built in CI; Libc-1752.120.2 (libc_static, libsystem_c) scaffolded in the same chain; full chain needs the closed-source pieces
 - [ ] dyld - blocked on liblibc*.a archives (Libc + libmalloc liblibc target), next wave
 - [ ] Shell and BSD utilities on top of the native libc
 - [ ] Bootable image: kernel + rootfs in a VM
@@ -53,9 +58,9 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 **Этап 0 — фундамент** (готово): база XNU импортирована, поверхностный ребрендинг применён — система отвечает `Ioni` в `uname` и в баннере загрузки.
 
-**Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; ARM64-линковка закрыта: VMAPPLE-ядро собирается в CI с KDK 26.5 (дерево запиновано на xnu-12377.121.6); осталось — сборка kernel collection (kmutil) и загрузка в ВМ (tart-джоба в CI, дальше — автоматизация security policy).
+**Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; ARM64-линковка закрыта: VMAPPLE-ядро собирается в CI с KDK 26.5 (дерево запиновано на xnu-12377.121.6); осталось — kernel collection собирается прямо в tart-госте его собственным kmutil (KDK 26.5 в госте, kext-база гостя) и уезжает артефактом, затем configure-boot и перезагрузка гостя; VZ-гости с macOS 14.4 грузят кастомные KC без патчей iBoot. Параллельный трек — x86_64-загрузка на ПК (QEMU/OVMF + OpenCore).
 
-**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall уже собирается в fakeroot; дальше — open-части Libsystem (каркас в CI), dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
+**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall уже собирается в fakeroot; дальше — open-части Libsystem (libpthread/libmalloc/libclosure/libdispatch зелёные, Libc-1752.120.2 в каркасе), dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
 
 **Этап 3 — Homebrew**: портирование пакетного менеджера и собственный tap.
 
