@@ -12,8 +12,9 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 - [x] Build scripts and CI: GitHub Actions (macos-26 runners, Xcode 26.6)
 - [x] Header export pipeline green on CI (`exporthdrs` for ARM64 + X86_64)
-- [ ] Dependency chain in CI: mig (bootstrap_cmds), ctf tools (dtrace), libplatform, libdispatch (firehose)
-- [ ] Full kernel build on CI — x86_64 first; ARM64 link needs KDK machine libraries
+- [x] Dependency chain in CI: fakeroot with exported kernel headers, libplatform headers and libdispatch firehose (mig/ctf only when Xcode lacks them)
+- [x] Full x86_64 kernel build on CI — `kernel-RELEASE-X86_64` artifact on every run
+- [ ] ARM64 kernel link (needs KDK machine libraries: sptm/txm)
 - [ ] Kernel boots in a VM with serial console output
 
 ## Stage 2 — Minimal userland
@@ -50,7 +51,7 @@ The plan of record for Ioni: big milestones first, smaller steps between them.
 
 **Этап 0 — фундамент** (готово): база XNU импортирована, поверхностный ребрендинг применён — система отвечает `Ioni` в `uname` и в баннере загрузки.
 
-**Этап 1 — собираемое ядро**: скрипты сборки и CI готовы, экспорт заголовков зелёный на CI; дальше — цепочка зависимостей (mig, ctf, libdispatch) и полная линковка ядра (x86_64 сначала, ARM64 требует KDK).
+**Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; осталось — ARM64-линковка (нужны машинные библиотеки из KDK) и загрузка ядра в ВМ.
 
 **Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; дальше — собственная libc (Libsystem), dyld, BSD-утилиты и загружаемый образ с ядром.
 
