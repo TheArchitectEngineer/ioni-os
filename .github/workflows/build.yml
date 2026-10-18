@@ -110,6 +110,27 @@ jobs:
           path: BUILD/vm-boot.log
           if-no-files-found: warn
 
+  libsystem:
+    name: libsystem chain (experimental)
+    runs-on: macos-26
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build open libs
+        run: ./scripts/build-libsystem.sh
+
+      - name: upload fakeroot libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsystem-fakeroot
+          path: |
+            BUILD/fakeroot/usr/**/*.a
+            BUILD/fakeroot/usr/**/*.dylib
+            BUILD/fakeroot/usr/**/*.tbd
+          if-no-files-found: warn
+
   userland:
     name: userland init + ionish
     runs-on: macos-26
