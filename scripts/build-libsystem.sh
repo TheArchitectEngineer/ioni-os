@@ -156,6 +156,7 @@ cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2
 clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
 clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
 cp "$DEPS_DIR/libmalloc/private/stack_logging.h" "$FROOT_INC/" 2>/dev/null || true
+cp "$DEPS_DIR/libmalloc/private/malloc_private.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
 # spawn SPI: kernel-user shared header from our xnu, the SDK ships only the public half
@@ -303,6 +304,7 @@ build_libdispatch() {
 #define __OS_WORKGROUP_PRIVATE_INDIRECT__ 1
 #endif
 #include <Availability.h>
+#include <os/availability.h>
 #include <dispatch/base.h>
 #include <mach/mach_time.h>
 #include <time.h>
