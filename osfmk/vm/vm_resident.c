@@ -61,7 +61,6 @@
  *
  *	Resident memory management module.
  */
-#include <AppleFeatures.h>
 #include <debug.h>
 #include <libkern/OSDebug.h>
 
