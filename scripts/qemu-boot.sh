@@ -36,15 +36,70 @@ else
     echo "qemu-boot: boot-args: loader default (-v debug=0x219 keepsyms=1 serial=3)"
 fi
 
-OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}"
-OVMF_VARS_SRC="${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}"
+OVMF_CODE="${OVMF_CODE:-}"
+OVMF_VARS_SRC="${OVMF_VARS:-}"
 
-if [ ! -f "$OVMF_CODE" ]; then
-    echo "qemu-boot: OVMF firmware not found: $OVMF_CODE" >&2
-    exit 2
+find_ovmf_code() {
+    for c in /usr/share/OVMF/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE_4M.fd \
+             /usr/share/ovmf/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE_4M.ms.fd; do
+        [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+find_ovmf_vars() {
+    for c in /usr/share/OVMF/OVMF_VARS.fd \
+             /usr/share/OVMF/OVMF_VARS_4M.fd \
+             /usr/share/ovmf/OVMF_VARS.fd \
+             /usr/share/OVMF/OVMF_VARS_4M.ms.fd; do
+        [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+find_ovmf_combined() {
+    for c in /usr/share/OVMF/OVMF.fd \
+             /usr/share/ovmf/OVMF.fd \
+             /usr/share/qemu/OVMF.fd; do
+        [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+PFLASH_ARGS=""
+if [ -z "$OVMF_CODE" ] && [ -z "$OVMF_VARS_SRC" ]; then
+    if CODE=$(find_ovmf_code) && VARS=$(find_ovmf_vars); then
+        OVMF_CODE="$CODE"
+        OVMF_VARS_SRC="$VARS"
+    elif COMBINED=$(find_ovmf_combined); then
+        OVMF_CODE=""
+        PFLASH_ARGS="-bios $COMBINED"
+        echo "qemu-boot: using combined OVMF via -bios: $COMBINED"
+    fi
 fi
 
-cp "$OVMF_VARS_SRC" "$OUT_DIR/OVMF_VARS.fd"
+if [ -n "$OVMF_CODE" ]; then
+    if [ ! -f "$OVMF_CODE" ]; then
+        echo "qemu-boot: OVMF firmware not found: $OVMF_CODE" >&2
+        ls /usr/share/OVMF /usr/share/ovmf 2>/dev/null || true
+        exit 2
+    fi
+    if [ -z "$OVMF_VARS_SRC" ] || [ ! -f "$OVMF_VARS_SRC" ]; then
+        echo "qemu-boot: OVMF vars not found: $OVMF_VARS_SRC" >&2
+        exit 2
+    fi
+    cp "$OVMF_VARS_SRC" "$OUT_DIR/OVMF_VARS.fd"
+    PFLASH_ARGS="-drive if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE -drive if=pflash,format=raw,unit=1,file=$OUT_DIR/OVMF_VARS.fd"
+    echo "qemu-boot: OVMF code=$OVMF_CODE vars=$OVMF_VARS_SRC"
+fi
+
+if [ -z "$PFLASH_ARGS" ]; then
+    echo "qemu-boot: no OVMF firmware found on this system" >&2
+    ls /usr/share/OVMF /usr/share/ovmf /usr/share/qemu 2>/dev/null || true
+    exit 2
+fi
 
 echo "qemu-boot: starting qemu (tcg, timeout ${QEMU_TIMEOUT}s)"
 set +e
@@ -57,8 +112,7 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -monitor none \
     -no-reboot \
     -serial "file:$SERIAL_LOG" \
-    -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,unit=1,file=$OUT_DIR/OVMF_VARS.fd" \
+    $PFLASH_ARGS \
     -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
     > "$OUT_DIR/qemu-stdout.log" 2>&1
 QEMU_RC=$?
