@@ -15,6 +15,7 @@ LIBMALLOC_TAG="${LIBMALLOC_TAG:-libmalloc-812.100.31}"
 LIBCLOSURE_TAG="${LIBCLOSURE_TAG:-libclosure-96}"
 LIBDISPATCH_TAG="${LIBDISPATCH_TAG:-libdispatch-1542.100.32}"
 LIBC_TAG="${LIBC_TAG:-Libc-1752.120.2}"
+DYLD_TAG="${DYLD_TAG:-dyld-1378}"
 
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
@@ -32,10 +33,11 @@ clone() {
         fi
 }
 
-# strip clang bounds-safety annotations (closed toolchain), keep availability args intact:
-# bridgeos/driverkit are only removed when they carry a numeric version arg -
-# bare names inside macro parameter lists (e.g. DISPATCH_OSX_SUPPORTS_AT_LEAST) stay
-STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g'
+# strip clang bounds-safety annotations (closed toolchain) and map internal
+# availability domains to public SDK ones: the public SDK ships visionos, not xros,
+# so 'xros(1.1)' in Apple opensource headers must become 'visionos(1.1)';
+# bare names inside macro parameter lists stay untouched
+STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\)//g; s/__ended_by\([^()]*\)//g; s/__ending_in\([^()]*\)//g; s/__unsafe_forge_bidi_indexable\([^()]*\)//g; s/__unsafe_forge_single\([^()]*\)//g; s/__sized_by\([^()]*\)//g; s/__counted_by\([^()]*\)//g; s/__ptrcheck_abi_assume_single\(\)//g; s/__unsafe_indexable//g; s/__single//g; s/, bridgeos\([0-9][0-9.]*\)//g; s/, driverkit\([0-9][0-9.]*\)//g; s/xros\(/visionos(/g'
 
 xb() {
         _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"
@@ -46,7 +48,7 @@ xb() {
         else
                 find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         fi
-        find "$_src" \( -name "*.h" -o -name "*.c" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+        find "$_src" \( -name "*.h" -o -name "*.c" -o -name "*.m" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
         cd "$_src"
         # fakeroot headers ride in via CPATH (clang-native), project search paths stay untouched
         _cpath="$FAKEROOT/usr/local/include"
@@ -56,6 +58,7 @@ xb() {
                 LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
                 ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" CODE_SIGN_IDENTITY="-" \
+                GCC_TREAT_WARNINGS_AS_ERRORS=NO \
                 OBJROOT="$BUILD_DIR/obj.$_name" \
                 SYMROOT="$BUILD_DIR/sym.$_name" \
                 DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
@@ -92,11 +95,37 @@ else
         log "libplatform headers: cached"
 fi
 
-# kernel-side headers the userland libs expect but the SDK no longer ships
+# libsyscall (libsystem_kernel source) from our xnu
+build_libsyscall() {
+        MAKE_EXTRA=""
+        if [ -n "${KDKROOT:-}" ] && [ -d "$KDKROOT" ]; then
+                export KDKROOT
+        fi
+        make -j "$(sysctl -n hw.ncpu)" install \
+                RC_ProjectName=xnu_libraries XNU_LibFlavour=NONE \
+                KERNEL_CONFIGS=RELEASE ARCH_CONFIGS=X86_64 \
+                BUILD_WERROR=0 SDKROOT=macosx \
+                DSTROOT="$FAKEROOT"
+        log "libsyscall products:"
+        ls -R "$FAKEROOT/usr/local/lib" 2>/dev/null | head -20
+}
+try libsyscall build_libsyscall
+
+# kernel-side headers the userland libs expect but the SDK no longer ships;
+# installed AFTER libsyscall because its exporthdrs rewrites fakeroot includes
 FROOT_INC="$FAKEROOT/usr/local/include"
-mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys"
+mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
+        "$FROOT_INC/arm" "$FROOT_INC/i386" "$FROOT_INC/mach-o"
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
+cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
+cp "$REPO_ROOT"/libkern/libkern/*.h "$FROOT_INC/libkern/" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$FROOT_INC/i386/" 2>/dev/null || true
+clone dyld "$DYLD_TAG" "$DEPS_DIR/dyld"
+cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2>/dev/null || true
+find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
+        -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 # THREAD_QOS_* graph: private kernel constants, not in any public header; base_private.h
 # is the first shim every libpthread internal compile includes
 if ! grep -q THREAD_QOS_LAST "$FROOT_INC/os/base_private.h" 2>/dev/null; then
@@ -114,24 +143,8 @@ cat >> "$FROOT_INC/os/base_private.h" <<'EOF'
 #define THREAD_QOS_LAST                 7
 #endif
 EOF
-log "os headers + qos shim: ok"
+log "kernel header shims: ok"
 fi
-
-# libsyscall (libsystem_kernel source) from our xnu
-build_libsyscall() {
-        MAKE_EXTRA=""
-        if [ -n "${KDKROOT:-}" ] && [ -d "$KDKROOT" ]; then
-                export KDKROOT
-        fi
-        make -j "$(sysctl -n hw.ncpu)" install \
-                RC_ProjectName=xnu_libraries XNU_LibFlavour=NONE \
-                KERNEL_CONFIGS=RELEASE ARCH_CONFIGS=X86_64 \
-                BUILD_WERROR=0 SDKROOT=macosx \
-                DSTROOT="$FAKEROOT"
-        log "libsyscall products:"
-        ls -R "$FAKEROOT/usr/local/lib" 2>/dev/null | head -20
-}
-try libsyscall build_libsyscall
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
@@ -153,6 +166,18 @@ try libclosure build_libclosure
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
+        # SDK headers (sys/time.h) self-include <dispatch/time.h> from the source tree
+        # before src/internal.h defines the INDIRECT guards - set them project-wide
+        _dxc="$DEPS_DIR/libdispatch/xcodeconfig"
+        for _f in libdispatch.xcconfig libfirehose.xcconfig; do
+                if [ -f "$_dxc/$_f" ] && ! grep -q "__DISPATCH_INDIRECT__" "$_dxc/$_f"; then
+                        if grep -q "^GCC_PREPROCESSOR_DEFINITIONS" "$_dxc/$_f"; then
+                                sed -i '' 's|^GCC_PREPROCESSOR_DEFINITIONS = \(.*\)$|GCC_PREPROCESSOR_DEFINITIONS = \1 __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1|' "$_dxc/$_f"
+                        else
+                                printf '\nGCC_PREPROCESSOR_DEFINITIONS = __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1\n' >> "$_dxc/$_f"
+                        fi
+                fi
+        done
         xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch "$DEPS_DIR/libdispatch"
 }
 try libdispatch build_libdispatch
