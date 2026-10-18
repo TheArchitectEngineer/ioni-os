@@ -324,6 +324,28 @@ build_libpthread() {
 }
 try libpthread build_libpthread
 
+# dispatch workgroups drive the newer work interval instance SPI whose header
+# is internal - stand in the declarations the TU chain needs
+if ! grep -q "IONI_WORK_INTERVAL_INSTANCE" "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h"; then
+cat >> "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h" <<'EOF'
+
+/* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
+struct work_interval_data { uint64_t _ioni_fields[8]; };
+typedef struct work_interval_instance *work_interval_instance_t;
+work_interval_instance_t work_interval_instance_alloc(work_interval_t wi);
+void work_interval_instance_free(work_interval_instance_t wil);
+int work_interval_instance_clear(work_interval_instance_t wil);
+int work_interval_instance_start(work_interval_instance_t wil);
+int work_interval_instance_update(work_interval_instance_t wil);
+int work_interval_instance_finish(work_interval_instance_t wil, uint32_t type);
+int work_interval_instance_set_finish(work_interval_instance_t wil, uint32_t type);
+int work_interval_instance_set_start(work_interval_instance_t wil, uint64_t start);
+int work_interval_instance_set_deadline(work_interval_instance_t wil, uint64_t deadline);
+int work_interval_instance_set_complexity(work_interval_instance_t wil, uint64_t complexity);
+int work_interval_instance_get_telemetry_data(work_interval_instance_t wil, void *data, size_t size);
+EOF
+fi
+
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
@@ -336,7 +358,7 @@ build_libmalloc() {
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
         # voucher.c needs the private proc info structs the public header dropped
         if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
-                perl -pi -e 's{^(#include <sys/proc_info\\.h>)$}{$1\n#include <sys/proc_info_private.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
+                perl -pi -e 's{^(#include <sys/proc_info\.h>)$}{$1\n#include <sys/proc_info_private.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
         fi
         # xzone wakes waiters through ulocks; the TU misses the include
         if ! grep -q "include <sys/ulock.h>" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"; then
@@ -448,7 +470,7 @@ build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         # Libc clock_gettime uses the boottime SPI the SDK headers dropped
         if ! grep -q "extern uint64_t mach_boottime_usec" "$DEPS_DIR/Libc/gen/clock_gettime.c"; then
-                printf '/* Ioni: boottime SPI (mach_time_private.h) */\nextern uint64_t mach_boottime_usec(void);\n' \
+                printf '/* Ioni: boottime SPI (mach_time_private.h) */\n#include <stdint.h>\nextern uint64_t mach_boottime_usec(void);\n' \
                         | cat - "$DEPS_DIR/Libc/gen/clock_gettime.c" > "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" \
                         && mv "$DEPS_DIR/Libc/gen/clock_gettime.c.ioni" "$DEPS_DIR/Libc/gen/clock_gettime.c"
         fi
