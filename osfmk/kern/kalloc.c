@@ -1078,7 +1078,7 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
 				    &cur_count, false, kext_uuid_str);
 			}
 		}
-	} else if (kc_format == KCFormatKCGEN) {
+	} else if (kc_format == KCFormatKCGEN || kc_format == KCFormatDynamic) {
 		/*
 		 * Parse __kalloc_type section from xnu
 		 */
@@ -1105,9 +1105,14 @@ kalloc_type_view_parse(const kalloc_type_variant_t type)
 		 */
 		kernel_section_t *prelink_sect = getsectbynamefromheader(
 			xnu_mh, kPrelinkTextSegment, kPrelinkTextSection);
-		assert(prelink_sect);
-		cur = prelink_sect->addr;
-		end = prelink_sect->addr + prelink_sect->size;
+		if (prelink_sect == NULL) {
+			// standalone boot has no prelinked kexts
+			cur = 0;
+			end = 0;
+		} else {
+			cur = prelink_sect->addr;
+			end = prelink_sect->addr + prelink_sect->size;
+		}
 
 		while (cur < end) {
 			uint64_t kext_text_sz = 0;
