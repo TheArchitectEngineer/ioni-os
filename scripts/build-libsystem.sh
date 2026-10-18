@@ -185,6 +185,36 @@ cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null |
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
 cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
+# work intervals/personas: the shared headers hide the Libsyscall interface
+# behind #if PRIVATE - lift it for the vendored copies
+for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h"; do
+        [ -f "$_wh" ] || continue
+        grep -q "IONI_PRIVATE_LIFTED" "$_wh" && continue
+        python3 - "$_wh" <<'PYW'
+import sys
+f = sys.argv[1]
+lines = open(f).readlines()
+out, depth = [], 0
+for ln in lines:
+    st = ln.strip()
+    if depth == 0 and st == "#ifdef PRIVATE":
+        depth = 1
+        out.append("/* IONI_PRIVATE_LIFTED */\n")
+        continue
+    if depth:
+        if st.startswith("#if"):
+            depth += 1
+        elif st.startswith("#endif"):
+            depth -= 1
+            if depth == 0:
+                continue
+        elif st == "#else" and depth == 1:
+            continue
+    out.append(ln)
+open(f, "w").writelines(out)
+PYW
+done
+cp "$REPO_ROOT/bsd/sys/proc_info_private.h" "$FROOT_INC/sys/proc_info_private.h" 2>/dev/null || true
 # work intervals and personas: shared kernel-user headers the SDK 26 trimmed
 cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
@@ -304,6 +334,10 @@ build_libmalloc() {
         fi
         # every malloc target variant must default the atomic config itself
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
+        # voucher.c needs the private proc info structs the public header dropped
+        if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
+                perl -pi -e 's{^(#include <sys/proc_info\\.h>)$}{$1\n#include <sys/proc_info_private.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
+        fi
         # xzone wakes waiters through ulocks; the TU misses the include
         if ! grep -q "include <sys/ulock.h>" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"; then
                 perl -pi -e 's{^(#include <sys/types\.h>)$}{$1\n#include <sys/ulock.h>}' "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c" 2>/dev/null || true
