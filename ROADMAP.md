@@ -19,9 +19,9 @@ Primary target: **x86_64 (PC hardware)**. ARM64 is paused as a product target; t
 - [x] Dependency chain in CI: fakeroot with exported kernel headers, libplatform headers and libdispatch firehose (mig/ctf only when Xcode lacks them)
 - [x] Full x86_64 kernel build on CI — `kernel-RELEASE-X86_64` artifact on every run
 - [x] ARM64 kernel link - RELEASE VMAPPLE kernel links in CI with KDK 26.5 (tree pinned to xnu-12377.121.6, libVMAPPLE.os.release.a force-loaded from KDK)
-- [ ] Kernel collection (kmutil create) for VM boot - built in-guest by the boot job (KDK 26.5 inside the guest, kext list from the guest's own system), uploaded as the `ioni-kc-ARM64` artifact
-- [ ] Kernel boots in a VM with serial console output - tart guest (macOS 26), in-guest `kmutil create` + `kmutil configure-boot`; VZ guests since macOS 14.4 boot custom KCs without iBoot patches
-- [ ] x86_64 boot track (PC): QEMU/OVMF + OpenCore-style loader for the x86_64 kernel collection
+- [ ] Kernel collection (kmutil create) for VM boot - built in-guest (KDK 26.5 inside the guest, kext list from the guest's own system) by `scripts/vm-boot.sh` + `scripts/guest-kc.sh`; produced as an artifact on the same run
+- [ ] Kernel boots in a VM with serial console output - tart guest (macOS 26), in-guest `kmutil create` + `kmutil configure-boot`; VZ guests since macOS 14.4 boot custom KCs without iBoot patches. Scripts are ready and must run on a real Apple Silicon Mac or a self-hosted runner - GitHub-hosted runners do not expose nested virtualization (job is workflow_dispatch-only)
+- [ ] x86_64 boot track (PC): QEMU/OVMF + OpenCore-style loader for the x86_64 kernel collection (KVM on linux runners is a candidate for CI)
 
 ## Stage 2 — Minimal userland
 
@@ -58,9 +58,9 @@ Primary target: **x86_64 (PC hardware)**. ARM64 is paused as a product target; t
 
 **Этап 0 — фундамент** (готово): база XNU импортирована, поверхностный ребрендинг применён — система отвечает `Ioni` в `uname` и в баннере загрузки.
 
-**Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; ARM64-линковка закрыта: VMAPPLE-ядро собирается в CI с KDK 26.5 (дерево запиновано на xnu-12377.121.6); осталось — kernel collection собирается прямо в tart-госте его собственным kmutil (KDK 26.5 в госте, kext-база гостя) и уезжает артефактом, затем configure-boot и перезагрузка гостя; VZ-гости с macOS 14.4 грузят кастомные KC без патчей iBoot. Параллельный трек — x86_64-загрузка на ПК (QEMU/OVMF + OpenCore).
+**Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; ARM64-линковка закрыта: VMAPPLE-ядро собирается в CI с KDK 26.5 (дерево запиновано на xnu-12377.121.6); осталось — KC и загрузка: скрипты готовы (`scripts/vm-boot.sh` собирает KC прямо в tart-госте его kmutil, затем configure-boot и ребут), но GitHub-hosted раннеры не дают nested virtualization — нужен реальный Mac (локальный запуск одной командой) или self-hosted runner. Параллельный трек — x86_64-загрузка на ПК (QEMU/OVMF + OpenCore, KVM в linux-раннерах как кандидат для CI).
 
-**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall уже собирается в fakeroot; дальше — open-части Libsystem (libpthread/libmalloc/libclosure/libdispatch зелёные, Libc-1752.120.2 в каркасе), dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
+**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall и Blocks уже собираются в fakeroot; libpthread/libmalloc/libdispatch/Libc каркассятся в CI (нейтрализация bounds-аннотаций, приватные заголовки, приватная availability-механика — следующая волна); дальше — dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
 
 **Этап 3 — Homebrew**: портирование пакетного менеджера и собственный tap.
 

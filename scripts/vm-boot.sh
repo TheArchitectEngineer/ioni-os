@@ -103,7 +103,11 @@ for i in $(seq 1 45); do
         sleep 10
 done
 if [ "$UP" != "1" ]; then
-        say "RESULT: guest did not come back (custom KC likely rejected)"
+        if grep -q "not available on this hardware" "$LOG" 2>/dev/null; then
+                say "RESULT: host lacks nested virtualization (run this on a real Apple Silicon Mac or self-hosted runner)"
+        else
+                say "RESULT: guest did not come back (custom KC likely rejected)"
+        fi
         tail -n 60 "$LOG" || true
         exit 5
 fi

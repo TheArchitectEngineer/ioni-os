@@ -83,8 +83,10 @@ jobs:
   boot-vm:
     name: boot in VM (tart guest, in-guest kmutil)
     runs-on: macos-15
+    if: github.event_name == 'workflow_dispatch'
     needs: kernel-arm64
     timeout-minutes: 90
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
