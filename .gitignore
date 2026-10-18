@@ -3,3 +3,5 @@ BUILD/
 *.dSYM
 userland/init
 userland/ionish
+boot/xnu-loader/build/
+boot/kc-tools/build/
