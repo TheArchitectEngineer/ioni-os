@@ -14,6 +14,7 @@ LIBPTHREAD_TAG="${LIBPTHREAD_TAG:-libpthread-539.100.4}"
 LIBMALLOC_TAG="${LIBMALLOC_TAG:-libmalloc-812.100.31}"
 LIBCLOSURE_TAG="${LIBCLOSURE_TAG:-libclosure-96}"
 LIBDISPATCH_TAG="${LIBDISPATCH_TAG:-libdispatch-1542.100.32}"
+LIBC_TAG="${LIBC_TAG:-Libc-1752.120.2}"
 
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
@@ -107,6 +108,18 @@ build_libdispatch() {
         xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch
 }
 try libdispatch build_libdispatch
+
+build_libc_static() {
+        clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c
+}
+try libc_static build_libc_static
+
+build_libsystem_c() {
+        clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c
+}
+try libsystem_c build_libsystem_c
 
 log "fails:$FAILS"
 log "fakeroot libraries:"
