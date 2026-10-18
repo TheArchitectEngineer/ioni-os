@@ -33,6 +33,8 @@ clone() {
 
 xb() {
         _src="$1"; _proj="$2"; _target="$3"; _name="$4"
+        # strip Apple-internal xcconfig includes (CoreOS/*) missing from public Xcode
+        find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         cd "$_src"
         env LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
                 xcodebuild install -sdk macosx -project "$_proj" -target "$_target" \
@@ -94,22 +96,15 @@ build_libmalloc() {
 }
 try libmalloc build_libmalloc
 
-build_liblibc() {
-        # the liblibc archives dyld links against come from here in part
-        clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
-        xb "$DEPS_DIR/libmalloc" libmalloc.xcodeproj liblibc liblibc
-}
-try liblibc build_liblibc
-
 build_libclosure() {
         clone libclosure "$LIBCLOSURE_TAG" "$DEPS_DIR/libclosure"
-        xb "$DEPS_DIR/libclosure" libclosure.xcodeproj Blocks blocks
+        xb "$DEPS_DIR/libclosure" Blocks.xcodeproj Blocks blocks
 }
 try libclosure build_libclosure
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
-        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj dispatch dispatch
+        xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch
 }
 try libdispatch build_libdispatch
 

@@ -88,6 +88,7 @@ build_kernel_hdrs() {
                 log "kernel headers: cached"
         else
                 log "kernel headers: make installhdrs X86_64 ARM64"
+                unset MACHINE_CONFIGS
                 make -j "$(sysctl -n hw.ncpu)" \
                         KERNEL_CONFIGS=RELEASE ARCH_CONFIGS="X86_64 ARM64" \
                         SDKROOT=macosx DSTROOT="$FAKEROOT" installhdrs
