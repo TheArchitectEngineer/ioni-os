@@ -23,6 +23,11 @@ LIBPLATFORM_TAG="${LIBPLATFORM_TAG:-libplatform-375.120.2}"
 BOOTSTRAP_CMDS_TAG="${BOOTSTRAP_CMDS_TAG:-bootstrap_cmds-138}"
 DTRACE_TAG="${DTRACE_TAG:-dtrace-413}"
 IONI_CTF="${IONI_CTF:-0}"
+KDK_VERSION="${KDK_VERSION:-26.5}"
+KDK_BUILD="${KDK_BUILD:-25F71}"
+KDKROOT="${KDKROOT:-/Library/Developer/KDKs/KDK_${KDK_VERSION}_${KDK_BUILD}.kdk}"
+KDK_DMG_URL="${KDK_DMG_URL:-https://github.com/dortania/KdkSupportPkg/releases/download/${KDK_BUILD}/Kernel_Debug_Kit_${KDK_VERSION}_build_${KDK_BUILD}.dmg}"
+export KDKROOT
 
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
@@ -139,6 +144,20 @@ build_ctf() {
         log "ctf: ok"
 }
 
+install_kdk() {
+        if [ -d "$KDKROOT/usr/local/lib/kernel/platform" ]; then
+                log "kdk: cached ($KDKROOT)"
+                return 0
+        fi
+        log "kdk: download $KDK_DMG_URL"
+        curl -fL --retry 3 --max-time 900 -o /tmp/KDK.dmg "$KDK_DMG_URL"
+        hdiutil attach /tmp/KDK.dmg -nobrowse -quiet
+        sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
+        hdiutil detach '/Volumes/Kernel Debug Kit' -quiet
+        rm -f /tmp/KDK.dmg
+        log "kdk: installed $KDKROOT"
+}
+
 build_kernel_hdrs
 build_libplatform
 build_firehose
@@ -147,6 +166,12 @@ if [ "$IONI_CTF" = "1" ]; then
         build_ctf
 else
         log "ctf: skipped (IONI_CTF=1 to build, kernel falls back to DO_CTFMERGE=0)"
+fi
+
+if [ "$IONI_KDK" = "1" ]; then
+        install_kdk
+else
+        log "kdk: skipped (IONI_KDK=1 to install, required for ARM64 link)"
 fi
 
 test -f "$FAKEROOT/usr/local/lib/kernel/libfirehose_kernel.a" || {

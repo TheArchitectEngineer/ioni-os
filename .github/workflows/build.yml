@@ -57,18 +57,58 @@ jobs:
           if-no-files-found: error
 
   kernel-arm64:
-    name: kernel RELEASE ARM64 (experimental, needs KDK)
+    name: kernel RELEASE ARM64 (VMAPPLE, KDK)
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 180
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: build kernel
+      - name: build kernel + KC
         run: ./scripts/build.sh
         env:
           KERNEL_CONFIGS: RELEASE
           ARCH_CONFIGS: ARM64
+          MACHINE_CONFIGS: VMAPPLE
+          IONI_KC: "1"
+
+      - name: upload kernel + KC
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-RELEASE-ARM64
+          path: |
+            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel
+            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel.dSYM
+            BUILD/obj/ioni.*.kc*
+          if-no-files-found: warn
+
+  boot-vm:
+    name: boot in VM (tart, experimental)
+    runs-on: macos-26
+    needs: kernel-arm64
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch kernel + KC
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-RELEASE-ARM64
+          path: BUILD/obj
+
+      - name: boot test
+        run: ./scripts/vm-boot.sh
+        env:
+          KC: BUILD/obj/ioni.release.vmapple.kc
+
+      - name: upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-boot-log
+          path: BUILD/vm-boot.log
+          if-no-files-found: warn
 
   userland:
     name: userland init + ionish
