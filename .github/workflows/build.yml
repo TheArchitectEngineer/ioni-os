@@ -64,33 +64,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: build kernel + KC
+      - name: build kernel
         run: ./scripts/build.sh
         env:
           KERNEL_CONFIGS: RELEASE
           ARCH_CONFIGS: ARM64
           MACHINE_CONFIGS: VMAPPLE
-          IONI_KC: "1"
 
-      - name: upload kernel + KC
+      - name: upload kernel
         uses: actions/upload-artifact@v4
         with:
           name: kernel-RELEASE-ARM64
           path: |
-            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel*
-            BUILD/obj/ioni.*
-          if-no-files-found: warn
+            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel.release.vmapple
+            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel.release.vmapple.dSYM
+          if-no-files-found: error
 
   boot-vm:
-    name: boot in VM (tart, experimental)
+    name: boot in VM (tart guest, in-guest kmutil)
     runs-on: macos-26
     needs: kernel-arm64
     timeout-minutes: 90
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: fetch kernel + KC
+      - name: fetch kernel
         uses: actions/download-artifact@v4
         with:
           name: kernel-RELEASE-ARM64
@@ -99,7 +97,15 @@ jobs:
       - name: boot test
         run: ./scripts/vm-boot.sh
         env:
-          KC: BUILD/obj/ioni.release.vmapple.kc
+          KERNEL: BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel.release.vmapple
+
+      - name: upload kernel collection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioni-kc-ARM64
+          path: BUILD/obj/ioni.*.kc
+          if-no-files-found: warn
 
       - name: upload boot log
         if: always()
