@@ -15,8 +15,14 @@ say() { echo "vm-boot: $*"; }
 guest() { sshpass -p "$PASS" ssh $SSHOPTS "admin@$1" "$2"; }
 
 mkdir -p "$(dirname "$LOG")"
-say "image=$IMAGE kc=$KC"
-[ -f "$KC" ] || { say "KC missing: $KC"; exit 1; }
+say "image=$IMAGE kc-glob=$KC"
+KC_FILE="$(ls $KC 2>/dev/null | head -n 1 || true)"
+if [ -z "$KC_FILE" ]; then
+        KC_FILE="$(ls BUILD/obj/ioni.* 2>/dev/null | grep -v dSYM | head -n 1 || true)"
+fi
+[ -n "$KC_FILE" ] && [ -f "$KC_FILE" ] || { say "KC not found for $KC"; exit 1; }
+KC="$KC_FILE"
+say "using KC: $KC"
 ls -lh "$KC"
 
 brew install -q tart >/dev/null 2>&1 && say "tart installed"

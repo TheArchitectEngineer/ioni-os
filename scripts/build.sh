@@ -90,20 +90,24 @@ if [ "${IONI_KC:-0}" = "1" ]; then
                 echo "build: IONI_KC=1 requires KDK (KDKROOT)" >&2
                 exit 1
         fi
-        if [ ! -f "$OBJ_DIR/kernel" ]; then
+        if [ ! -f "$OBJ_DIR/kernel" ] && [ ! -f "$OBJ_DIR/kernel.release.vmapple" ]; then
                 OBJ_DIR="$(ls -d BUILD/obj/${KERNEL_CONFIGS%% *}_${ARCH_CONFIGS%% *}_* 2>/dev/null | head -n 1)"
         fi
         KC_VARIANT="$(echo "$KERNEL_CONFIGS" | tr '[:upper:]' '[:lower:]')"
         KC_FILTER_DEFAULT="SEPHibernation|ExclavesAudioKext|AppleH11ANEInterface|AppleFirmwareKit|AppleARMWatchdogTimer"
         KC_FILTER="${KC_FILTER:-$KC_FILTER_DEFAULT}"
         KC_BASE="BUILD/obj/ioni.${KC_VARIANT}.vmapple"
-        KEXTS="$(kmutil inspect -V release --no-header | awk '{print " -b " $1; }' | grep -Ev "$KC_FILTER")"
-        echo "build: kmutil create $KC_BASE.kc"
+        KC_KERNEL="$OBJ_DIR/kernel"
+        [ -f "$KC_KERNEL" ] || KC_KERNEL="$OBJ_DIR/kernel.${KC_VARIANT}.vmapple"
+        command -v ipsw >/dev/null 2>&1 || brew install -q ipsw
+        KEXTS="$(ipsw kernel kmutil inspect -x --filter "$KC_FILTER")"
+        echo "build: kc kext entries: $(printf '%s\n' "$KEXTS" | grep -c '^-b\|^ -b' || true)"
+        echo "build: kmutil create $KC_BASE from $KC_KERNEL"
         # shellcheck disable=SC2086
         kmutil create -v -V "$KC_VARIANT" -a arm64e -n boot -s none \
                 --kdk "$KDKROOT" \
                 -B "$KC_BASE" \
-                -k "$OBJ_DIR/kernel" \
+                -k "$KC_KERNEL" \
                 $KEXTS
-        ls -lh BUILD/obj/ioni.*.kc*
+        ls -lh BUILD/obj/ioni.*
 fi

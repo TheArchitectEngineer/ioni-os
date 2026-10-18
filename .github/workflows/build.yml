@@ -77,9 +77,8 @@ jobs:
         with:
           name: kernel-RELEASE-ARM64
           path: |
-            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel
-            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel.dSYM
-            BUILD/obj/ioni.*.kc*
+            BUILD/obj/RELEASE_ARM64_VMAPPLE/kernel*
+            BUILD/obj/ioni.*
           if-no-files-found: warn
 
   boot-vm:
