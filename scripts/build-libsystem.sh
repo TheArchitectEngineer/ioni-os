@@ -72,6 +72,10 @@ xb() {
         else
                 find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
         fi
+        # the Xcode-shipped CoreOS xcconfig carries -Werror and -Wundef-prefix -
+        # cancel via leaf appends; SPI_AVAILABLE is Apple-internal, SDK lacks it
+        xcset "$_src" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)='
+        xcset "$_src" OTHER_CFLAGS '-Wno-error'
         strip_tree "$_src"
         cd "$_src"
         # fakeroot headers ride in via CPATH (clang-native), project search paths stay untouched
@@ -150,6 +154,12 @@ cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || tr
 cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$FROOT_INC/i386/" 2>/dev/null || true
 clone dyld "$DYLD_TAG" "$DEPS_DIR/dyld"
 cp "$DEPS_DIR/dyld/include/mach-o/dyld_priv.h" "$FROOT_INC/mach-o/dyld_priv.h" 2>/dev/null || true
+# malloc/pthread/Libc cross-headers absent from the SDK
+clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
+clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+cp "$DEPS_DIR/libmalloc/private/stack_logging.h" "$FROOT_INC/" 2>/dev/null || true
+cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
+cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
 
 # os/alloc_once_private.h: Apple-internal, absent from every public tree; the
 # libplatform impl header carries the API, we add the key pthread asks for
@@ -157,6 +167,9 @@ if [ ! -f "$FROOT_INC/os/alloc_once_private.h" ]; then
 cat > "$FROOT_INC/os/alloc_once_private.h" <<'EOF'
 #ifndef __OS_ALLOC_ONCE_PRIVATE_H
 #define __OS_ALLOC_ONCE_PRIVATE_H
+#ifndef __OS_ALLOC_INDIRECT__
+#define __OS_ALLOC_INDIRECT__ 1
+#endif
 #include <os/alloc_once_impl.h>
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_PTHREAD 61
@@ -199,6 +212,8 @@ fi
 find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
         "$FROOT_INC/arm" "$FROOT_INC/i386" -name "*.h" \
         -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/stack_logging.h" "$FROOT_INC/thread_stack_pcs.h" \
+        "$FROOT_INC/_bounds.h" 2>/dev/null || true
 find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
         -name "*.h" -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
 log "kernel header shims: ok"
