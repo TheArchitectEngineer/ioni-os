@@ -144,7 +144,7 @@ try libsyscall build_libsyscall
 # vendored selectively - kernel OSAtomic.h must NOT shadow the SDK's userland one
 FROOT_INC="$FAKEROOT/usr/local/include"
 mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
-        "$FROOT_INC/arm" "$FROOT_INC/i386" "$FROOT_INC/mach-o"
+        "$FROOT_INC/arm" "$FROOT_INC/i386" "$FROOT_INC/mach-o" "$FROOT_INC/machine" "$FROOT_INC/corecrypto"
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
@@ -180,6 +180,10 @@ cp "$REPO_ROOT"/libkern/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 # mach eventlink types and disklabel, kernel-user headers the SDK omits
 cp "$REPO_ROOT/osfmk/mach/mach_eventlink_types.h" "$FROOT_INC/mach/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/disklabel.h" "$FROOT_INC/sys/" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/machine/disklabel.h" "$FROOT_INC/machine/disklabel.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null || true
+# corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
+cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 # pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
 # includes <pthread/priority_private.h> which Apple ships only in the internal SDK
 mkdir -p "$FROOT_INC/pthread"
@@ -261,7 +265,10 @@ find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o
 sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/stack_logging.h" "$FROOT_INC/malloc_private.h" \
         "$FROOT_INC/thread_stack_pcs.h" "$FROOT_INC/_bounds.h" "$FROOT_INC/spawn_private.h" \
         "$FROOT_INC/sys/spawn_internal.h" "$FROOT_INC/sys/disklabel.h" \
+        "$FROOT_INC/machine/disklabel.h" "$FROOT_INC/i386/disklabel.h" \
         "$FROOT_INC/pthread/priority_private.h" 2>/dev/null || true
+find "$FROOT_INC/corecrypto" "$FROOT_INC/mach" -name "*.h" \
+        -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 find "$FROOT_INC/os" "$FROOT_INC/libkern" "$FROOT_INC/System" "$FROOT_INC/mach-o" \
         -name "*.h" -exec perl -0777 -pi -e "$STRIP_UNAVAIL" {} + 2>/dev/null || true
 log "kernel header shims: ok"
@@ -292,6 +299,10 @@ build_libmalloc() {
         fi
         # every malloc target variant must default the atomic config itself
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
+        # xzone wakes waiters through ulocks; the TU misses the include
+        if ! grep -q "include <sys/ulock.h>" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"; then
+                perl -pi -e 's{^(#include <sys/types\.h>)$}{$1\n#include <sys/ulock.h>}' "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c" 2>/dev/null || true
+        fi
         # memorystatus kqueue notes for the pressure masks in internal.h
         if ! grep -q "IONI_NOTE_MEMORYSTATUS" "$DEPS_DIR/libmalloc/src/internal.h"; then
                 printf '/* IONI_NOTE_MEMORYSTATUS: internal SDK event.h constants */\n#ifndef NOTE_MEMORYSTATUS_MSL_STATUS\n#define NOTE_MEMORYSTATUS_PRESSURE_NORMAL 0x00000001\n#define NOTE_MEMORYSTATUS_PRESSURE_WARN 0x00000002\n#define NOTE_MEMORYSTATUS_PRESSURE_CRITICAL 0x00000004\n#define NOTE_MEMORYSTATUS_LOW_SWAP 0x00000008\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_WARN 0x00000010\n#define NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL 0x00000020\n#define NOTE_MEMORYSTATUS_MSL_STATUS 0xf0000000\n#endif\n' \
@@ -384,6 +395,8 @@ EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         # kernel atomic_private.h defaults the dependency mode off outside the kernel
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        # dtrace providers need the closed dtrace bootstrap - tracepoints stay off
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0'
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
                 -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +

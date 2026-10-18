@@ -1,20 +1,19 @@
-/* Copyright (c) (2010-2012,2015-2019,2021,2022) Apple Inc. All rights reserved.
+/*
+ *  ccasn1.h
+ *  corecrypto
  *
- * corecrypto is licensed under Apple Inc.’s Internal Use License Agreement (which
- * is contained in the License.txt file distributed with corecrypto) and only to 
- * people who accept that license. IMPORTANT:  Any license rights granted to you by 
- * Apple Inc. (if any) are limited to internal use within your organization only on 
- * devices and computers you own or control, for the sole purpose of verifying the 
- * security characteristics and correct functioning of the Apple Software.  You may 
- * not, directly or indirectly, redistribute the Apple Software or any portions thereof.
+ *  Created on 11/16/2010
+ *
+ *  Copyright (c) 2010,2011,2012,2015 Apple Inc. All rights reserved.
+ *
  */
 
 #ifndef _CORECRYPTO_CCASN1_H_
 #define _CORECRYPTO_CCASN1_H_
 
 #include <corecrypto/cc.h>
-
-CC_PTRCHECK_CAPABLE_HEADER()
+#include <stdbool.h>
+#include <string.h>
 
 /* ASN.1 types for on the fly ASN.1 BER/DER encoding/decoding. Don't use
    these with the ccder interface, use the CCDER_ types instead. */
@@ -70,17 +69,29 @@ enum {
     CCASN1_CONSTRUCTED_SEQUENCE = CCASN1_SEQUENCE | CCASN1_CONSTRUCTED,
 };
 
-typedef const unsigned char * cc_unsafe_indexable ccoid_t;
+#if CORECRYPTO_USE_TRANSPARENT_UNION
+typedef union {
+    const unsigned char * oid;
+} __attribute__((transparent_union)) ccoid_t;
+#define CCOID(x) ((x).oid)
+#else
+    typedef const unsigned char * ccoid_t;
 #define CCOID(oid) (oid)
+#endif
 
-/* Returns the size of an oid including its tag and length. */
-CC_PURE CC_NONNULL((1))
-size_t ccoid_size(ccoid_t oid);
+/* Returns *der iff *der points to a DER encoded oid that fits within *der_len. */
+ccoid_t ccoid_for_der(size_t *der_len, const uint8_t **der);
 
-CC_PURE CC_NONNULL((1))
-const unsigned char *cc_indexable ccoid_payload(ccoid_t oid);
+/* Returns the size of an oid including it's tag and length. */
+CC_INLINE CC_PURE CC_NONNULL_TU((1))
+size_t ccoid_size(ccoid_t oid) {
+    return 2 + CCOID(oid)[1];
+}
 
-CC_PURE
-bool ccoid_equal(ccoid_t oid1, ccoid_t oid2);
+CC_INLINE CC_PURE CC_NONNULL_TU((1)) CC_NONNULL_TU((2))
+bool ccoid_equal(ccoid_t oid1, ccoid_t oid2) {
+    return  (ccoid_size(oid1) == ccoid_size(oid2)
+            && memcmp(CCOID(oid1), CCOID(oid2), ccoid_size(oid1))== 0);
+}
 
 #endif /* _CORECRYPTO_CCASN1_H_ */

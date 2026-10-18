@@ -1,26 +1,49 @@
-/* Copyright (c) (2010-2012,2015-2019,2021,2022) Apple Inc. All rights reserved.
+/*
+ *  ccdigest_priv.h
+ *  corecrypto
  *
- * corecrypto is licensed under Apple Inc.’s Internal Use License Agreement (which
- * is contained in the License.txt file distributed with corecrypto) and only to
- * people who accept that license. IMPORTANT:  Any license rights granted to you by
- * Apple Inc. (if any) are limited to internal use within your organization only on
- * devices and computers you own or control, for the sole purpose of verifying the
- * security characteristics and correct functioning of the Apple Software.  You may
- * not, directly or indirectly, redistribute the Apple Software or any portions thereof.
+ *  Created on 12/07/2010
+ *
+ *  Copyright (c) 2010,2011,2012,2015 Apple Inc. All rights reserved.
+ *
  */
 
 #ifndef _CORECRYPTO_CCDIGEST_PRIV_H_
 #define _CORECRYPTO_CCDIGEST_PRIV_H_
 
-#include <corecrypto/cc_priv.h>
 #include <corecrypto/ccdigest.h>
 #include <corecrypto/ccasn1.h>
-#include <stdarg.h>
+
+void ccdigest_final_common(const struct ccdigest_info *di,
+                           ccdigest_ctx_t ctx, void *digest);
+void ccdigest_final_64be(const struct ccdigest_info *di, ccdigest_ctx_t,
+                         unsigned char *digest);
+void ccdigest_final_64le(const struct ccdigest_info *di, ccdigest_ctx_t,
+                         unsigned char *digest);
+
+CC_INLINE CC_NONNULL_TU((1))
+bool ccdigest_oid_equal(const struct ccdigest_info *di, ccoid_t oid) {
+    if(di->oid == NULL && CCOID(oid) == NULL) return true;
+    if(di->oid == NULL || CCOID(oid) == NULL) return false;
+    return ccoid_equal(di->oid, oid);
+}
 
 typedef const struct ccdigest_info *(ccdigest_lookup)(ccoid_t oid);
 
-const struct ccdigest_info *ccdigest_oid_lookup(ccoid_t oid, ...);
+//#include <stdarg.h>
 
-#define ccdigest_copy_state(_di_, _dst_, _src_) cc_memcpy_nochk(_dst_, _src_, (_di_)->state_size)
+// NOTE(@facekapow):
+// i'm not sure entirely sure what Apple was going for with the varargs,
+// especially since there was no documentation in the header
+//
+// my initial assumption was that it was used to try multiple possible OIDs
+// and return the digest info for the first one that was found. (un?)fortunately,
+// there's no indication of how to determine the length of the varargs
+// (NULL could be used as the last element)
+//
+// therefore, i'm just going to remove the varargs. besides, it's in a private header
+// which means that only our own implementation should use it, so we can modify it
+// however we want
+const struct ccdigest_info *ccdigest_oid_lookup(ccoid_t oid /*, ...*/);
 
 #endif /* _CORECRYPTO_CCDIGEST_PRIV_H_ */
