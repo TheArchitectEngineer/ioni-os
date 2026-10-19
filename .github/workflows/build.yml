@@ -208,3 +208,19 @@ jobs:
           name: ioni-rootfs
           path: BUILD/ioni-rootfs.dmg
           if-no-files-found: error
+
+  userland-hunt:
+    name: userland corruption hunt (asan ubsan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build hardened
+        run: make -C userland clean all
+
+      - name: build sanitized
+        run: make -C userland hunt
+
+      - name: run hunt suite
+        run: ./tests/hunt.sh
