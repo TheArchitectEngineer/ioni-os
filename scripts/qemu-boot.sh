@@ -191,6 +191,9 @@ PYEOF
             echo "info registers rip rsp rbp rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
             echo "printf \"=== canaries ===\\\\n\""
             echo "$WATCH_INFO" | while read -r name addr; do
+                case "$name" in
+                    startup_table|startup_entry_cur) continue ;;
+                esac
                 echo "printf \"$name @ $addr: \""
                 echo "x/2gx $addr"
             done
