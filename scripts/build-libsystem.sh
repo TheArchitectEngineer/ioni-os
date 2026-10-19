@@ -619,10 +619,11 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
-        # the variant macros key off VARIANT_PLATFORM_NAME resolved through
-        # the FALLBACK_PLATFORM default modifier - it does not resolve here,
-        # so Pre1050/Legacy symbols come out unrenamed and collide - pin it
-        printf '\nVARIANT_PLATFORM_NAME = macosx\n' >> "$DEPS_DIR/Libc/xcodescripts/variants.xcconfig"
+        # the compat variant archives duplicate the plain symbols on this
+        # toolchain (variant rename macros do not fully apply) and our system
+        # has no pre-10.5 clients - link the plain archives only
+        sed -i '' 's|^BUILD_ARCHIVES = .*|BUILD_ARCHIVES = Platform Base FreeBSD NetBSD TRE FortifySource|' \
+                "$DEPS_DIR/Libc/xcodescripts/libc.xcconfig"
         # the dispatch install clobbers the blocks-runtime Block.h with its
         # indirect block.h on a case-insensitive fs - put the clean one back
         cp "$DEPS_DIR/libclosure/Block.h" "$FROOT_INC/Block.h"
