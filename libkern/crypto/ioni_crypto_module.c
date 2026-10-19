@@ -42,7 +42,7 @@ ioni_digest_info(unsigned int alg)
 static size_t
 ioni_digest_ctx_size(crypto_digest_alg_t alg)
 {
-	return ioni_digest_info(alg)->size;
+	return ccdigest_di_size(ioni_digest_info(alg));
 }
 
 static void
@@ -62,7 +62,13 @@ static void
 ioni_digest_final(crypto_digest_alg_t alg, void *ctx, size_t ctx_size,
     void *digest, size_t digest_size)
 {
-	ccdigest_final(ioni_digest_info(alg), ctx, digest_size, digest);
+	const struct ccdigest_info *di = ioni_digest_info(alg);
+
+	if (__improbable(digest_size < di->output_size ||
+	    ctx_size < ccdigest_di_size(di))) {
+		panic("ioni_crypto: digest final buffer too small alg %u", alg);
+	}
+	ccdigest_final(di, ctx, digest);
 }
 
 static void
@@ -200,10 +206,16 @@ ioni_random_uniform(crypto_random_ctx_t ctx, uint64_t bound, uint64_t *random)
 	*random = bound == 0 ? 0 : value % bound;
 }
 
+static void
+ioni_ccdigest_final(const struct ccdigest_info *di, ccdigest_ctx_t ctx, void *digest)
+{
+	ccdigest_final(di, ctx, digest);
+}
+
 static struct crypto_functions ioni_crypto_funcs = {
 	.ccdigest_init_fn = ccdigest_init,
 	.ccdigest_update_fn = ccdigest_update,
-	.ccdigest_final_fn = ccdigest_final,
+	.ccdigest_final_fn = ioni_ccdigest_final,
 	.ccdigest_fn = ccdigest,
 	.ccsha256_di = &ccsha256_ltc_di,
 	.ccsha512_di = &ccsha512_ltc_di,

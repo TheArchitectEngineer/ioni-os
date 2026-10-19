@@ -109,7 +109,7 @@ rm -f "$MON_SOCK"
 if [ -n "${IONI_QEMU_GDB:-}" ]; then
     WATCH_INFO=$(python3 - "$KERNEL" "$KERNEL.dSYM/Contents/Resources/DWARF/kernel" << 'PYEOF'
 import struct, sys
-targets = {"_vm_page_locks": [0x48], "_zone_info": [0xb0, 0x0]}
+targets = {"_vm_page_locks": [0x48], "_zone_info": [0xb0, 0x0], "___startup_SYSCTL_entry_sysctl__security_mac__sysvsem_enforce": [8]}
 seen = set()
 found = []
 startup_syms = []
@@ -179,14 +179,14 @@ PYEOF
         TABLE_LO=$(echo "$WATCH_INFO" | awk '$1 == "startup_table" {print $2}')
         TABLE_HI=$(echo "$WATCH_INFO" | awk '$1 == "startup_table" {print $3}')
         CUR_ADDR=$(echo "$WATCH_INFO" | awk '$1 == "_startup_entry_cur" {print $2}')
-        if [ -n "$TABLE_LO" ]; then
-            echo "printf \"=== startup table $TABLE_LO-$TABLE_HI cur=$CUR_ADDR ===\\n\""
-            echo "dump binary memory $OUT_DIR/startup-table-hit0.bin $TABLE_LO $TABLE_HI"
-            echo "printf \"table dump written\\n\""
-        fi
         i=1
         while [ $i -le 40 ]; do
             echo "continue"
+            if [ -n "$TABLE_LO" ] && [ "$i" -eq 1 ]; then
+                echo "echo === startup table $TABLE_LO-$TABLE_HI cur=$CUR_ADDR ==="
+                echo "dump binary memory $OUT_DIR/startup-table-hit0.bin $TABLE_LO $TABLE_HI"
+                echo "echo table dump written"
+            fi
             echo "printf \"=== HUNT HIT $i ===\\\\n\""
             echo "info registers rip rsp rbp rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
             echo "printf \"=== canaries ===\\\\n\""
@@ -199,11 +199,11 @@ PYEOF
             i=$((i + 1))
         done
         if [ -n "$TABLE_LO" ]; then
-            echo "printf \"=== startup table final dump ===\\n\""
+            echo "echo === startup table final dump ==="
             echo "dump binary memory $OUT_DIR/startup-table-end.bin $TABLE_LO $TABLE_HI"
-            echo "printf \"final dump written\\n\""
+            echo "echo final dump written"
             if [ -n "$CUR_ADDR" ]; then
-                echo "printf \"startup_entry_cur: \""
+                echo "echo startup_entry_cur:"
                 echo "x/1gx $CUR_ADDR"
             fi
         fi

@@ -109,6 +109,9 @@ jobs:
             BUILD/hunt/qemu-serial.log
             BUILD/hunt/qemu-gdb-hunt.log
             BUILD/hunt/qemu-stdout.log
+            BUILD/hunt/startup-table-hit0.bin
+            BUILD/hunt/startup-table-end.bin
+            BUILD/hunt/hunt.gdb
           if-no-files-found: warn
 
   kernel-arm64:
