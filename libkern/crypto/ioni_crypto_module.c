@@ -2,7 +2,6 @@
 #include <libkern/crypto/register_crypto.h>
 #include <libkern/section_keywords.h>
 #include <kern/startup.h>
-#include <kern/misc_protos.h>
 #include <machine/machine_routines.h>
 #include <prng/random.h>
 #include <sys/random.h>
@@ -13,6 +12,7 @@
 
 
 extern const struct ccdigest_info ccsha256_ltc_di;
+extern uint64_t early_random(void);
 extern const struct ccdigest_info ccsha512_ltc_di;
 
 #define IONI_DRBG_MAX_STATE 512
