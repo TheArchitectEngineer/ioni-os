@@ -197,7 +197,7 @@ cp "$REPO_ROOT/bsd/sys/proc_info_private.h" "$FROOT_INC/sys/proc_info_private.h"
 cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/proc_info.h" "$FROOT_INC/sys/proc_info.h" 2>/dev/null || true
-for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h"; do
+for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h" "$FROOT_INC/sys/ulock.h"; do
         [ -f "$_wh" ] || continue
         grep -q "IONI_PRIVATE_LIFTED" "$_wh" && continue
         python3 - "$_wh" <<'PYW'
@@ -315,8 +315,18 @@ log "kernel header shims: ok"
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # pthread reads the libSystem cross-bootstrap flag whose declaration
+        # lives in the closed os/base_private.h - declare it project-wide
+        cat > "$DEPS_DIR/libpthread/_ioni_pthread_prefix.h" <<'EOF'
+#ifndef _IONI_PTHREAD_PREFIX_H
+#define _IONI_PTHREAD_PREFIX_H
+#include <stdbool.h>
+extern bool _os_xbs_chrooted;
+#endif
+EOF
         # the Xcode-shipped CoreOS xcconfig carries -Werror - cancel via leaf appends
         xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/libpthread" GCC_PREFIX_HEADER '_ioni_pthread_prefix.h'
         # SPI_AVAILABLE and the ptrcheck forge casts are Apple-internal, SDK lacks them
         xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         # the SDK ships its own os/base_private.h ahead of our CPATH fakeroot and it
@@ -333,7 +343,15 @@ try libpthread build_libpthread
 # is internal - stand in the declarations the TU chain needs
 cat > "$BUILD_DIR/work_interval_instance_ioni.h" <<'EOF'
 /* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
-struct work_interval_data { uint64_t _ioni_fields[8]; };
+struct work_interval_data {
+	uint64_t _ioni_fields[8];
+	uint64_t wid_external_wakeups;
+	uint64_t wid_total_wakeups;
+	uint64_t wid_cycles;
+	uint64_t wid_instructions;
+	uint64_t wid_user_time_mach;
+	uint64_t wid_system_time_mach;
+};
 typedef struct work_interval_instance *work_interval_instance_t;
 work_interval_instance_t work_interval_instance_alloc(work_interval_t wi);
 void work_interval_instance_free(work_interval_instance_t wil);
