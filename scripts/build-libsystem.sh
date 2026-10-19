@@ -54,14 +54,16 @@ strip_tree() {
 # append a build setting in every xcconfig of a project tree (command-line
 # settings would override the whole chain, xcconfig appends inherit it)
 xcset() {
-        _tree="$1"; _setting="$2"; _value="$3"
+        _tree="$1"; _setting="$2"; shift 2
         find "$_tree" -name "*.xcconfig" | while IFS= read -r _f; do
-                grep -q "$_value" "$_f" 2>/dev/null && continue
-                if grep -q "^$_setting" "$_f" 2>/dev/null; then
-                        sed -i '' "s|^$_setting = \(.*\)$|$_setting = \1 $_value|" "$_f"
-                else
-                        printf '\n%s = %s\n' "$_setting" "$_value" >> "$_f"
-                fi
+                for _value in "$@"; do
+                        grep -qF "$_value" "$_f" 2>/dev/null && continue
+                        if grep -q "^$_setting" "$_f" 2>/dev/null; then
+                                sed -i '' "s|^$_setting = \(.*\)$|$_setting = \1 $_value|" "$_f"
+                        else
+                                printf '\n%s = %s\n' "$_setting" "$_value" >> "$_f"
+                        fi
+                done
         done
 }
 
@@ -114,7 +116,7 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         ditto "$DEPS_DIR/libplatform/private" "$FAKEROOT/usr/local/include"
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
         # public SDK hides sched_param.quantum - drop the two uses
-        perl -pi -e 's{^\t\tparam->quantum = 10; .*$}{}; s{^\t\tbases\.rr\.quantum = param->quantum$}{\t\tbases.rr.quantum = 0;}' "$DEPS_DIR/libpthread/src/pthread.c"
+        perl -pi -e 's{^\t\tparam->quantum = 10; .*$}{}; s{^\t\tbases\.rr\.quantum = param->quantum;$}{\t\tbases.rr.quantum = 0;}' "$DEPS_DIR/libpthread/src/pthread.c"
         ditto "$DEPS_DIR/libpthread/private" "$FAKEROOT/usr/local/include"
         mkdir -p "$FAKEROOT/usr/local/include/os"
         cp "$REPO_ROOT/libkern/os/base_private.h" "$FAKEROOT/usr/local/include/os/"
@@ -496,6 +498,15 @@ typedef struct {
 #ifndef EVFILT_MEMORYSTATUS
 #define EVFILT_MEMORYSTATUS (-14)
 #endif
+/* internal-SDK pthread workqueue bits */
+#ifndef PTHREAD_WQ_QUANTUM_EXPIRY_NARROW
+#define PTHREAD_WQ_QUANTUM_EXPIRY_NARROW 1
+#endif
+static inline bool _pthread_priority_has_qos(unsigned long pp)
+{
+        (void)pp;
+        return false;
+}
 EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
@@ -514,6 +525,10 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # vfprintf/arc4random self-enable the libtrace crash path that needs
+        # the closed os/log_private.h - fall back to the plain _os_crash branch
+        perl -pi -e 's{^#define OS_CRASH_ENABLE_EXPERIMENTAL_LIBTRACE 1$}{}' \
+                "$DEPS_DIR/Libc/stdio/FreeBSD/vfprintf.c" "$DEPS_DIR/Libc/gen/FreeBSD/arc4random.c"
         xcset "$DEPS_DIR/Libc" LIBRARY_SEARCH_PATHS "$FAKEROOT/usr/local/lib"
         xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS '-lioni_membership'
         # Libc clock_gettime uses the boottime SPI the SDK headers dropped
