@@ -744,8 +744,8 @@ EOF
         # the target links \$(LIBSYSTEM_C_LDFLAGS); the last assignment in
         # libc.xcconfig wins - ride the gap fillers on the variable itself
         _ldline="$(grep '^LIBSYSTEM_C_LDFLAGS' "$DEPS_DIR/Libc/xcodescripts/libc.xcconfig")"
-        printf '\n%s -Wl,-alias_list,%s/libc-gapfill/fdopen.alias %s/libc-gapfill/nanosleep.o %s/libc-gapfill/getutmpx.o\n' \
-                "$_ldline" "$BUILD_DIR" "$BUILD_DIR" "$BUILD_DIR" \
+        printf '\n%s -Wl,-alias_list,%s/libc-gapfill/fdopen.alias %s/libc-gapfill/getutmpx.o\n' \
+                "$_ldline" "$BUILD_DIR" "$BUILD_DIR" \
                 >> "$DEPS_DIR/Libc/xcodescripts/libc.xcconfig"
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
