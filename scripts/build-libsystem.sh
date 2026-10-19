@@ -152,6 +152,7 @@ mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
 cp "$REPO_ROOT/libsyscall/mach/mach/mach_sync_ipc.h" "$FROOT_INC/mach/" 2>/dev/null || true
@@ -340,7 +341,7 @@ typedef uint64_t kqueue_id_t;
 #endif
 EOF
         # the Xcode-shipped CoreOS xcconfig carries -Werror - cancel via leaf appends
-        xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error' '-fno-stack-protector'
         xcset "$DEPS_DIR/libpthread" GCC_PREFIX_HEADER '_ioni_pthread_prefix.h'
         # SPI_AVAILABLE and the ptrcheck forge casts are Apple-internal, SDK lacks them
         xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
@@ -389,7 +390,7 @@ done
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1' 'OS_VARIANT_NOTRESOLVED=1'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1' 'OS_VARIANT_NOTRESOLVED=1' 'OS_VARIANT_RESOLVED=1'
         xcset "$DEPS_DIR/libmalloc" BUILD_VARIANTS normal
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
@@ -512,7 +513,7 @@ EOF
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         # kernel atomic_private.h defaults the dependency mode off outside the kernel
-        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1'
+        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1' 'PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
         # dtrace providers need the closed dtrace bootstrap - tracepoints stay off
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0'
         xcset "$DEPS_DIR/libdispatch" GCC_PREFIX_HEADER '_ioni_dispatch_prefix.h'
