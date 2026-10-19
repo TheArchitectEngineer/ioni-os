@@ -268,6 +268,14 @@ thread_zone_startup(void)
 }
 STARTUP(ZALLOC, STARTUP_RANK_FOURTH, thread_zone_startup);
 
+__startup_func
+static void
+init_thread_turnstile_init(void)
+{
+	init_thread.turnstile = turnstile_alloc();
+}
+STARTUP(ZALLOC, STARTUP_RANK_SECOND, init_thread_turnstile_init);
+
 static void thread_deallocate_enqueue(thread_t thread);
 static void thread_deallocate_complete(thread_t thread);
 
@@ -418,8 +426,6 @@ thread_init(void)
 	 *	per-thread structures necessary.
 	 */
 	machine_thread_init();
-
-	init_thread.turnstile = turnstile_alloc();
 
 	init_thread_ledgers();
 }
