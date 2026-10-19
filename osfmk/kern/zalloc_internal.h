@@ -586,7 +586,7 @@ typedef union kalloc_type_views {
 } kalloc_type_views_t;
 
 #define KT_VAR_MAX_HEAPS 8
-#define MAX_ZONES       690
+#define MAX_ZONES       1024
 extern struct kheap_info        kalloc_type_heap_array[KT_VAR_MAX_HEAPS];
 extern zone_id_t _Atomic        num_zones;
 extern uint32_t                 zone_view_count;

@@ -8903,6 +8903,9 @@ zone_create_find(
 			}
 		}
 
+		if (__improbable(nzones >= MAX_ZONES)) {
+			panic("zone_create: out of zone slots (%d) for %s", nzones, name);
+		}
 		zid = nzones++;
 		z = zone_init_defaults(zid);
 
