@@ -321,6 +321,10 @@ log "kernel header shims: ok"
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # upstream strips the internal resolver machinery - both TUs define
+        # the four wrappers and collide at link time; base TU wins, the
+        # variant TU is emptied in place (pbxproj keeps its file reference)
+        printf '/* Ioni: variant TU dropped, base TU carries the wrappers */\n' > "$DEPS_DIR/libpthread/src/variants/pthread_cancelable_cancel.c"
         # pthread reads the libSystem cross-bootstrap flag whose declaration
         # lives in the closed os/base_private.h - declare it project-wide
         cat > "$DEPS_DIR/libpthread/_ioni_pthread_prefix.h" <<'EOF'
@@ -441,6 +445,11 @@ fi
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
+        # mach_msg2/mach_msg_vector_t/mach_msg_qos_t live in the xnu message.h
+        # PRIVATE blocks the SDK strips - stage our copy for the prefix to
+        # include ahead of everything; the SDK header then no-ops on the guard
+        mkdir -p "$BUILD_DIR/xnu-include/mach"
+        cp "$REPO_ROOT/osfmk/mach/message.h" "$BUILD_DIR/xnu-include/mach/message.h"
         # voucher.c needs the private proc info structs and persona SPI the public
         # headers dropped - patch after the clone, not before
         if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
@@ -450,6 +459,7 @@ build_libdispatch() {
         # before src/internal.h defines the INDIRECT guards - set them project-wide
         # and force dispatch/base.h first via a prefix header
         cat > "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h" <<'EOF'
+__IONI_XNU_MESSAGE_H__
 #ifndef __DISPATCH_INDIRECT__
 #define __DISPATCH_INDIRECT__ 1
 #endif
@@ -508,7 +518,20 @@ static inline bool _pthread_priority_has_qos(unsigned long pp)
         (void)pp;
         return false;
 }
+/* xnu priority_private.h inline the SDK qos_private.h stops short of;
+ * mirrors the has_qos shim above - no QoS propagation through mach yet */
+static inline int _pthread_priority_relpri(unsigned long pp)
+{
+        if (_pthread_priority_has_qos(pp)) {
+                return (int8_t)(pp & 0xffu) + 1;
+        }
+        return 0;
+}
+/* xnu mach_traps.h PRIVATE decl - the SDK ships the header without it;
+ * mach_port_name_t arrives with the xnu message.h pulled in above */
+extern mach_port_name_t thread_get_special_reply_port(void);
 EOF
+        sed -i '' "s|__IONI_XNU_MESSAGE_H__|#include \"$BUILD_DIR/xnu-include/mach/message.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
@@ -526,6 +549,16 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # readdir.c reads the getdirentries64 tail flags from sys/dirent_private.h
+        # which only xnu's dirent.h includes under PRIVATE - the SDK dirent.h
+        # drops that include, so force-include the private header project-wide
+        cat > "$DEPS_DIR/Libc/_ioni_libc_prefix.h" <<'EOF'
+#ifndef _IONI_LIBC_PREFIX_H
+#define _IONI_LIBC_PREFIX_H
+#include <sys/dirent_private.h>
+#endif
+EOF
+        xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
         # vfprintf/arc4random self-enable the libtrace crash path that needs
         # the closed os/log_private.h - fall back to the plain _os_crash branch
         perl -pi -e 's{^#define OS_CRASH_ENABLE_EXPERIMENTAL_LIBTRACE 1$}{}' \
@@ -540,17 +573,27 @@ build_libc_static() {
         fi
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
-        xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c
+        xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libc_static build_libc_static
 
 build_libsystem_c() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # readdir.c reads the getdirentries64 tail flags from sys/dirent_private.h
+        # which only xnu's dirent.h includes under PRIVATE - the SDK dirent.h
+        # drops that include, so force-include the private header project-wide
+        cat > "$DEPS_DIR/Libc/_ioni_libc_prefix.h" <<'EOF'
+#ifndef _IONI_LIBC_PREFIX_H
+#define _IONI_LIBC_PREFIX_H
+#include <sys/dirent_private.h>
+#endif
+EOF
+        xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
         xcset "$DEPS_DIR/Libc" LIBRARY_SEARCH_PATHS "$FAKEROOT/usr/local/lib"
         xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS '-lioni_membership'
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
-        xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c
+        xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libsystem_c build_libsystem_c
 
