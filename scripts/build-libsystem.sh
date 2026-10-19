@@ -562,9 +562,8 @@ EOF
         sed -i '' "s|__IONI_XNU_MESSAGE_H__|#include \"$BUILD_DIR/xnu-include/mach/message.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
         sed -i '' "s|__IONI_XNU_EVENT_H__|#include \"$BUILD_DIR/xnu-include/sys/event.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
-        xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libdispatch" OTHER_CPLUSPLUSFLAGS '-fno-exceptions'
-        xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
+        xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error' '-fno-exceptions'
+                xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         # kernel atomic_private.h defaults the dependency mode off outside the kernel
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1' 'PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
         # dtrace providers need the closed dtrace bootstrap - tracepoints stay off
@@ -579,6 +578,11 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # the dispatch install clobbers the blocks-runtime Block.h with its
+        # indirect block.h on a case-insensitive fs - put the clean one back
+        cp "$DEPS_DIR/libclosure/Block.h" "$FROOT_INC/Block.h"
+        sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/Block.h" 2>/dev/null || true
+        perl -0777 -pi -e "$STRIP_UNAVAIL" "$FROOT_INC/Block.h" 2>/dev/null || true
         # readdir.c reads the getdirentries64 tail flags from sys/dirent_private.h
         # which only xnu's dirent.h includes under PRIVATE - the SDK dirent.h
         # drops that include, so force-include the private header project-wide
@@ -620,6 +624,11 @@ try libc_static build_libc_static
 
 build_libsystem_c() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # the dispatch install clobbers the blocks-runtime Block.h with its
+        # indirect block.h on a case-insensitive fs - put the clean one back
+        cp "$DEPS_DIR/libclosure/Block.h" "$FROOT_INC/Block.h"
+        sed -E -i '' "$STRIP_BOUNDS" "$FROOT_INC/Block.h" 2>/dev/null || true
+        perl -0777 -pi -e "$STRIP_UNAVAIL" "$FROOT_INC/Block.h" 2>/dev/null || true
         # readdir.c reads the getdirentries64 tail flags from sys/dirent_private.h
         # which only xnu's dirent.h includes under PRIVATE - the SDK dirent.h
         # drops that include, so force-include the private header project-wide
