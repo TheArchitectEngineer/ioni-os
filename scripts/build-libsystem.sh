@@ -148,6 +148,9 @@ mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
+mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
+cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/mach/arm/syscall_sw.h" "$FROOT_INC/mach/arm/" 2>/dev/null || true
 cp "$REPO_ROOT/libkern/libkern/OSCrossEndian.h" "$FROOT_INC/libkern/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$FROOT_INC/i386/" 2>/dev/null || true
@@ -185,10 +188,6 @@ cp "$REPO_ROOT/bsd/i386/disklabel.h" "$FROOT_INC/i386/disklabel.h" 2>/dev/null |
 # corecrypto public headers (APSL, vendored from Apple SDK headers) for xzone
 cp "$REPO_ROOT"/vendor/corecrypto/*.h "$FROOT_INC/corecrypto/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/os/assumes.h" "$FROOT_INC/os/assumes.h" 2>/dev/null || true
-# posix1e acl support references the closed membership framework header
-if [ ! -f "$FROOT_INC/membershipPriv.h" ]; then
-printf '/* Ioni: membership framework surface (declarations resolve at link) */\n#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <sys/types.h>\n#include <uuid/uuid.h>\nint mbr_uid_to_uuid(uid_t id, uuid_t uu);\nint mbr_gid_to_uuid(gid_t id, uuid_t uu);\nint mbr_uuid_to_uuid(const uuid_t uu, uuid_t suu);\nint mbr_check_membership(const uuid_t user, uuid_t group, int *ismember);\n#endif\n' > "$FROOT_INC/membershipPriv.h"
-fi
 # work intervals/personas: the shared headers hide the Libsyscall interface
 # behind #if PRIVATE - lift it below, after our xnu copies overwrite the
 # exporthdrs versions
@@ -358,7 +357,7 @@ void work_interval_instance_free(work_interval_instance_t wil);
 int work_interval_instance_clear(work_interval_instance_t wil);
 int work_interval_instance_start(work_interval_instance_t wil);
 int work_interval_instance_update(work_interval_instance_t wil);
-int work_interval_instance_finish(work_interval_instance_t wil, uint32_t type);
+int work_interval_instance_finish(work_interval_instance_t wil);
 int work_interval_instance_set_finish(work_interval_instance_t wil, uint32_t type);
 int work_interval_instance_set_start(work_interval_instance_t wil, uint64_t start);
 int work_interval_instance_set_deadline(work_interval_instance_t wil, uint64_t deadline);
@@ -496,6 +495,8 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xcset "$DEPS_DIR/Libc" LIBRARY_SEARCH_PATHS "$FAKEROOT/usr/local/lib"
+        xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS '-lioni_membership'
         # Libc clock_gettime uses the boottime SPI the SDK headers dropped
         if ! grep -q "extern uint64_t mach_boottime_usec" "$DEPS_DIR/Libc/gen/clock_gettime.c"; then
                 printf '/* Ioni: boottime SPI (mach_time_private.h) */\n#include <stdint.h>\nextern uint64_t mach_boottime_usec(void);\n' \
@@ -510,6 +511,8 @@ try libc_static build_libc_static
 
 build_libsystem_c() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        xcset "$DEPS_DIR/Libc" LIBRARY_SEARCH_PATHS "$FAKEROOT/usr/local/lib"
+        xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS '-lioni_membership'
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c
