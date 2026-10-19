@@ -69,6 +69,8 @@ xcset() {
 
 xb() {
         _src="$1"; _proj="$2"; _target="$3"; _name="$4"; _extra="${5:-}"; _xbs="${6:-}"
+        # older call sites pass build settings as the seventh argument
+        [ -n "${7:-}" ] && _xbs="$_xbs $7"
         # drop Apple-internal xcconfig includes, keep ones shipped with Xcode
         DEVDIR="$(xcode-select -p 2>/dev/null || true)"
         if [ -n "$DEVDIR" ] && [ -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
