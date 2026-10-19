@@ -173,7 +173,7 @@ fi
 cp "$DEPS_DIR/Libc/gen/thread_stack_pcs.h" "$FROOT_INC/" 2>/dev/null || true
 cp "$DEPS_DIR/Libc/include/_bounds.h" "$FROOT_INC/" 2>/dev/null || true
 # spawn SPI: kernel-user shared header from our xnu, the SDK ships only the public half
-cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/spawn_private.h" 2>/dev/null || true
+cp "$REPO_ROOT/libsyscall/wrappers/spawn/spawn_private.h" "$FROOT_INC/spawn_private.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/spawn_internal.h" "$FROOT_INC/sys/spawn_internal.h" 2>/dev/null || true
 # remaining libkern os headers (log_private and friends) the Libc sources expect
 cp "$REPO_ROOT"/libkern/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
@@ -190,7 +190,13 @@ if [ ! -f "$FROOT_INC/membershipPriv.h" ]; then
 printf '/* Ioni: membership framework surface (declarations resolve at link) */\n#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <sys/types.h>\n#include <uuid/uuid.h>\nint mbr_uid_to_uuid(uid_t id, uuid_t uu);\nint mbr_gid_to_uuid(gid_t id, uuid_t uu);\nint mbr_uuid_to_uuid(const uuid_t uu, uuid_t suu);\nint mbr_check_membership(const uuid_t user, uuid_t group, int *ismember);\n#endif\n' > "$FROOT_INC/membershipPriv.h"
 fi
 # work intervals/personas: the shared headers hide the Libsyscall interface
-# behind #if PRIVATE - lift it for the vendored copies
+# behind #if PRIVATE - lift it below, after our xnu copies overwrite the
+# exporthdrs versions
+cp "$REPO_ROOT/bsd/sys/proc_info_private.h" "$FROOT_INC/sys/proc_info_private.h" 2>/dev/null || true
+# work intervals and personas: shared kernel-user headers the SDK 26 trimmed
+cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/proc_info.h" "$FROOT_INC/sys/proc_info.h" 2>/dev/null || true
 for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h"; do
         [ -f "$_wh" ] || continue
         grep -q "IONI_PRIVATE_LIFTED" "$_wh" && continue
@@ -218,11 +224,6 @@ for ln in lines:
 open(f, "w").writelines(out)
 PYW
 done
-cp "$REPO_ROOT/bsd/sys/proc_info_private.h" "$FROOT_INC/sys/proc_info_private.h" 2>/dev/null || true
-# work intervals and personas: shared kernel-user headers the SDK 26 trimmed
-cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
-cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
-cp "$REPO_ROOT/bsd/sys/proc_info.h" "$FROOT_INC/sys/proc_info.h" 2>/dev/null || true
 # pthread priority encoding: kernel-user header from our xnu, pthread's qos_private.h
 # includes <pthread/priority_private.h> which Apple ships only in the internal SDK
 mkdir -p "$FROOT_INC/pthread"
@@ -362,13 +363,11 @@ build_libmalloc() {
         fi
         # every malloc target variant must default the atomic config itself
         perl -0pi -e 's{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n# error "Must set OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY in GCC_PREPROCESSOR_DEFINITIONS"\n#endif}{#ifndef OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY\n#define OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY 1\n#endif}' "$DEPS_DIR/libmalloc/src/internal.h"
-        # voucher.c needs the private proc info structs the public header dropped
-        if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
-                perl -pi -e 's{^(#include <sys/proc_info\.h>)$}{$1\n#include <sys/proc_info_private.h>\n#include <sys/persona.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
-        fi
-        # xzone wakes waiters through ulocks; the TU misses the include
+        # xzone wakes waiters through ulocks; the TU misses the include and has no
+        # sys/types.h anchor for inline patching - prepend at the top instead
         if ! grep -q "include <sys/ulock.h>" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"; then
-                perl -pi -e 's{^(#include <sys/types\.h>)$}{$1\n#include <sys/ulock.h>}' "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c" 2>/dev/null || true
+                printf '#include <sys/ulock.h>\n' | cat - "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c" > "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c.ioni" \
+                        && mv "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c.ioni" "$DEPS_DIR/libmalloc/src/xzone_malloc/xzone_malloc.c"
         fi
         # memorystatus kqueue notes for the pressure masks in internal.h
         if ! grep -q "IONI_NOTE_MEMORYSTATUS" "$DEPS_DIR/libmalloc/src/internal.h"; then
@@ -407,6 +406,11 @@ fi
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
+        # voucher.c needs the private proc info structs and persona SPI the public
+        # headers dropped - patch after the clone, not before
+        if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
+                perl -pi -e 's{^(#include <sys/proc_info\.h>)$}{$1\n#include <sys/proc_info_private.h>\n#include <sys/persona.h>}' "$DEPS_DIR/libdispatch/src/voucher.c" 2>/dev/null || true
+        fi
         # SDK headers (sys/time.h) self-include <dispatch/time.h> from the source tree
         # before src/internal.h defines the INDIRECT guards - set them project-wide
         # and force dispatch/base.h first via a prefix header
