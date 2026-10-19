@@ -107,8 +107,10 @@ MON_SOCK="$OUT_DIR/qmp.sock"
 rm -f "$MON_SOCK"
 
 if [ -n "${IONI_QEMU_GDB:-}" ]; then
-    WATCH_BASE=$(python3 - "$KERNEL" "$KERNEL.dSYM/Contents/Resources/DWARF/kernel" << 'PYEOF'
+    WATCH_INFO=$(python3 - "$KERNEL" "$KERNEL.dSYM/Contents/Resources/DWARF/kernel" << 'PYEOF'
 import struct, sys
+targets = {"_vm_page_locks": 0x48, "_zone_array": 0x19c, "_zone_info": 0xb0}
+found = {}
 for path in sys.argv[1:]:
     try:
         data = open(path, "rb").read()
@@ -132,32 +134,37 @@ for path in sys.argv[1:]:
         n_strx, n_type, n_sect, _, n_value = struct.unpack_from("<IBBHQ", data, o)
         if n_type & 0x0e:
             end = strtab.find(b"\0", n_strx)
-            name = strtab[n_strx:end]
-            if name == b"_vm_page_locks" and n_value:
-                print(hex(n_value))
-                sys.exit(0)
-sys.exit(1)
+            name = strtab[n_strx:end].decode(errors="replace")
+            if name in targets and name not in found:
+                found[name] = n_value
+for name, base in found.items():
+    print(name, hex(base), hex(base + targets[name]))
+if not found:
+    sys.exit(1)
 PYEOF
 )
-    if [ -z "$WATCH_BASE" ]; then
-        echo "qemu-boot: hunt failed, _vm_page_locks not found in symtab" >&2
+    if [ -z "$WATCH_INFO" ]; then
+        echo "qemu-boot: hunt failed, canary symbols not found in symtab" >&2
         exit 2
     fi
-    WATCH_ADDR=$(printf '0x%x' $((WATCH_BASE + 0x48)))
-    echo "qemu-boot: gdb hunt watching $WATCH_ADDR (vm_page_locks+0x48)"
+    echo "$WATCH_INFO"
     GDB_CMDS="$OUT_DIR/hunt.gdb"
     {
         echo "set pagination off"
         echo "set confirm off"
         echo "target remote localhost:1234"
-        echo "watch *(unsigned long *) $WATCH_ADDR"
+        echo "$WATCH_INFO" | while read -r name base addr; do
+            echo "watch *(unsigned long *) $addr"
+        done
         i=1
-        while [ $i -le 8 ]; do
+        while [ $i -le 12 ]; do
             echo "continue"
             echo "printf \"=== HUNT HIT $i ===\\\\n\""
             echo "info registers rip rsp rbp rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
-            echo "printf \"=== lock area ===\\\\n\""
-            echo "x/24gx $WATCH_BASE"
+            echo "$WATCH_INFO" | while read -r name base addr; do
+                echo "printf \"=== $name @ $base ===\\\\n\""
+                echo "x/12gx $base"
+            done
             echo "printf \"=== raw stack ===\\\\n\""
             echo "x/64gx \$rsp"
             i=$((i + 1))
