@@ -7,6 +7,7 @@ ESP_IMG="$OUT_DIR/ioni-esp.img"
 SERIAL_LOG="$OUT_DIR/qemu-serial.log"
 ESP_KB="${IONI_ESP_KB:-131072}"
 QEMU_TIMEOUT="${IONI_QEMU_TIMEOUT:-360}"
+QEMU_SMP="${IONI_QEMU_SMP:-4}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "qemu-boot: kernel not found: $KERNEL" >&2
@@ -101,17 +102,64 @@ if [ -z "$PFLASH_ARGS" ]; then
     exit 2
 fi
 
-echo "qemu-boot: starting qemu (tcg, timeout ${QEMU_TIMEOUT}s)"
+echo "qemu-boot: starting qemu (tcg, timeout ${QEMU_TIMEOUT}s, smp ${QEMU_SMP})"
+MON_SOCK="$OUT_DIR/qmp.sock"
+rm -f "$MON_SOCK"
+
+(
+    while true; do
+        if grep -q "panic(cpu" "$SERIAL_LOG" 2>/dev/null; then
+            sleep 1
+            python3 - "$MON_SOCK" "$OUT_DIR" << 'PYEOF'
+import json, socket, sys, os, time
+sock_path, out_dir = sys.argv[1], sys.argv[2]
+s = None
+for attempt in range(20):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock_path)
+        break
+    except OSError:
+        time.sleep(0.5)
+if s is None:
+    sys.exit(0)
+f = s.makefile("rw")
+f.readline()
+def cmd(o):
+    f.write(json.dumps(o) + "\n")
+    f.flush()
+    while True:
+        line = f.readline()
+        if not line:
+            return None
+        m = json.loads(line)
+        if "return" in m or "error" in m:
+            return m
+cmd({"execute": "qmp_capabilities"})
+dumps = [("lock-dump.bin", 0xcff380, 512), ("thread-dump.bin", 0xf98700, 512)]
+for name, val, size in dumps:
+    r = cmd({"execute": "pmemsave", "arguments": {"val": val, "size": size, "filename": os.path.join(out_dir, name)}})
+    print("qmp %s -> %s" % (name, r))
+s.close()
+PYEOF
+            break
+        fi
+        sleep 1
+    done
+) &
+WATCHER_PID=$!
+
 set +e
 timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -M q35 \
     -cpu IvyBridge,vendor=GenuineIntel \
     -m 4096 \
-    -smp 4 \
+    -smp "$QEMU_SMP" \
     -display none \
     -monitor none \
     -no-reboot \
     -serial "file:$SERIAL_LOG" \
+    -qmp "unix:$MON_SOCK,server,nowait" \
     -d int,cpu_reset,guest_errors \
     -D "$OUT_DIR/qemu-debug.log" \
     $PFLASH_ARGS \
@@ -119,6 +167,8 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     > "$OUT_DIR/qemu-stdout.log" 2>&1
 QEMU_RC=$?
 set -e
+kill "$WATCHER_PID" 2>/dev/null || true
+wait "$WATCHER_PID" 2>/dev/null || true
 
 echo "qemu-boot: qemu exit code $QEMU_RC (124 = timeout, normal for running kernel)"
 
@@ -137,6 +187,12 @@ if ! grep -q "jumping to kernel" "$SERIAL_LOG"; then
 fi
 
 KERNEL_MARKS="panic.cpu|Kernel Version|panic:|BSD|pmap|APIC|IOKit|kdp|machine_info|cpu:"
+for dump in "$OUT_DIR/lock-dump.bin" "$OUT_DIR/thread-dump.bin"; do
+    if [ -s "$dump" ]; then
+        echo "qemu-boot: post-mortem dump $dump:"
+        xxd "$dump" | head -32
+    fi
+done
 if grep -Eq "$KERNEL_MARKS" "$SERIAL_LOG"; then
     echo "qemu-boot: PASS kernel reached serial console"
     grep -E "$KERNEL_MARKS" "$SERIAL_LOG" | head -20

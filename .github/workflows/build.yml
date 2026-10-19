@@ -98,6 +98,8 @@ jobs:
             BUILD/qemu-serial.log
             BUILD/qemu-stdout.log
             BUILD/qemu-debug.log
+            BUILD/lock-dump.bin
+            BUILD/thread-dump.bin
           if-no-files-found: warn
 
   kernel-arm64:
