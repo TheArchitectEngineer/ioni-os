@@ -321,6 +321,14 @@ log "kernel header shims: ok"
 
 build_libpthread() {
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # pthread.h expects the internal-SDK _types.h which provides size_t;
+        # the public SDK copy does not - include stddef.h directly instead
+        perl -pi -e 's{^#include <_types\.h>$}{#include <stddef.h>}' "$DEPS_DIR/libpthread/include/pthread/pthread.h"
+        # _pthread_mutex_enable_legacy_mode is declared in pthread_spis.h but
+        # its implementation was dropped from the opensource tree - stub it
+        if ! grep -q "pthread_mutex_enable_legacy_mode" "$DEPS_DIR/libpthread/src/pthread_mutex.c"; then
+                printf '\n/* Ioni: SPI stub - implementation dropped upstream */\nvoid _pthread_mutex_enable_legacy_mode(void) {}\n' >> "$DEPS_DIR/libpthread/src/pthread_mutex.c"
+        fi
         # upstream strips the internal resolver machinery - both TUs define
         # the four wrappers and collide at link time; base TU wins, the
         # variant TU is emptied in place (pbxproj keeps its file reference)
@@ -450,6 +458,27 @@ build_libdispatch() {
         # include ahead of everything; the SDK header then no-ops on the guard
         mkdir -p "$BUILD_DIR/xnu-include/mach"
         cp "$REPO_ROOT/osfmk/mach/message.h" "$BUILD_DIR/xnu-include/mach/message.h"
+        # the internal SDK struct kevent carries qos and ext[4]; the open xnu
+        # ships the short userland one - swap the struct in our staged copy
+        mkdir -p "$BUILD_DIR/xnu-include/sys"
+        python3 - "$REPO_ROOT/bsd/sys/event.h" "$BUILD_DIR/xnu-include/sys/event.h" <<'PYEOF'
+import sys
+src = open(sys.argv[1], 'rb').read()
+start = src.index(b'struct kevent {')
+end = src.index(b'};', start) + 2
+ext = (b'struct kevent {\n'
+       b'\tuint64_t        ident;\n'
+       b'\tint16_t         filter;\n'
+       b'\tuint16_t        flags;\n'
+       b'\tint32_t         qos;\n'
+       b'\tuint64_t        udata;\n'
+       b'\tuint32_t        fflags;\n'
+       b'\tuint32_t        xflags;\n'
+       b'\tint64_t         data;\n'
+       b'\tuint64_t        ext[4];\n'
+       b'};')
+open(sys.argv[2], 'wb').write(src[:start] + ext + src[end:])
+PYEOF
         # voucher.c needs the private proc info structs and persona SPI the public
         # headers dropped - patch after the clone, not before
         if ! grep -q "sys/proc_info_private.h" "$DEPS_DIR/libdispatch/src/voucher.c"; then
@@ -460,6 +489,7 @@ build_libdispatch() {
         # and force dispatch/base.h first via a prefix header
         cat > "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h" <<'EOF'
 __IONI_XNU_MESSAGE_H__
+__IONI_XNU_EVENT_H__
 #ifndef __DISPATCH_INDIRECT__
 #define __DISPATCH_INDIRECT__ 1
 #endif
@@ -528,6 +558,7 @@ static inline int _pthread_priority_relpri(unsigned long pp)
 extern mach_port_name_t thread_get_special_reply_port(void);
 EOF
         sed -i '' "s|__IONI_XNU_MESSAGE_H__|#include \"$BUILD_DIR/xnu-include/mach/message.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
+        sed -i '' "s|__IONI_XNU_EVENT_H__|#include \"$BUILD_DIR/xnu-include/sys/event.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
@@ -553,6 +584,10 @@ build_libc_static() {
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
 #include <sys/param.h>
+/* Apple-internal alloc-once key enum; OS_ALLOC_ONCE_KEY_MAX is 100 */
+#ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
+#define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
+#endif
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
@@ -584,6 +619,10 @@ build_libsystem_c() {
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
 #include <sys/param.h>
+/* Apple-internal alloc-once key enum; OS_ALLOC_ONCE_KEY_MAX is 100 */
+#ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
+#define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
+#endif
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
