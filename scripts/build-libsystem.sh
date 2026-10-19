@@ -519,8 +519,14 @@ extern int nanosleep(const struct timespec *__rqtp, struct timespec *__rmtp);
 extern uint64_t clock_gettime_nsec_np(unsigned int __clock_id);
 /* blocks: the case-insensitive <Block.h> lookup picks up libdispatch's own
  * dispatch/block.h stub, so the block API rides here instead */
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern void *_Block_copy(const void *aBlock);
 extern void _Block_release(const void *aBlock);
+#ifdef __cplusplus
+}
+#endif
 #define Block_copy(...) ((__typeof(__VA_ARGS__))_Block_copy(__unsafe_forge_single(const void *, (const void *)(__VA_ARGS__))))
 #define Block_release(...) _Block_release(__unsafe_forge_single(const void *, (const void *)(__VA_ARGS__)))
 /* mach clock SPI the SDK headers no longer declare */
@@ -601,6 +607,9 @@ build_libc_static() {
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
 #endif
+/* locale-internal proto glob.c expects from the internal SDK headers */
+#include <sys/_types.h>
+extern int __wcollate_range_cmp(__darwin_wchar_t, __darwin_wchar_t);
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
@@ -618,6 +627,7 @@ EOF
         fi
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'PR_13085474_CHECK=0'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libc_static build_libc_static
@@ -647,6 +657,9 @@ build_libsystem_c() {
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
 #endif
+/* locale-internal proto glob.c expects from the internal SDK headers */
+#include <sys/_types.h>
+extern int __wcollate_range_cmp(__darwin_wchar_t, __darwin_wchar_t);
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
@@ -654,6 +667,7 @@ EOF
         xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS '-lioni_membership'
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'PR_13085474_CHECK=0'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libsystem_c build_libsystem_c
