@@ -30,7 +30,22 @@ static char **split(char *line)
 			*p++ = '\0';
 	}
 	args[n] = NULL;
+	if (n == MAX_ARGS && *p)
+		fprintf(stderr, "ionish: too many arguments, dropped after %s\n", args[MAX_ARGS - 1]);
 	return args;
+}
+
+static void strip_comment(char *line)
+{
+	char *p = line;
+
+	while (*p) {
+		if (*p == '#' && (p == line || p[-1] == ' ' || p[-1] == '\t')) {
+			*p = '\0';
+			return;
+		}
+		p++;
+	}
 }
 
 static void run_builtin(char **a)
@@ -84,19 +99,18 @@ static int is_builtin(const char *cmd)
 	       !strcmp(cmd, "env");
 }
 
-static void run_line(char *line)
+static int run_line(char *line)
 {
-	char *hash = strchr(line, '#');
+	int rc = 0;
 
-	if (hash)
-		*hash = '\0';
+	strip_comment(line);
 	char **a = split(line);
 
 	if (!a[0])
-		return;
+		return 0;
 	if (is_builtin(a[0])) {
 		run_builtin(a);
-		return;
+		return 0;
 	}
 	pid_t pid = fork();
 
@@ -107,32 +121,49 @@ static void run_line(char *line)
 	}
 	if (pid < 0) {
 		fprintf(stderr, "ionish: fork: %s\n", strerror(errno));
-		return;
+		return 1;
 	}
 	int status;
 
-	waitpid(pid, &status, 0);
-	if (WIFEXITED(status) && WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 127)
-		return;
-	if (WIFSIGNALED(status))
+	if (waitpid(pid, &status, 0) < 0)
+		return 1;
+	if (WIFSIGNALED(status)) {
 		fprintf(stderr, "ionish: %s: killed by signal %d\n", a[0], WTERMSIG(status));
+		rc = 128 + WTERMSIG(status);
+	} else if (WIFEXITED(status)) {
+		rc = WEXITSTATUS(status);
+	} else {
+		rc = 1;
+	}
+	return rc;
 }
 
 int main(int argc, char **argv)
 {
-	if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
-		run_line(argv[2]);
-		return 0;
-	}
+	if (argc >= 3 && strcmp(argv[1], "-c") == 0)
+		return run_line(argv[2]);
 
 	char line[MAX_LINE];
 
 	for (;;) {
+		int c;
+		size_t len;
+
 		fputs("ioni$ ", stdout);
 		fflush(stdout);
 		if (!fgets(line, sizeof line, stdin)) {
 			putchar('\n');
 			return 0;
+		}
+		len = strlen(line);
+		if (len > 0 && line[len - 1] != '\n') {
+			c = fgetc(stdin);
+			if (c != EOF && c != '\n') {
+				while (c != EOF && c != '\n')
+					c = fgetc(stdin);
+				fprintf(stderr, "ionish: line too long (max %d), dropped\n", MAX_LINE - 1);
+				continue;
+			}
 		}
 		run_line(line);
 	}
