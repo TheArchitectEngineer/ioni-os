@@ -733,34 +733,12 @@ EOF
         env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_gcflags \
                 -c "$_gap/getutmpx.c" -o "$_gap/getutmpx.o"
         printf '_fdopen _fdopen$DARWIN_EXTSN\n' > "$_gap/fdopen.alias"
-        # the target configs define OTHER_LDFLAGS without $(inherited) -
-        # inject the gap fillers straight into the pbxproj
-        python3 - "$DEPS_DIR/Libc/Libc.xcodeproj/project.pbxproj" "$_gap" <<'PYEOF'
-import sys
-p, gap = sys.argv[1], sys.argv[2]
-t = open(p).read()
-import re as _re
-n = 0
-extra = ('"$(LIBSYSTEM_C_LDFLAGS)" "-Wl,-alias_list,' + gap + '/fdopen.alias" '
-         '"' + gap + '/nanosleep.o" "' + gap + '/getutmpx.o"')
-for cid in ('C9D94331138DB73300FB7ACC', 'C9D94332138DB73300FB7ACC'):
-    m = _re.search(cid + r' /\* (Debug|Release) \*/ = \{', t)
-    if not m:
-        continue
-    j = t.find('buildSettings = {', m.start())
-    k = t.find('OTHER_LDFLAGS', j)
-    if k != -1 and t.find('};', j) > k:
-        end = t.find(';', k)
-        if 'fdopen.alias' not in t[k:end]:
-            t = t[:k] + 'OTHER_LDFLAGS = ' + extra + t[end:]
-            n += 1
-    else:
-        jj = t.find('buildSettings = {', m.start())
-        t = t[:jj+len('buildSettings = {')+1] + 'OTHER_LDFLAGS = ' + extra + ';\n' + t[jj+len('buildSettings = {')+1:]
-        n += 1
-open(p, 'w').write(t)
-print('libc ldflags injected into', n, 'configs')
-PYEOF
+        # the target links \$(LIBSYSTEM_C_LDFLAGS); the last assignment in
+        # libc.xcconfig wins - ride the gap fillers on the variable itself
+        _ldline="$(grep '^LIBSYSTEM_C_LDFLAGS' "$DEPS_DIR/Libc/xcodescripts/libc.xcconfig")"
+        printf '\n%s -Wl,-alias_list,%s/libc-gapfill/fdopen.alias %s/libc-gapfill/nanosleep.o %s/libc-gapfill/getutmpx.o\n' \
+                "$_ldline" "$BUILD_DIR" "$BUILD_DIR" "$BUILD_DIR" \
+                >> "$DEPS_DIR/Libc/xcodescripts/libc.xcconfig"
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libsystem_c build_libsystem_c
