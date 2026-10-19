@@ -370,6 +370,10 @@ random_cpu_init(int cpu)
 __mockable void
 read_random(void * buffer, u_int numbytes)
 {
+	if (__improbable(!prng_ready)) {
+		read_erandom(buffer, numbytes);
+		return;
+	}
 	prng_funcs.refresh(prng_ctx);
 	read_random_generate(buffer, numbytes);
 }
