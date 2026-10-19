@@ -578,7 +578,7 @@ EOF
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
                 -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +
         xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch \
-                "$DEPS_DIR/libdispatch" "" 'GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
+                "$DEPS_DIR/libdispatch" "" 'PRODUCT_NAME=dispatch INSTALL_PATH=/usr/lib/system EXECUTABLE_PREFIX=lib GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
 }
 try libdispatch build_libdispatch
 
@@ -628,6 +628,7 @@ EOF
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'PR_13085474_CHECK=0'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS '_LIBC_NO_FEATURE_VERIFICATION=1'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libc_static c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libc_static build_libc_static
@@ -668,6 +669,7 @@ EOF
         xcset "$DEPS_DIR/Libc" OTHER_CFLAGS '-Wno-error'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS 'PR_13085474_CHECK=0'
+        xcset "$DEPS_DIR/Libc" GCC_PREPROCESSOR_DEFINITIONS '_LIBC_NO_FEATURE_VERIFICATION=1'
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libsystem_c build_libsystem_c
