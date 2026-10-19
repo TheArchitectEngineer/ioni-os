@@ -514,6 +514,8 @@ __IONI_XNU_EVENT_H__
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
 #endif
+/* SDK 26.5 time.h also hides the POSIX sleep SPI behind those guards */
+extern int nanosleep(const struct timespec *__rqtp, struct timespec *__rmtp);
 extern uint64_t clock_gettime_nsec_np(unsigned int __clock_id);
 /* blocks: the case-insensitive <Block.h> lookup picks up libdispatch's own
  * dispatch/block.h stub, so the block API rides here instead */
@@ -561,6 +563,7 @@ EOF
         sed -i '' "s|__IONI_XNU_EVENT_H__|#include \"$BUILD_DIR/xnu-include/sys/event.h\"|" "$DEPS_DIR/libdispatch/_ioni_dispatch_prefix.h"
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
         xcset "$DEPS_DIR/libdispatch" OTHER_CFLAGS '-Wno-error'
+        xcset "$DEPS_DIR/libdispatch" OTHER_CPLUSPLUSFLAGS '-fno-exceptions'
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS '__DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1'
         # kernel atomic_private.h defaults the dependency mode off outside the kernel
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1' 'PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
@@ -583,7 +586,13 @@ build_libc_static() {
 #ifndef _IONI_LIBC_PREFIX_H
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
-#include <sys/param.h>
+/* sys/param.h leaks roundup() into gdtoa - provide only MAX/MIN */
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 /* Apple-internal alloc-once key enum; OS_ALLOC_ONCE_KEY_MAX is 100 */
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
@@ -618,7 +627,13 @@ build_libsystem_c() {
 #ifndef _IONI_LIBC_PREFIX_H
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
-#include <sys/param.h>
+/* sys/param.h leaks roundup() into gdtoa - provide only MAX/MIN */
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 /* Apple-internal alloc-once key enum; OS_ALLOC_ONCE_KEY_MAX is 100 */
 #ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_C
 #define OS_ALLOC_ONCE_KEY_LIBSYSTEM_C 95
