@@ -434,6 +434,14 @@ build_libclosure() {
 }
 try libclosure build_libclosure
 
+# Apple's internal CrashReporterClient archive: the Libc link line carries
+# -lCrashReporterClient and the public SDK has no stub for it
+if [ ! -f "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" ]; then
+        printf '/* Ioni: empty CrashReporterClient stub */\nint _ioni_crc_stub;\n' > "$DEPS_DIR/crc_stub.c"
+        xcrun clang -arch "$LIBARCHS" -c "$DEPS_DIR/crc_stub.c" -o "$DEPS_DIR/crc_stub.o"
+        ar crs "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" "$DEPS_DIR/crc_stub.o"
+        log "CrashReporterClient stub: ok"
+fi
 # blocks install drops Block_private.h but not Block.h, so every consumer that
 # pulls <Block_private.h> loses BLOCK_EXPORT - ship the header ourselves
 if [ -f "$DEPS_DIR/libclosure/Block.h" ] && [ -f "$FROOT_INC/Block_private.h" ] \
@@ -455,6 +463,23 @@ fi
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
+        # the project-level PRODUCT_NAME=$(TARGET_NAME) beats xcconfig levels;
+        # patch the libdispatch target configs directly (base = resolver)
+        python3 - "$DEPS_DIR/libdispatch/libdispatch.xcodeproj/project.pbxproj" <<'PYEOF'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+add = ('PRODUCT_NAME = dispatch;\n'
+       '\t\t\t\tINSTALL_PATH = "/usr/lib/system";\n'
+       '\t\t\t\tEXECUTABLE_PREFIX = lib;\n')
+key = 'baseConfigurationReference = E40041AA125D705F0022B135'
+out = []
+for chunk in t.split(key):
+    out.append(chunk)
+    if len(out) > 1 and 'buildSettings = {' in chunk:
+        out[-1] = chunk.replace('buildSettings = {', 'buildSettings = {\n' + add, 1)
+open(p, 'w').write(key.join([]) + key.join(out))
+PYEOF
         # mach_msg2/mach_msg_vector_t/mach_msg_qos_t live in the xnu message.h
         # PRIVATE blocks the SDK strips - stage our copy for the prefix to
         # include ahead of everything; the SDK header then no-ops on the guard
@@ -580,7 +605,7 @@ EOF
         find "$DEPS_DIR/libdispatch" -name "config.h" -path "*config*" \
                 -exec sed -i '' 's/#define HAVE_PTHREAD_MACHDEP_H 1/#define HAVE_PTHREAD_MACHDEP_H 0/' {} +
         xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj libdispatch dispatch \
-                "$DEPS_DIR/libdispatch" "" 'PRODUCT_NAME=dispatch INSTALL_PATH=/usr/lib/system EXECUTABLE_PREFIX=lib GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
+                "$DEPS_DIR/libdispatch" "" 'GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
 }
 try libdispatch build_libdispatch
 
