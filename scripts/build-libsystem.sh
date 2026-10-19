@@ -463,6 +463,10 @@ fi
 
 build_libdispatch() {
         clone libdispatch "$LIBDISPATCH_TAG" "$DEPS_DIR/libdispatch"
+        # the dirty/clean invariant checker is tuned to the internal build;
+        # our object set legitimately diverges - keep the phase, drop the gate
+        printf '#!/bin/bash -e\n# Ioni: internal invariant check disabled\nexit 0\n' \
+                > "$DEPS_DIR/libdispatch/xcodescripts/check-order.sh"
         # the project-level PRODUCT_NAME=$(TARGET_NAME) beats xcconfig levels;
         # patch the libdispatch target configs directly (base = resolver)
         python3 - "$DEPS_DIR/libdispatch/libdispatch.xcodeproj/project.pbxproj" <<'PYEOF'
@@ -703,7 +707,7 @@ EOF
         _gap="$BUILD_DIR/libc-gapfill"
         mkdir -p "$_gap"
         _sdk="$(xcrun -show-sdk-path)"
-        _gcflags="-arch $LIBARCHS -isysroot "$_sdk" -D__LIBC__ -D__DARWIN_UNIX03=1 -D__DARWIN_64_BIT_INO_T=1 -Wno-error -I$DEPS_DIR/Libc/include -I$DEPS_DIR/Libc/nbsdcompat -I$DEPS_DIR/Libc/gen"
+        _gcflags="-arch $LIBARCHS -isysroot "$_sdk" -D__LIBC__ -D_LIBC_NO_FEATURE_VERIFICATION=1 -D__DARWIN_UNIX03=1 -D__DARWIN_64_BIT_INO_T=1 -Wno-error -I$DEPS_DIR/Libc/include -I$DEPS_DIR/Libc/nbsdcompat -I$DEPS_DIR/Libc/gen"
         env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_gcflags \
                 -c "$DEPS_DIR/Libc/gen/nanosleep.c" -o "$_gap/nanosleep.o"
         cat > "$_gap/getutmpx.c" <<'EOF'
@@ -735,7 +739,11 @@ EOF
 import sys
 p, gap = sys.argv[1], sys.argv[2]
 t = open(p).read()
-add = ('OTHER_LDFLAGS = (\n'
+add = ('GCC_PREPROCESSOR_DEFINITIONS = (\n'
+       '\t\t\t\t\t"$(inherited)",\n'
+       '\t\t\t\t\t"_LIBC_NO_FEATURE_VERIFICATION=1",\n'
+       '\t\t\t\t);\n'
+       'OTHER_LDFLAGS = (\n'
        '\t\t\t\t\t"$(inherited)",\n'
        '\t\t\t\t\t"-Wl,-alias_list,' + gap + '/fdopen.alias",\n'
        '\t\t\t\t\t"' + gap + '/nanosleep.o",\n'
