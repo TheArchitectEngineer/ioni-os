@@ -477,6 +477,10 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
 #endif /* __BUILDING_XNU_LIB_UNITTEST__ */
 		startup_phase = cur->subsystem - 1;
 		kernel_startup_log(cur->subsystem);
+		if (__improbable(cur->func == NULL)) {
+			panic("startup entry %zd: NULL func, subsystem %d rank %d arg %p",
+			    cur - startup_entries, cur->subsystem, cur->rank, cur->arg);
+		}
 		cur->func(cur->arg);
 		startup_entry_cur = ++cur;
 	}

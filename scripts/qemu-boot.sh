@@ -112,6 +112,8 @@ import struct, sys
 targets = {"_vm_page_locks": [0x48], "_zone_info": [0xb0, 0x0]}
 seen = set()
 found = []
+startup_syms = []
+entry_cur_addr = None
 for path in sys.argv[1:]:
     try:
         data = open(path, "rb").read()
@@ -140,8 +142,20 @@ for path in sys.argv[1:]:
                 seen.add(name)
                 for off in targets[name]:
                     found.append((name, off, n_value + off))
+            if name.startswith("___startup_") and "_entry_" in name:
+                startup_syms.append(n_value)
+            if name == "_startup_entry_cur":
+                entry_cur_addr = n_value
 for name, off, addr in found:
     print(name, hex(addr))
+if startup_syms:
+    lo = min(startup_syms)
+    hi = max(startup_syms) + 24
+    if hi - lo > 0x20000:
+        hi = lo + 0x20000
+    print("startup_table", hex(lo), hex(hi))
+if entry_cur_addr is not None:
+    print("startup_entry_cur", hex(entry_cur_addr))
 if not found:
     sys.exit(1)
 PYEOF
@@ -157,8 +171,19 @@ PYEOF
         echo "set confirm off"
         echo "target remote localhost:1234"
         echo "$WATCH_INFO" | while read -r name addr; do
+            case "$name" in
+                startup_table|startup_entry_cur) continue ;;
+            esac
             echo "watch *(unsigned long *) $addr"
         done
+        TABLE_LO=$(echo "$WATCH_INFO" | awk '$1 == "startup_table" {print $2}')
+        TABLE_HI=$(echo "$WATCH_INFO" | awk '$1 == "startup_table" {print $3}')
+        CUR_ADDR=$(echo "$WATCH_INFO" | awk '$1 == "_startup_entry_cur" {print $2}')
+        if [ -n "$TABLE_LO" ]; then
+            echo "printf \"=== startup table $TABLE_LO-$TABLE_HI cur=$CUR_ADDR ===\\n\""
+            echo "dump binary memory $OUT_DIR/startup-table-hit0.bin $TABLE_LO $TABLE_HI"
+            echo "printf \"table dump written\\n\""
+        fi
         i=1
         while [ $i -le 40 ]; do
             echo "continue"
@@ -173,6 +198,15 @@ PYEOF
             echo "x/48gx \$rsp"
             i=$((i + 1))
         done
+        if [ -n "$TABLE_LO" ]; then
+            echo "printf \"=== startup table final dump ===\\n\""
+            echo "dump binary memory $OUT_DIR/startup-table-end.bin $TABLE_LO $TABLE_HI"
+            echo "printf \"final dump written\\n\""
+            if [ -n "$CUR_ADDR" ]; then
+                echo "printf \"startup_entry_cur: \""
+                echo "x/1gx $CUR_ADDR"
+            fi
+        fi
         echo "kill"
         echo "quit"
     } > "$GDB_CMDS"
