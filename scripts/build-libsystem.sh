@@ -749,10 +749,13 @@ add = ('GCC_PREPROCESSOR_DEFINITIONS = (\n'
        '\t\t\t\t\t"' + gap + '/nanosleep.o",\n'
        '\t\t\t\t\t"' + gap + '/getutmpx.o",\n'
        '\t\t\t\t);\n')
+import re as _re
 n = 0
 for cid in ('C9D94331138DB73300FB7ACC', 'C9D94332138DB73300FB7ACC'):
-    i = t.find(cid)
-    j = t.find('buildSettings = {', i)
+    m = _re.search(cid + r' /\* (Debug|Release) \*/ = \{', t)
+    if not m:
+        continue
+    j = t.find('buildSettings = {', m.start())
     if 'OTHER_LDFLAGS' not in t[j:j+200]:
         t = t[:j+len('buildSettings = {')+1] + add + t[j+len('buildSettings = {')+1:]
         n += 1
