@@ -109,8 +109,9 @@ rm -f "$MON_SOCK"
 if [ -n "${IONI_QEMU_GDB:-}" ]; then
     WATCH_INFO=$(python3 - "$KERNEL" "$KERNEL.dSYM/Contents/Resources/DWARF/kernel" << 'PYEOF'
 import struct, sys
-targets = {"_vm_page_locks": 0x48, "_zone_array": 0x19c, "_zone_info": 0xb0}
-found = {}
+targets = {"_vm_page_locks": [0x48], "_zone_info": [0xb0, 0x0]}
+seen = set()
+found = []
 for path in sys.argv[1:]:
     try:
         data = open(path, "rb").read()
@@ -135,10 +136,12 @@ for path in sys.argv[1:]:
         if n_type & 0x0e:
             end = strtab.find(b"\0", n_strx)
             name = strtab[n_strx:end].decode(errors="replace")
-            if name in targets and name not in found:
-                found[name] = n_value
-for name, base in found.items():
-    print(name, hex(base), hex(base + targets[name]))
+            if name in targets and name not in seen:
+                seen.add(name)
+                for off in targets[name]:
+                    found.append((name, off, n_value + off))
+for name, off, addr in found:
+    print(name, hex(addr))
 if not found:
     sys.exit(1)
 PYEOF
@@ -153,20 +156,21 @@ PYEOF
         echo "set pagination off"
         echo "set confirm off"
         echo "target remote localhost:1234"
-        echo "$WATCH_INFO" | while read -r name base addr; do
+        echo "$WATCH_INFO" | while read -r name addr; do
             echo "watch *(unsigned long *) $addr"
         done
         i=1
-        while [ $i -le 12 ]; do
+        while [ $i -le 40 ]; do
             echo "continue"
             echo "printf \"=== HUNT HIT $i ===\\\\n\""
             echo "info registers rip rsp rbp rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
-            echo "$WATCH_INFO" | while read -r name base addr; do
-                echo "printf \"=== $name @ $base ===\\\\n\""
-                echo "x/12gx $base"
+            echo "printf \"=== canaries ===\\\\n\""
+            echo "$WATCH_INFO" | while read -r name addr; do
+                echo "printf \"$name @ $addr: \""
+                echo "x/2gx $addr"
             done
             echo "printf \"=== raw stack ===\\\\n\""
-            echo "x/64gx \$rsp"
+            echo "x/48gx \$rsp"
             i=$((i + 1))
         done
         echo "kill"
