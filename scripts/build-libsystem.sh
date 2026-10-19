@@ -702,7 +702,8 @@ EOF
         # links: compile them here and ride them on the link line
         _gap="$BUILD_DIR/libc-gapfill"
         mkdir -p "$_gap"
-        _gcflags="-arch $LIBARCHS -isysroot macosx -D__LIBC__ -D__DARWIN_UNIX03=1 -D__DARWIN_64_BIT_INO_T=1 -Wno-error -I$DEPS_DIR/Libc/include -I$DEPS_DIR/Libc/nbsdcompat -I$DEPS_DIR/Libc/gen"
+        _sdk="$(xcrun -show-sdk-path)"
+        _gcflags="-arch $LIBARCHS -isysroot "$_sdk" -D__LIBC__ -D__DARWIN_UNIX03=1 -D__DARWIN_64_BIT_INO_T=1 -Wno-error -I$DEPS_DIR/Libc/include -I$DEPS_DIR/Libc/nbsdcompat -I$DEPS_DIR/Libc/gen"
         env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_gcflags \
                 -c "$DEPS_DIR/Libc/gen/nanosleep.c" -o "$_gap/nanosleep.o"
         cat > "$_gap/getutmpx.c" <<'EOF'
@@ -728,8 +729,28 @@ EOF
         env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_gcflags \
                 -c "$_gap/getutmpx.c" -o "$_gap/getutmpx.o"
         printf '_fdopen _fdopen$DARWIN_EXTSN\n' > "$_gap/fdopen.alias"
-        xcset "$DEPS_DIR/Libc" OTHER_LDFLAGS "-Wl,-alias_list,$_gap/fdopen.alias" \
-                "$_gap/nanosleep.o" "$_gap/getutmpx.o"
+        # the target configs define OTHER_LDFLAGS without $(inherited) -
+        # inject the gap fillers straight into the pbxproj
+        python3 - "$DEPS_DIR/Libc/Libc.xcodeproj/project.pbxproj" "$_gap" <<'PYEOF'
+import sys
+p, gap = sys.argv[1], sys.argv[2]
+t = open(p).read()
+add = ('OTHER_LDFLAGS = (\n'
+       '\t\t\t\t\t"$(inherited)",\n'
+       '\t\t\t\t\t"-Wl,-alias_list,' + gap + '/fdopen.alias",\n'
+       '\t\t\t\t\t"' + gap + '/nanosleep.o",\n'
+       '\t\t\t\t\t"' + gap + '/getutmpx.o",\n'
+       '\t\t\t\t);\n')
+n = 0
+for cid in ('C9D94331138DB73300FB7ACC', 'C9D94332138DB73300FB7ACC'):
+    i = t.find(cid)
+    j = t.find('buildSettings = {', i)
+    if 'OTHER_LDFLAGS' not in t[j:j+200]:
+        t = t[:j+len('buildSettings = {')+1] + add + t[j+len('buildSettings = {')+1:]
+        n += 1
+open(p, 'w').write(t)
+print('libc ldflags injected into', n, 'configs')
+PYEOF
         xb "$DEPS_DIR/Libc" Libc.xcodeproj libsystem_c.dylib system_c "" "" 'GCC_PREFIX_HEADER=_ioni_libc_prefix.h'
 }
 try libsystem_c build_libsystem_c
