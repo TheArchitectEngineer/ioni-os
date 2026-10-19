@@ -466,6 +466,9 @@ build_libdispatch() {
         # the dirty/clean invariant checker is tuned to the internal build;
         # our object set legitimately diverges - keep the phase, drop the gate
         printf '#!/bin/bash -e\n# Ioni: internal invariant check disabled\nexit 0\n' \
+        # the opensource tree drops install-plists.sh but the phase sources it
+        printf '#!/bin/bash -e\n# Ioni: nothing to install, script dropped upstream\n' \
+                > "$DEPS_DIR/libdispatch/xcodescripts/install-plists.sh"
                 > "$DEPS_DIR/libdispatch/xcodescripts/check-order.sh"
         # the project-level PRODUCT_NAME=$(TARGET_NAME) beats xcconfig levels;
         # patch the libdispatch target configs directly (base = resolver)
@@ -616,6 +619,10 @@ try libdispatch build_libdispatch
 
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
+        # the variant macros key off VARIANT_PLATFORM_NAME resolved through
+        # the FALLBACK_PLATFORM default modifier - it does not resolve here,
+        # so Pre1050/Legacy symbols come out unrenamed and collide - pin it
+        printf '\nVARIANT_PLATFORM_NAME = macosx\n' >> "$DEPS_DIR/Libc/xcodescripts/variants.xcconfig"
         # the dispatch install clobbers the blocks-runtime Block.h with its
         # indirect block.h on a case-insensitive fs - put the clean one back
         cp "$DEPS_DIR/libclosure/Block.h" "$FROOT_INC/Block.h"
