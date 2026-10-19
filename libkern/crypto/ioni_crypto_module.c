@@ -2,6 +2,7 @@
 #include <libkern/crypto/register_crypto.h>
 #include <libkern/section_keywords.h>
 #include <kern/startup.h>
+#include <kern/misc_protos.h>
 #include <machine/machine_routines.h>
 #include <prng/random.h>
 #include <sys/random.h>
@@ -72,10 +73,27 @@ ioni_digest_final(crypto_digest_alg_t alg, void *ctx, size_t ctx_size,
 }
 
 static void
+ioni_ccdigest(const struct ccdigest_info *di, unsigned long len,
+    const void *data, void *digest)
+{
+	ccdigest_di_decl(di, ctx);
+
+	ccdigest_init(di, ctx);
+	ccdigest_update(di, ctx, len, data);
+	ccdigest_final(di, ctx, digest);
+	ccdigest_di_clear(di, ctx);
+}
+
+static void
 ioni_digest(crypto_digest_alg_t alg, const void *data, size_t data_size,
     void *digest, size_t digest_size)
 {
-	ccdigest(ioni_digest_info(alg), data_size, data, digest);
+	const struct ccdigest_info *di = ioni_digest_info(alg);
+
+	if (__improbable(digest_size < di->output_size)) {
+		panic("ioni_crypto: digest buffer too small alg %u", alg);
+	}
+	ioni_ccdigest(di, data_size, data, digest);
 }
 
 static size_t
@@ -177,6 +195,7 @@ ioni_random_kmem_init(crypto_random_ctx_t ctx)
 	int rc;
 	const char ps[] = "ioni kmem random";
 
+	(void)early_random();
 	read_random(seed, sizeof(seed));
 	nonce = ml_get_timebase();
 	rc = ccdrbg_init(&ioni_krng.info, (struct ccdrbg_state *)ctx,
@@ -216,7 +235,7 @@ static struct crypto_functions ioni_crypto_funcs = {
 	.ccdigest_init_fn = ccdigest_init,
 	.ccdigest_update_fn = ccdigest_update,
 	.ccdigest_final_fn = ioni_ccdigest_final,
-	.ccdigest_fn = ccdigest,
+	.ccdigest_fn = ioni_ccdigest,
 	.ccsha256_di = &ccsha256_ltc_di,
 	.ccsha512_di = &ccsha512_ltc_di,
 	.cchmac_init_fn = cchmac_init,
