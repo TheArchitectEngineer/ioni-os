@@ -32,10 +32,13 @@ Primary target: **x86_64 (PC hardware)**. ARM64 is paused as a product target; t
 - [x] POSIX shell with builtins: cd / echo / pwd / env / exit (`userland/ionish`)
 - [x] Rootfs layout and HFS+ image builder (`scripts/rootfs.sh`), CI artifact
 - [x] libsyscall from the Ioni kernel sources built into the fakeroot (xnu_libraries)
+- [x] Corruption hunt: memory-safety audit of init/ionish (long-line splitting, silent arg truncation, exit-code passthrough, SIG_IGN inheritance, console fd fallback)
+- [x] ASan/UBSan adversarial suite in CI (`tests/hunt.sh`, ubuntu job) + hardened userland build (stack-protector, FORTIFY_SOURCE, format-security, auto-var-init)
 - [ ] libSystem / libc built from source against the Ioni kernel - libsyscall, libpthread, libmalloc, libclosure, libdispatch built in CI; Libc-1752.120.2 (libc_static, libsystem_c) scaffolded in the same chain; full chain needs the closed-source pieces
 - [ ] dyld - blocked on liblibc*.a archives (Libc + libmalloc liblibc target), next wave
 - [ ] Shell and BSD utilities on top of the native libc
 - [ ] Bootable image: kernel + rootfs in a VM
+- [ ] Kernel-side corruption detectors: KASAN kernel config artifact and `-zc` (zone corruption debug) boot-args exercised in the VM boot test
 
 ## Stage 3 — Homebrew
 
@@ -63,7 +66,7 @@ Primary target: **x86_64 (PC hardware)**. ARM64 is paused as a product target; t
 
 **Этап 1 — собираемое ядро** (почти готов): скрипты сборки и CI, экспорт заголовков, fakeroot-цепочка зависимостей и полная сборка x86_64-ядра с артефактом в CI; ARM64-линковка закрыта: VMAPPLE-ядро собирается в CI с KDK 26.5 (дерево запиновано на xnu-12377.121.6). Открытая загрузочная база вендорена из экосистемы PureDarwin (BSD-3): `boot/xnu-loader` — UEFI-загрузчик BOOTX64.EFI, который грузит сырой Mach-O ядра на QEMU x86-64 (boot_args x86_64 ABI совпадает с нашим деревом), `boot/kc-tools` — открытый сборщик kernel collection без kmutil. Новая CI-джоба на ubuntu-раннере собирает ESP-образ и грузит ядро в QEMU TCG — nested virtualization не нужна, поэтому boot-тест живёт прямо в GitHub CI (`scripts/qemu-boot.sh`). Tart-трек (KC через in-guest kmutil, `scripts/vm-boot.sh`) остаётся для реального Mac/self-hosted runner — hosted раннеры не дают nested virtualization. Следующий шаг x86_64-трека — KC от kc-tools с QEMU-драйверами (VirtIO, PS2, ACPI). Статус загрузки: ядро Ioni грузится в QEMU в CI до баннера, pmap и инициализации зон; дальше — дебаг плавающей порчи памяти в позднем zalloc (посмертные QMP-дампы уже в CI).
 
-**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall и Blocks уже собираются в fakeroot; libpthread/libmalloc/libdispatch/Libc каркассятся в CI (нейтрализация bounds-аннотаций, приватные заголовки, приватная availability-механика — следующая волна); дальше — dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
+**Этап 2 — минимальный userland** (начат): свой init (консоль, запуск шелла, сбор сирот) и POSIX-шелл `ionish` со встроенными командами готовы, rootfs-раскладка и HFS+-образ собираются в CI; libsyscall и Blocks уже собираются в fakeroot; libpthread/libmalloc/libdispatch/Libc каркассятся в CI (нейтрализация bounds-аннотаций, приватные заголовки, приватная availability-механика — следующая волна); проведена охота на коррупцию: аудит памяти init/ionish с фиксами, адверсариальный ASan/UBSan-корпус в CI и хардендинг сборки; дальше — dyld (нужны архивы liblibc), BSD-утилиты и загружаемый образ с ядром.
 
 **Этап 3 — Homebrew**: портирование пакетного менеджера и собственный tap.
 
