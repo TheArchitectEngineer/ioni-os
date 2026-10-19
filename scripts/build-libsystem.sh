@@ -496,11 +496,7 @@ extern kern_return_t mach_get_times(uint64_t *absolute_time,
         uint64_t *continuous_time, struct timespec *tp);
 extern int kdebug_trace(uint32_t code, uint64_t a, uint64_t b,
         uint64_t c, uint64_t d);
-/* mach message aux header, kernel-user shared struct from our xnu */
-typedef struct {
-        uint32_t        msgdh_size;
-        uint32_t        msgdh_reserved;
-} mach_msg_aux_header_t;
+/* mach_msg_aux_header_t arrives with the xnu message.h included above */
 /* set by the internal Apple build outside the opensource tree */
 #ifndef DISPATCH_SEND_ACTIVITY_IN_MSGV
 #define DISPATCH_SEND_ACTIVITY_IN_MSGV 1
@@ -556,6 +552,7 @@ build_libc_static() {
 #ifndef _IONI_LIBC_PREFIX_H
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
+#include <sys/param.h>
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'
@@ -586,6 +583,7 @@ build_libsystem_c() {
 #ifndef _IONI_LIBC_PREFIX_H
 #define _IONI_LIBC_PREFIX_H
 #include <sys/dirent_private.h>
+#include <sys/param.h>
 #endif
 EOF
         xcset "$DEPS_DIR/Libc" GCC_PREFIX_HEADER '_ioni_libc_prefix.h'

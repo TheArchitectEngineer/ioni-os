@@ -15,7 +15,7 @@
  
     Conditional configuration macros specific to corecrypto should be named CORECRYPTO_xxx
     or CCxx_yyy and be defined to be either 0 or 1 in this file. You can add an 
-    #ifndef #error construct at the end of this file to make sure it's always defined.
+    ifndef-error guard construct at the end of this file to make sure it's always defined.
 
     They should always be tested using the #if directive, never the #ifdef directive.
 
