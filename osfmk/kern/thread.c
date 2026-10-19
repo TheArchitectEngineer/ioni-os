@@ -419,6 +419,8 @@ thread_init(void)
 	 */
 	machine_thread_init();
 
+	init_thread.turnstile = turnstile_alloc();
+
 	init_thread_ledgers();
 }
 
