@@ -1386,6 +1386,13 @@ kalloc_type_create_iterators_var(
 	return n;
 }
 
+#ifndef __BUILDING_XNU_LIB_UNITTEST__
+#define KT_ZONES_FOR_SIZE_SIZE 32
+#else /* __BUILDING_XNU_LIB_UNITTEST__ */
+/* different init sequence in unit-test requires a bigger buffer in the kalloc zones initialization */
+#define KT_ZONES_FOR_SIZE_SIZE 35
+#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
+
 __startup_func
 static uint16_t
 kalloc_type_distribute_budget(
@@ -1446,6 +1453,11 @@ kalloc_type_distribute_budget(
 			modulo += (extra_zones * total_sig);
 			n_zones -= extra_zones;
 		}
+
+		if (kt_zones[i] + n_zones > KT_ZONES_FOR_SIZE_SIZE - 1) {
+			n_zones = (KT_ZONES_FOR_SIZE_SIZE - 1) - kt_zones[i];
+		}
+
 		kt_zones[i] += n_zones;
 		assigned_zones += n_zones;
 	}
@@ -1699,13 +1711,6 @@ kalloc_type_init_sig_eq(
 	}
 }
 
-#ifndef __BUILDING_XNU_LIB_UNITTEST__
-#define KT_ZONES_FOR_SIZE_SIZE 32
-#else /* __BUILDING_XNU_LIB_UNITTEST__ */
-/* different init sequence in unit-test requires a bigger buffer in the kalloc zones initialization */
-#define KT_ZONES_FOR_SIZE_SIZE 35
-#endif /* __BUILDING_XNU_LIB_UNITTEST__ */
-
 __startup_func
 static uint16_t
 kalloc_type_distribute_zone_for_type(
@@ -1812,7 +1817,16 @@ kalloc_type_create_zones_fixed(
 		}
 
 		zone_carry = 0;
-		assert(n_zones_sig + n_zones_type + 1 <= KT_ZONES_FOR_SIZE_SIZE);
+		if (n_zones_sig + n_zones_type + 1 > KT_ZONES_FOR_SIZE_SIZE) {
+			while (n_zones_sig + n_zones_type + 1 > KT_ZONES_FOR_SIZE_SIZE) {
+				if (n_zones_type > 0) {
+					n_zones_type--;
+				} else {
+					n_zones_sig--;
+				}
+			}
+			printf("kalloc_type_create_zones_fixed: clamped zones for size %u\n", (uint32_t)z_size);
+		}
 		zone_t kt_zones_for_size[KT_ZONES_FOR_SIZE_SIZE] = {};
 		kalloc_type_create_zone_for_size(kt_zones_for_size,
 		    n_zones_sig + n_zones_type, z_size);
