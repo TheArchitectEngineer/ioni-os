@@ -41,6 +41,7 @@
 #include <kern/zalloc.h>
 #include <kern/debug.h>
 #include <kern/compact_id.h>
+#include <kern/startup.h>
 #include <machine/limits.h>
 #include <machine/atomic.h>
 #include <machine/machine_routines.h>
@@ -315,8 +316,9 @@ LCK_GRP_DECLARE(turnstiles_htable_lock_grp, "turnstiles_htable_locks");
  * Returns:
  *   None
  */
+__startup_func
 static void
-turnstiles_hashtable_init(void)
+turnstiles_hashtable_startup(void)
 {
 	/* Initialize number of buckets in the hashtable */
 	if (PE_parse_boot_argn("ts_htable_buckets", &ts_htable_buckets, sizeof(ts_htable_buckets)) != TRUE) {
@@ -346,6 +348,7 @@ turnstiles_hashtable_init(void)
 		SLIST_INIT(&ts_bucket->ts_ht_bucket_list);
 	}
 }
+STARTUP(ZALLOC, STARTUP_RANK_SECOND, turnstiles_hashtable_startup);
 
 /*
  * Name: turnstile_freelist_empty
@@ -769,7 +772,6 @@ void
 turnstiles_init(void)
 {
 	ctsid_nonce = (uint32_t)early_random() & CTSID_MASK;
-	turnstiles_hashtable_init();
 
 #if DEVELOPMENT || DEBUG
 	/* Initialize turnstile test primitive */
@@ -790,6 +792,25 @@ turnstiles_init(void)
  * Returns:
  *   turnstile on Success.
  */
+static struct turnstile turnstile_boot_turnstile;
+
+struct turnstile *
+turnstile_alloc_bootstrap(void)
+{
+	struct turnstile *turnstile = &turnstile_boot_turnstile;
+
+	waitq_init(&turnstile->ts_waitq, WQT_TURNSTILE,
+	    SYNC_POLICY_REVERSED | SYNC_POLICY_INIT_LOCKED);
+	SLIST_INIT(&turnstile->ts_free_turnstiles);
+	turnstile_set_type_and_increment_gencount(turnstile, TURNSTILE_NONE);
+	turnstile_state_init(turnstile, TURNSTILE_STATE_THREAD);
+	os_ref_init_raw(&turnstile->ts_refcount, &turnstile_refgrp);
+	priority_queue_init(&turnstile->ts_inheritor_queue);
+	waitq_unlock(&turnstile->ts_waitq);
+
+	return turnstile;
+}
+
 struct turnstile *
 turnstile_alloc(void)
 {

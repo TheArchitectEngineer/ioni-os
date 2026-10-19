@@ -106,6 +106,72 @@ echo "qemu-boot: starting qemu (tcg, timeout ${QEMU_TIMEOUT}s, smp ${QEMU_SMP})"
 MON_SOCK="$OUT_DIR/qmp.sock"
 rm -f "$MON_SOCK"
 
+if [ -n "${IONI_QEMU_GDB:-}" ]; then
+    WATCH_BASE=$(python3 - "$KERNEL" "$KERNEL.dSYM/Contents/Resources/DWARF/kernel" << 'PYEOF'
+import struct, sys
+for path in sys.argv[1:]:
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        continue
+    if len(data) < 32 or struct.unpack_from("<I", data, 0)[0] != 0xfeedfacf:
+        continue
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    off = 32
+    symoff = nsyms = stroff = 0
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == 0x2:
+            symoff, nsyms, stroff, _ = struct.unpack_from("<IIII", data, off + 8)
+        off += cmdsize
+    if not symoff:
+        continue
+    strtab = data[stroff:]
+    for i in range(nsyms):
+        o = symoff + i * 16
+        n_strx, n_type, n_sect, _, n_value = struct.unpack_from("<IBBHQ", data, o)
+        if n_type & 0x0e:
+            end = strtab.find(b"\0", n_strx)
+            name = strtab[n_strx:end]
+            if name == b"_vm_page_locks" and n_value:
+                print(hex(n_value))
+                sys.exit(0)
+sys.exit(1)
+PYEOF
+)
+    if [ -z "$WATCH_BASE" ]; then
+        echo "qemu-boot: hunt failed, _vm_page_locks not found in symtab" >&2
+        exit 2
+    fi
+    WATCH_ADDR=$(printf '0x%x' $((WATCH_BASE + 0x48)))
+    echo "qemu-boot: gdb hunt watching $WATCH_ADDR (vm_page_locks+0x48)"
+    GDB_CMDS="$OUT_DIR/hunt.gdb"
+    {
+        echo "set pagination off"
+        echo "set confirm off"
+        echo "target remote localhost:1234"
+        echo "watch *(unsigned long *) $WATCH_ADDR"
+        i=1
+        while [ $i -le 8 ]; do
+            echo "continue"
+            echo "printf \"=== HUNT HIT $i ===\\\\n\""
+            echo "info registers rip rsp rbp rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
+            echo "printf \"=== lock area ===\\\\n\""
+            echo "x/24gx $WATCH_BASE"
+            echo "printf \"=== raw stack ===\\\\n\""
+            echo "x/64gx \$rsp"
+            i=$((i + 1))
+        done
+        echo "kill"
+        echo "quit"
+    } > "$GDB_CMDS"
+    QEMU_GDB_EXTRA="-S -s"
+    HUNT_LOG="$OUT_DIR/qemu-gdb-hunt.log"
+else
+    QEMU_GDB_EXTRA=""
+    HUNT_LOG=""
+fi
+
 (
     while true; do
         if grep -q "panic(cpu" "$SERIAL_LOG" 2>/dev/null; then
@@ -150,6 +216,35 @@ PYEOF
 WATCHER_PID=$!
 
 set +e
+if [ -n "$HUNT_LOG" ]; then
+    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
+        -M q35 \
+        -cpu IvyBridge,vendor=GenuineIntel \
+        -m 4096 \
+        -smp "$QEMU_SMP" \
+        -display none \
+        -monitor none \
+        -no-reboot \
+        -serial "file:$SERIAL_LOG" \
+        -qmp "unix:$MON_SOCK,server,nowait" \
+        -d int,cpu_reset,guest_errors \
+        -D "$OUT_DIR/qemu-debug.log" \
+        $PFLASH_ARGS \
+        -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
+        $QEMU_GDB_EXTRA \
+        > "$OUT_DIR/qemu-stdout.log" 2>&1 &
+    QEMU_PID=$!
+    sleep 2
+    timeout "$QEMU_TIMEOUT" gdb -q -batch -x "$GDB_CMDS" > "$HUNT_LOG" 2>&1
+    GDB_RC=$?
+    echo "qemu-boot: gdb hunt rc $GDB_RC, hits: $(grep -c 'HUNT HIT' "$HUNT_LOG" || true)"
+    grep -A 24 "HUNT HIT" "$HUNT_LOG" | head -120 || true
+    kill "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+    kill "$WATCHER_PID" 2>/dev/null || true
+    set -e
+    exit 0
+fi
 timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -M q35 \
     -cpu IvyBridge,vendor=GenuineIntel \
@@ -186,23 +281,35 @@ if ! grep -q "jumping to kernel" "$SERIAL_LOG"; then
     exit 1
 fi
 
-KERNEL_MARKS="panic.cpu|Kernel Version|panic:|BSD|pmap|APIC|IOKit|kdp|machine_info|cpu:"
+KERNEL_MARKS="Kernel Version|BSD|pmap|APIC|IOKit|kdp|machine_info|cpu:"
+PANIC_MARKS="panic\\(cpu|Kernel trap at|Debugger called: <panic>"
 for dump in "$OUT_DIR/lock-dump.bin" "$OUT_DIR/thread-dump.bin"; do
     if [ -s "$dump" ]; then
         echo "qemu-boot: post-mortem dump $dump:"
         xxd "$dump" | head -32
     fi
 done
-if grep -Eq "$KERNEL_MARKS" "$SERIAL_LOG"; then
-    echo "qemu-boot: PASS kernel reached serial console"
-    grep -E "$KERNEL_MARKS" "$SERIAL_LOG" | head -20
-    exit 0
+if grep -Eq "$PANIC_MARKS" "$SERIAL_LOG"; then
+    echo "qemu-boot: FAIL kernel panicked during boot" >&2
+    grep -E "panic\\(cpu|Kernel trap at|type = |Backtrace|mach_kernel|CR2:" "$SERIAL_LOG" | head -50
+    exit 1
+fi
+if ! grep -Eq "$KERNEL_MARKS" "$SERIAL_LOG"; then
+    echo "qemu-boot: FAIL no kernel serial output detected (silent early fault?)" >&2
+    tail -80 "$SERIAL_LOG"
+    if [ -s "$OUT_DIR/qemu-debug.log" ]; then
+        echo "qemu-boot: qemu debug log: $(wc -l < "$OUT_DIR/qemu-debug.log") lines, tail:" >&2
+        tail -40 "$OUT_DIR/qemu-debug.log" >&2
+    fi
+    exit 1
+fi
+OK_MARK="${IONI_BOOT_OK_MARK:-VM bootstrap done}"
+if ! grep -q "$OK_MARK" "$SERIAL_LOG"; then
+    echo "qemu-boot: FAIL kernel did not reach '$OK_MARK'" >&2
+    tail -60 "$SERIAL_LOG"
+    exit 1
 fi
 
-echo "qemu-boot: FAIL no kernel serial output detected (silent early fault?)" >&2
-tail -80 "$SERIAL_LOG"
-if [ -s "$OUT_DIR/qemu-debug.log" ]; then
-    echo "qemu-boot: qemu debug log: $(wc -l < "$OUT_DIR/qemu-debug.log") lines, tail:" >&2
-    tail -40 "$OUT_DIR/qemu-debug.log" >&2
-fi
-exit 1
+echo "qemu-boot: PASS kernel reached '$OK_MARK' without panic"
+grep -E "$KERNEL_MARKS" "$SERIAL_LOG" | head -20
+exit 0

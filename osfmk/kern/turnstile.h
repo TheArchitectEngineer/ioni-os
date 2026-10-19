@@ -399,6 +399,9 @@ turnstiles_init(void);
 struct turnstile *
 turnstile_alloc(void);
 
+struct turnstile *
+turnstile_alloc_bootstrap(void);
+
 /*
  * Name: turnstile_compact_id_get()
  *

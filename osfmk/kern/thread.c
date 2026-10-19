@@ -268,14 +268,6 @@ thread_zone_startup(void)
 }
 STARTUP(ZALLOC, STARTUP_RANK_FOURTH, thread_zone_startup);
 
-__startup_func
-static void
-init_thread_turnstile_init(void)
-{
-	init_thread.turnstile = turnstile_alloc();
-}
-STARTUP(ZALLOC, STARTUP_RANK_SECOND, init_thread_turnstile_init);
-
 static void thread_deallocate_enqueue(thread_t thread);
 static void thread_deallocate_complete(thread_t thread);
 
@@ -397,6 +389,7 @@ thread_bootstrap(void)
 	timer_init(&thread_template.runnable_timer);
 
 	init_thread_from_template(&init_thread);
+	init_thread.turnstile = turnstile_alloc_bootstrap();
 	/* fiddle with init thread to skip asserts in set_sched_pri */
 	init_thread.sched_pri = MAXPRI_KERNEL;
 
