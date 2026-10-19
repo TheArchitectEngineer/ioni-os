@@ -113,6 +113,8 @@ if [ ! -f "$FAKEROOT/usr/local/include/_simple.h" ]; then
         ditto "$DEPS_DIR/libplatform/include" "$FAKEROOT/usr/local/include"
         ditto "$DEPS_DIR/libplatform/private" "$FAKEROOT/usr/local/include"
         clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+        # public SDK hides sched_param.quantum - drop the two uses
+        perl -pi -e 's{^\t\tparam->quantum = 10; .*$}{}; s{^\t\tbases\.rr\.quantum = param->quantum$}{\t\tbases.rr.quantum = 0;}' "$DEPS_DIR/libpthread/src/pthread.c"
         ditto "$DEPS_DIR/libpthread/private" "$FAKEROOT/usr/local/include"
         mkdir -p "$FAKEROOT/usr/local/include/os"
         cp "$REPO_ROOT/libkern/os/base_private.h" "$FAKEROOT/usr/local/include/os/"
@@ -151,6 +153,7 @@ cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
 cp "$REPO_ROOT/libsyscall/mach/mach/mach_sync_ipc.h" "$FROOT_INC/mach/" 2>/dev/null || true
+printf "#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <membership.h>\n#endif\n" > "$FROOT_INC/membershipPriv.h"
 cp "$REPO_ROOT/osfmk/mach/arm/syscall_sw.h" "$FROOT_INC/mach/arm/" 2>/dev/null || true
 cp "$REPO_ROOT/libkern/libkern/OSCrossEndian.h" "$FROOT_INC/libkern/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/arm/cpu_capabilities.h" "$FROOT_INC/arm/" 2>/dev/null || true
@@ -321,7 +324,17 @@ build_libpthread() {
 #ifndef _IONI_PTHREAD_PREFIX_H
 #define _IONI_PTHREAD_PREFIX_H
 #include <stdbool.h>
+#include <stdint.h>
 extern bool _os_xbs_chrooted;
+/* W^X SPI: real impl lives in libsystem_platform, not built yet */
+static inline bool os_thread_self_restrict_rwx_is_supported(void) { return false; }
+static inline void os_thread_self_restrict_rwx_to_rx(void) {}
+static inline void os_thread_self_restrict_rwx_to_rw(void) {}
+/* internal-SDK-only decls */
+typedef uint64_t kqueue_id_t;
+#ifndef SWITCH_OPTION_OSLOCK_DEPRESS
+#define SWITCH_OPTION_OSLOCK_DEPRESS 4
+#endif
 #endif
 EOF
         # the Xcode-shipped CoreOS xcconfig carries -Werror - cancel via leaf appends
@@ -374,7 +387,7 @@ done
 build_libmalloc() {
         clone libmalloc "$LIBMALLOC_TAG" "$DEPS_DIR/libmalloc"
         xcset "$DEPS_DIR/libmalloc" OTHER_CFLAGS '-Wno-error'
-        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1'
+        xcset "$DEPS_DIR/libmalloc" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))' 'OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1' 'OS_VARIANT_NOTRESOLVED=1'
         xcset "$DEPS_DIR/libmalloc" BUILD_VARIANTS normal
         # corecrypto is unused by libmalloc sources and the SDK 26 headers omit it
         if ! grep -q "__has_include(<corecrypto/ccsha2.h>)" "$DEPS_DIR/libmalloc/src/internal.h"; then
@@ -478,6 +491,10 @@ typedef struct {
 /* set by the internal Apple build outside the opensource tree */
 #ifndef DISPATCH_SEND_ACTIVITY_IN_MSGV
 #define DISPATCH_SEND_ACTIVITY_IN_MSGV 1
+#endif
+/* kdebug_private.h pulls DBG_BSD_MEMSTAT in, but event_private.h stays kernel-only */
+#ifndef EVFILT_MEMORYSTATUS
+#define EVFILT_MEMORYSTATUS (-14)
 #endif
 EOF
         xcset "$DEPS_DIR/libdispatch" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' '__unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
