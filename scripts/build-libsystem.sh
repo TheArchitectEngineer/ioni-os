@@ -739,25 +739,24 @@ EOF
 import sys
 p, gap = sys.argv[1], sys.argv[2]
 t = open(p).read()
-add = ('GCC_PREPROCESSOR_DEFINITIONS = (\n'
-       '\t\t\t\t\t"$(inherited)",\n'
-       '\t\t\t\t\t"_LIBC_NO_FEATURE_VERIFICATION=1",\n'
-       '\t\t\t\t);\n'
-       'OTHER_LDFLAGS = (\n'
-       '\t\t\t\t\t"$(inherited)",\n'
-       '\t\t\t\t\t"-Wl,-alias_list,' + gap + '/fdopen.alias",\n'
-       '\t\t\t\t\t"' + gap + '/nanosleep.o",\n'
-       '\t\t\t\t\t"' + gap + '/getutmpx.o",\n'
-       '\t\t\t\t);\n')
 import re as _re
 n = 0
+extra = ('"$(LIBSYSTEM_C_LDFLAGS)" "-Wl,-alias_list,' + gap + '/fdopen.alias" '
+         '"' + gap + '/nanosleep.o" "' + gap + '/getutmpx.o"')
 for cid in ('C9D94331138DB73300FB7ACC', 'C9D94332138DB73300FB7ACC'):
     m = _re.search(cid + r' /\* (Debug|Release) \*/ = \{', t)
     if not m:
         continue
     j = t.find('buildSettings = {', m.start())
-    if 'OTHER_LDFLAGS' not in t[j:j+200]:
-        t = t[:j+len('buildSettings = {')+1] + add + t[j+len('buildSettings = {')+1:]
+    k = t.find('OTHER_LDFLAGS', j)
+    if k != -1 and t.find('};', j) > k:
+        end = t.find(';', k)
+        if 'fdopen.alias' not in t[k:end]:
+            t = t[:k] + 'OTHER_LDFLAGS = ' + extra + t[end:]
+            n += 1
+    else:
+        jj = t.find('buildSettings = {', m.start())
+        t = t[:jj+len('buildSettings = {')+1] + 'OTHER_LDFLAGS = ' + extra + ';\n' + t[jj+len('buildSettings = {')+1:]
         n += 1
 open(p, 'w').write(t)
 print('libc ldflags injected into', n, 'configs')
