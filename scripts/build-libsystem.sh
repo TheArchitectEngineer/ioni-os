@@ -8,6 +8,7 @@ BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/BUILD}"
 FAKEROOT="${FAKEROOT:-$BUILD_DIR/fakeroot}"
 DEPS_DIR="${DEPS_DIR:-$BUILD_DIR/deps}"
 LIBARCHS="${LIBARCHS:-x86_64}"
+_sdk="$(xcrun -show-sdk-path)"
 
 LIBPLATFORM_TAG="${LIBPLATFORM_TAG:-libplatform-375.120.2}"
 LIBPTHREAD_TAG="${LIBPTHREAD_TAG:-libpthread-539.100.4}"
@@ -22,7 +23,7 @@ export RC_DARWIN_KERNEL_VERSION
 
 mkdir -p "$FAKEROOT" "$DEPS_DIR"
 
-log() { echo "libsystem: $*"; }
+log() { echo "libsystem: $*" >&2; }
 
 clone() {
         _repo="$1"; _tag="$2"; _dst="$3"
@@ -934,7 +935,7 @@ build_libsyscall_static() {
 	_mig="$(xcrun -sdk "$_sdk" -find mig)"
 	_migcc="$(xcrun -sdk "$_sdk" -find cc)"
 	env MIGCC="$_migcc" "$_mig" -novouchers -arch i386 -cc "$_migcc" -header "$_lsinc/mach/mach_vm_internal.h" -I"$REPO_ROOT/osfmk" "$REPO_ROOT/osfmk/mach/mach_vm.defs" > "$BUILD_DIR/mig-vm.log" 2>&1 || log "mig mach_vm_internal: FAILED (see BUILD/mig-vm.log)"
-	rg -c "mach_vm_deferred_reclamation_buffer_allocate" "$_lsinc/mach/mach_vm_internal.h" >> "$BUILD_DIR/mig-vm.log" 2>&1 || true"
+	rg -c "mach_vm_deferred_reclamation_buffer_allocate" "$_lsinc/mach/mach_vm_internal.h" >> "$BUILD_DIR/mig-vm.log" 2>&1 || true
 	[ -f "$_lsinc/mach/mach_vm_internal.h" ] && log "mig mach_vm_internal: ok"
 	find "$_lsinc" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 	python3 - "$_lsinc/mach/message.h" <<'PYL'
@@ -1043,12 +1044,14 @@ build_dyld() {
 	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
 	strip_tree "$DEPS_DIR/dyld"
+	perl -pi -e 's{__API_UNAVAILABLE\(bridgeos\)\s*}{}g' "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || true
+	log "dyld.h bridgeos left: $(grep -c bridgeos "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || echo ?)"
 	grep -rl 'macosx\.internal' "$DEPS_DIR/dyld" 2>/dev/null | while IFS= read -r _f; do
 		sed -i '' 's/macosx\.internal/macosx/g' "$_f"
 	done
 	log "dyld macosx.internal sweep: done"
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
-	perl -pi -e 's{(-DBUILDING_DYLD=1 -std=c\+\+2a)}{-DDYLD_EXCLAVEKIT_UNAVAILABLE= -DBUILDING_DYLD=1 -std=c++2a}' "$DEPS_DIR/dyld/build-scripts/prebuilt-loader-hash.sh" 2>/dev/null || true"
+	perl -pi -e 's{(-DBUILDING_DYLD=1 -std=c\+\+2a)}{-DDYLD_EXCLAVEKIT_UNAVAILABLE= -DBUILDING_DYLD=1 -std=c++2a}' "$DEPS_DIR/dyld/build-scripts/prebuilt-loader-hash.sh" 2>/dev/null || true
 	cp "$FAKEROOT/usr/local/include/_simple.h" "$DEPS_DIR/dyld/include/_simple.h"
 	cp "$FROOT_INC/CrashReporterClient.h" "$DEPS_DIR/dyld/include/CrashReporterClient.h" 2>/dev/null || true
 	cp "$FAKEROOT/usr/local/include/libproc_internal.h" "$DEPS_DIR/dyld/include/libproc_internal.h" 2>/dev/null || true
