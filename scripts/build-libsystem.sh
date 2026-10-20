@@ -831,7 +831,14 @@ typedef uint64_t kqueue_id_t;
 #endif
 #endif
 EOF
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -Wno-incompatible-function-pointer-types -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -Wno-incompatible-function-pointer-types -DNO_ANSI_KEYWORDS -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
+	if [ -f "$FROOT_INC/sys/cdefs.h" ]; then
+		log "fakeroot sys/cdefs.h: $(grep -c 'define signed' "$FROOT_INC/sys/cdefs.h" 2>/dev/null || echo 0) signed-defines, removing shadow"
+		rm -f "$FROOT_INC/sys/cdefs.h"
+	fi
+	printf '#include <stdint.h>\nint x(void){return 0;}\n' > "$BUILD_DIR/probe-stdint.c"
+	env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch $LIBARCHS -isysroot $_sdk -E -H "$BUILD_DIR/probe-stdint.c" -o /dev/null 2> "$BUILD_DIR/probe-hdrs.txt" || true
+	head -12 "$BUILD_DIR/probe-hdrs.txt" 1>&2 || true
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	strip_tree "$DEPS_DIR/libplatform"
@@ -910,6 +917,8 @@ build_libsyscall_static() {
 	mkdir -p "$_lsinc/mach" "$_lsinc/kern"
 	cp "$REPO_ROOT/osfmk/mach/message.h" "$_lsinc/mach/message.h"
 	cp "$REPO_ROOT/osfmk/kern/restartable.h" "$_lsinc/kern/restartable.h"
+	cp "$REPO_ROOT/osfmk/mach/mach_types.h" "$_lsinc/mach/mach_types.h"
+	cp "$REPO_ROOT/osfmk/mach/vm_reclaim_private.h" "$_lsinc/mach/vm_reclaim_private.h"
 	find "$_lsinc" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 	python3 - "$_lsinc/mach/message.h" <<'PYL'
 import sys
@@ -1012,7 +1021,10 @@ build_dyld() {
 	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
 	strip_tree "$DEPS_DIR/dyld"
-	sed -i '' 's/macosx\.internal/macosx/g' "$DEPS_DIR/dyld/build-scripts/generate-cache-config-header.sh"
+	grep -rl 'macosx\.internal' "$DEPS_DIR/dyld" 2>/dev/null | while IFS= read -r _f; do
+		sed -i '' 's/macosx\.internal/macosx/g' "$_f"
+	done
+	log "dyld macosx.internal sweep: done"
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
