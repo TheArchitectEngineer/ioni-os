@@ -1020,7 +1020,8 @@ PYL
 	sudo mkdir -p "$_sdk/usr/local/include/mach" "$_sdk/usr/local/include/kern"
 	sudo cp "$_lsinc"/mach/*.h "$_sdk/usr/local/include/mach/"
 	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
-	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
+	sudo cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$_sdk/usr/local/include/mach/sfi_class.h"
+	log "fakeroot mach dir: $(ls "$FROOT_INC/mach" 2>/dev/null | tr "\n" " ")"	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
