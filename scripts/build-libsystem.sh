@@ -887,12 +887,12 @@ EOF
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_ccobjs=""
 	for _f in ccdigest_init ccdigest_update ccdigest_final_64be ccsha256_K ccsha256_initial_state ccsha256_ltc_compress ccsha256_ltc_di ccsha512_K ccsha512_initial_state ccsha512_ltc_compress ccsha512_ltc_di cc_clear cc_abort cc_cmp_safe; do
-		xcrun clang $_cflags -I"$REPO_ROOT/EXTERNAL_HEADERS" -I"$REPO_ROOT/osfmk/corecrypto" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
+		xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
 		_ccobjs="$_ccobjs $_gap/cc-$_f.o"
 	done
 	_gobjs="$_ccobjs"
 	for _f in mvm ioni_crypto ioni_string ioni_stubs; do
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/EXTERNAL_HEADERS" -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
 		_gobjs="$_gobjs $_gap/$_f.o"
 	done
 	cat > "$_gap/dtrace-stubs.c" <<'CSSEOF'
@@ -976,6 +976,10 @@ PYL
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
 		find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
+	fi
+	if ! sudo grep -q FSOPT_UTIMES_NULL "$_sdk/usr/include/sys/fsctl.h" 2>/dev/null; then
+		printf '\n#ifndef FSOPT_UTIMES_NULL\n#define FSOPT_UTIMES_NULL 0x00000400\n#endif\n' | sudo tee -a "$_sdk/usr/include/sys/fsctl.h" > /dev/null
+		log "fsctl.h FSOPT_UTIMES_NULL: appended to sdk"
 	fi
 	cd "$_src"
 	_rc=0
@@ -1081,6 +1085,10 @@ VMEOF
 #endif
 SCEOF
 	cp "$REPO_ROOT/osfmk/mach/dyld_pager.h" "$DEPS_DIR/dyld/include/System/mach/dyld_pager.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/codesign.h" "$DEPS_DIR/dyld/include/System/sys/codesign.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
+	cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
 	log "dyld include shims: staged"
 	log "dyld.h bridgeos left: $(grep -c bridgeos "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || echo ?)"
 	grep -rl 'macosx\.internal' "$DEPS_DIR/dyld" 2>/dev/null | while IFS= read -r _f; do
