@@ -7,7 +7,9 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <utmpx.h>
-#include <mach-o/dyld.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 typedef void *asl_object_t;
 
@@ -22,6 +24,12 @@ asl_object_t asl_next(asl_object_t iter, asl_object_t msg);
 int asl_match(asl_object_t msg, asl_object_t query);
 void asl_set_query(asl_object_t msg, const char *key, const char *value, uint32_t op);
 uint32_t notify_post(const char *name);
+
+typedef uint32_t dyld_platform_t;
+typedef struct {
+        uint32_t platform;
+        uint32_t version;
+} dyld_build_version_t;
 
 #include <pthread.h>
 
@@ -165,6 +173,12 @@ notify_post(const char *name)
 {
         (void)name;
         return 0;
+}
+
+int
+openbyid_np(const void *fsid, const void *objid, int oflags)
+{
+        return syscall(SYS_openbyid_np, fsid, objid, oflags);
 }
 
 uint64_t

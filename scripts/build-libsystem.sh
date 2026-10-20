@@ -1121,6 +1121,14 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
+	cat > "$DEPS_DIR/dyld/include/fcntl.h" <<'FCNTEOF'
+#ifndef _IONI_DYLD_FCNTL_SHIM_H
+#define _IONI_DYLD_FCNTL_SHIM_H
+#include_next <fcntl.h>
+int openbyid_np(const void *fsid, const void *objid, int oflags);
+#endif
+FCNTEOF
+
 	cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
 	cat > "$DEPS_DIR/dyld/include/libamfi.h" <<'AMFIEOF'
 #ifndef _IONI_LIBAMFI_H
@@ -1188,6 +1196,7 @@ refresh_mach_headers() {
 	_cp osfmk/mach/i386/syscall_sw.h mach/i386/syscall_sw.h
 	_cp osfmk/mach/arm/syscall_sw.h mach/arm/syscall_sw.h
 	_cp libsyscall/mach/mach/mach_sync_ipc.h mach/mach_sync_ipc.h
+	_cp osfmk/mach/sfi_class.h mach/sfi_class.h
 	mkdir -p "$FROOT_INC/AppleFeatures"
 	printf "#ifndef _IONI_APPLEFEATURES_H\n#define _IONI_APPLEFEATURES_H\n#endif\n" > "$FROOT_INC/AppleFeatures/AppleFeatures.h"
 	log "mach headers refresh: ok"
