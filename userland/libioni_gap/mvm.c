@@ -6,6 +6,12 @@
 #include <sys/mman.h>
 
 typedef struct _liblibc_plat_mem_map_t plat_map_t;
+typedef uint64_t mach_vm_reclaim_id_t;
+struct mvm_guarded_range_config_s {
+	mach_vm_address_t base_address;
+	size_t            size;
+	mach_vm_address_t carveout_address;
+};
 
 #ifndef MALLOC_DO_SCRIBBLE
 #define MALLOC_DO_SCRIBBLE (1 << 5)

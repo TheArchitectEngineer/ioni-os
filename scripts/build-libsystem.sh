@@ -183,6 +183,17 @@ cat > "$FROOT_INC/sys/attr.h" <<'ATTREOF'
 #endif
 ATTREOF
 fi
+if [ ! -f "$FROOT_INC/sys/mount.h" ]; then
+cat > "$FROOT_INC/sys/mount.h" <<'MNTEOF'
+#ifndef _IONI_SYS_MOUNT_SHIM_H
+#define _IONI_SYS_MOUNT_SHIM_H
+#include_next <sys/mount.h>
+#ifndef STATFS_EXT_NOBLOCK
+#define STATFS_EXT_NOBLOCK 0x0001
+#endif
+#endif
+MNTEOF
+fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
@@ -1051,7 +1062,7 @@ build_dyld() {
 			log "SDK LACKS $_h"
 		fi
 	done
-	for _a in libc liblibdispatch libmalloc_type_stubs liblibfirehose_server libioni_membership; do
+	for _a in libc liblibdispatch libmalloc_type_stubs liblibfirehose_server libioni_membership libioni_gap libioni_platform; do
 		[ -f "$FAKEROOT/usr/local/lib/system/$_a.a" ] && cp "$FAKEROOT/usr/local/lib/system/$_a.a" "$_dylddir/"
 	done
 	[ -f "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" ] && cp "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" "$_dylddir/"
@@ -1127,13 +1138,16 @@ AMFIEOF
 	cp "$FAKEROOT/usr/local/include/libproc_internal.h" "$DEPS_DIR/dyld/include/libproc_internal.h" 2>/dev/null || true
 	sudo rm -rf "$FROOT_INC/corecrypto"
 	log "dyld: fakeroot corecrypto shadow removed"
+	mkdir -p "$DEPS_DIR/dyld/include/corecrypto"
+	cp "$REPO_ROOT"/vendor/corecrypto/*.h "$DEPS_DIR/dyld/include/corecrypto/"
+	log "dyld corecrypto headers: $(ls "$DEPS_DIR/dyld/include/corecrypto" | wc -l | tr -d ' ') staged"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild build -project dyld.xcodeproj -target dyld -configuration Release \
 		-sdk macosx ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
-		GCC_PREPROCESSOR_DEFINITIONS="DYLD_VERSION=1378.120.2 BUILDING_DYLD=1 DYLD_EXCLAVEKIT_UNAVAILABLE=" \
+		GCC_PREPROCESSOR_DEFINITIONS="DYLD_VERSION=1378.120.2 BUILDING_DYLD=1 DYLD_EXCLAVEKIT_UNAVAILABLE= CORECRYPTO_DONOT_USE_TRANSPARENT_UNION" \
 		RC_ProjectSourceVersion="1378.120.2" \
 		OBJROOT="$BUILD_DIR/obj.dyld" SYMROOT="$BUILD_DIR/sym.dyld" || _rc=$?
 	if [ "$_rc" -ne 0 ]; then
