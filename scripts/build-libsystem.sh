@@ -44,7 +44,7 @@ STRIP_BOUNDS='s/__sized_by_or_null\([^()]*\)//g; s/__counted_by_or_null\([^()]*\
 # SDK 26 dropped bridgeos/driverkit from the UNAVAILABLE domain macros, but those
 # names also appear as macro parameter names - strip them only inside
 # API_UNAVAILABLE(...) argument spans, never in #define parameter lists
-STRIP_UNAVAIL='s#((?:__)?API_UNAVAILABLE\s*\()([^)]*)\)#$1 . join(",", grep { !/^\s*(bridgeos|driverkit)\s*$/ } split(/,/, $2)) . ")"#ge'
+STRIP_UNAVAIL='s#((?:__)?API_UNAVAILABLE\s*\()([^)]*)\)#my @k = grep { !/^\s*(bridgeos|driverkit)\s*$/ } split(/,/, $2); @k ? "$1" . join(",", @k) . ")" : ""#ge'
 
 strip_tree() {
         find "$1" \( -name "*.h" -o -name "*.c" -o -name "*.m" \) -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
@@ -158,6 +158,9 @@ cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/de
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/mach/thread_switch.h" "$FROOT_INC/mach/" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/mach/coalition.h" "$FROOT_INC/mach/" 2>/dev/null || true
+mkdir -p "$FROOT_INC/AppleFeatures"
+printf "#ifndef _IONI_APPLEFEATURES_H\n#define _IONI_APPLEFEATURES_H\n#endif\n" > "$FROOT_INC/AppleFeatures/AppleFeatures.h"
 cp "$REPO_ROOT/libsyscall/mach/mach/mach_sync_ipc.h" "$FROOT_INC/mach/" 2>/dev/null || true
 printf "#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <membership.h>\n#endif\n" > "$FROOT_INC/membershipPriv.h"
 cp "$REPO_ROOT/osfmk/mach/arm/syscall_sw.h" "$FROOT_INC/mach/arm/" 2>/dev/null || true
@@ -892,6 +895,7 @@ CSSEOF
 }
 
 build_libsyscall_static() {
+	xcset "$_src" OTHER_MIGFLAGS "-I$REPO_ROOT/osfmk"
 	sed -i "" "s|my @archs = split / /, \$ENV{\"ARCHS\"};|my @archs = (\"$LIBARCHS\");|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	sed -i "" "s|\"-x assembler-with-cpp\",|\"-x assembler-with-cpp\", \"-DPRIVATE=1\",|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
