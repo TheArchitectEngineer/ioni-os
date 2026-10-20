@@ -156,6 +156,17 @@ mkdir -p "$FROOT_INC/os" "$FROOT_INC/System/sys" "$FROOT_INC/libkern" \
         "$FROOT_INC/arm" "$FROOT_INC/i386" "$FROOT_INC/mach-o" "$FROOT_INC/machine" "$FROOT_INC/corecrypto"
 cp "$REPO_ROOT"/libsyscall/os/*.h "$FROOT_INC/os/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/fsctl.h" "$FROOT_INC/System/sys/fsctl.h"
+if [ ! -f "$FROOT_INC/sys/fsctl.h" ]; then
+cat > "$FROOT_INC/sys/fsctl.h" <<'FSEOF'
+#ifndef _IONI_SYS_FSCTL_SHIM_H
+#define _IONI_SYS_FSCTL_SHIM_H
+#include_next <sys/fsctl.h>
+#ifndef FSOPT_UTIMES_NULL
+#define FSOPT_UTIMES_NULL 0x00000400
+#endif
+#endif
+FSEOF
+fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
@@ -868,7 +879,8 @@ EOF
 		_pobjs="$_pobjs $_o"
 	done
 	if [ -f "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" ]; then
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
+		_asmflags=$(printf '%s' "$_cflags" | sed 's| -include [^ ]*||')
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
 	fi
 	rm -f "$_dylddir/libioni_platform.a"
@@ -1028,7 +1040,6 @@ build_dyld() {
 	_seen=""
 	_o=""
 	_b=""
-	_m=""
 	while IFS= read -r _o; do
 		_b="$(basename "$_o")"
 		case "$_seen" in
@@ -1045,6 +1056,32 @@ build_dyld() {
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
 	strip_tree "$DEPS_DIR/dyld"
 	perl -pi -e 's{__API_UNAVAILABLE\(bridgeos\)\s*}{}g' "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || true
+	mkdir -p "$DEPS_DIR/dyld/include/dyld" "$DEPS_DIR/dyld/include/os" "$DEPS_DIR/dyld/include/System/mach"
+	cat > "$DEPS_DIR/dyld/include/dyld/VersionMap.h" <<'VMEOF'
+#ifndef _DYLD_VERSION_MAP_IONI_H
+#define _DYLD_VERSION_MAP_IONI_H
+#include <stdint.h>
+namespace dyld3 {
+struct VersionSetEntry {
+	uint32_t set;
+	uint32_t macos;
+	uint32_t ios;
+	uint32_t watchos;
+	uint32_t tvos;
+	uint32_t bridgeos;
+	uint32_t visionos;
+};
+inline const VersionSetEntry sVersionMap[] = { { 1, 0x000F0000, 0x00110000, 0x00080000, 0x00100000, 0, 0 } };
+}
+#endif
+VMEOF
+	cat > "$DEPS_DIR/dyld/include/os/security_config_private.h" <<'SCEOF'
+#ifndef _IONI_SECURITY_CONFIG_PRIVATE_H
+#define _IONI_SECURITY_CONFIG_PRIVATE_H
+#endif
+SCEOF
+	cp "$REPO_ROOT/osfmk/mach/dyld_pager.h" "$DEPS_DIR/dyld/include/System/mach/dyld_pager.h" 2>/dev/null || true
+	log "dyld include shims: staged"
 	log "dyld.h bridgeos left: $(grep -c bridgeos "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || echo ?)"
 	grep -rl 'macosx\.internal' "$DEPS_DIR/dyld" 2>/dev/null | while IFS= read -r _f; do
 		sed -i '' 's/macosx\.internal/macosx/g' "$_f"
