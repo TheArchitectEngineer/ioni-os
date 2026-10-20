@@ -966,9 +966,11 @@ PYL
 	fi
 	cd "$_src"
 	_rc=0
+	sudo mkdir -p "$_sdk/usr/local/include/mach" "$_sdk/usr/local/include/kern"
+	sudo cp "$_lsinc"/mach/*.h "$_sdk/usr/local/include/mach/"
+	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
 	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
-		HEADER_SEARCH_PATHS="$_lsinc $(inherited)" \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		RC_ProjectSourceVersion="$RC_DARWIN_KERNEL_VERSION" \
@@ -1023,6 +1025,9 @@ build_dyld() {
 	[ -s "$BUILD_DIR/libmalloc-objs.txt" ] || return 1
 	rm -f "$_m"
 	_seen=""
+	_o=""
+	_b=""
+	_m=""
 	while IFS= read -r _o; do
 		_b="$(basename "$_o")"
 		case "$_seen" in
@@ -1091,11 +1096,11 @@ refresh_mach_headers() {
 	log "mach headers refresh: ok"
 }
 
-try ioni_gap build_ioni_gap
-try libsyscall_static build_libsyscall_static
+if build_ioni_gap; then log "ioni_gap: ok"; else log "ioni_gap: FAILED"; FAILS="$FAILS ioni_gap"; fi
+if build_libsyscall_static; then log "libsyscall_static: ok"; else log "libsyscall_static: FAILED"; FAILS="$FAILS libsyscall_static"; fi
 refresh_mach_headers
-try pthread_dyld build_pthread_dyld
-try dyld build_dyld
+if build_pthread_dyld; then log "pthread_dyld: ok"; else log "pthread_dyld: FAILED"; FAILS="$FAILS pthread_dyld"; fi
+if build_dyld; then log "dyld: ok"; else log "dyld: FAILED"; FAILS="$FAILS dyld"; fi
 
 log "fails:$FAILS"
 log "fakeroot libraries:"
