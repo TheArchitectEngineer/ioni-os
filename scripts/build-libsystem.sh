@@ -374,7 +374,11 @@ try libpthread build_libpthread
 # is internal - stand in the declarations the TU chain needs
 cat > "$BUILD_DIR/work_interval_instance_ioni.h" <<'EOF'
 /* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
+#if __has_include(<pthread/work_interval.h>)
 #include <pthread/work_interval.h>
+#else
+typedef struct work_interval_s *work_interval_t;
+#endif
 struct work_interval_data {
 	uint64_t _ioni_fields[8];
 	uint64_t wid_external_wakeups;
@@ -438,6 +442,17 @@ try libclosure build_libclosure
 
 # Apple's internal CrashReporterClient archive: the Libc link line carries
 # -lCrashReporterClient and the public SDK has no stub for it
+if [ ! -f "$FROOT_INC/CrashReporterClient.h" ]; then
+	cat > "$FROOT_INC/CrashReporterClient.h" <<'EOF'
+#ifndef _IONI_CRASHREPORTERCLIENT_H
+#define _IONI_CRASHREPORTERCLIENT_H
+void CRSetCrashLogMessage(const char *message);
+void CRSetCrashLogMessage2(const char *message);
+const char *CRGetCrashLogMessage(void);
+#endif
+EOF
+	log "CrashReporterClient.h stub: ok"
+fi
 if [ ! -f "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" ]; then
         printf '/* Ioni: empty CrashReporterClient stub */\nint _ioni_crc_stub;\n' > "$DEPS_DIR/crc_stub.c"
         xcrun clang -arch "$LIBARCHS" -c "$DEPS_DIR/crc_stub.c" -o "$DEPS_DIR/crc_stub.o"
@@ -765,7 +780,7 @@ build_ioni_gap() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_gap="$BUILD_DIR/ioni-gap"
 	_sdk="$(xcrun -show-sdk-path)"
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -D'OS_SWIFT_NAME(_name)='"
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -DOS_SWIFT_NAME(_name)="
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	mkdir -p "$_dylddir" "$_gap"
@@ -833,7 +848,8 @@ CSSEOF
 }
 
 build_libsyscall_static() {
-	env IONI_ARCH="$LIBARCHS" perl -pi -e 's{\$ENV\{"ARCHS"\}}{(\$ENV{"ARCHS"} || \$ENV{"IONI_ARCH"})}' "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
+	sed -i "" "s|my @archs = split / /, \$ENV{\"ARCHS\"};|my @archs = (\"$LIBARCHS\");|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
+	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	_src="$REPO_ROOT/libsyscall"
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
