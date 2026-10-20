@@ -197,6 +197,31 @@ jobs:
             BUILD/dyld-product/
           if-no-files-found: warn
 
+  bsd-utils:
+    name: bsd utils on native libc
+    runs-on: macos-26
+    timeout-minutes: 30
+    needs: libsystem
+    if: always() && needs.libsystem.result != 'skipped'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download supply archives
+        uses: actions/download-artifact@v4
+        with:
+          name: libsystem-fakeroot
+          path: BUILD/fakeroot
+
+      - name: build utilities
+        run: ./scripts/build-utils.sh
+
+      - name: upload utilities
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioni-bsd-utils
+          path: BUILD/utils/
+          if-no-files-found: warn
+
   userland:
     name: userland init + ionish
     runs-on: macos-26

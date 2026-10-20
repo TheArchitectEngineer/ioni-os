@@ -617,6 +617,14 @@ EOF
 }
 try libdispatch build_libdispatch
 
+# the dispatch install drops its indirect time.h into the fakeroot include root;
+# it #errors unless included via <dispatch/dispatch.h> and shadows the SDK one
+# for every later CPATH consumer - move it aside
+if [ -f "$FROOT_INC/time.h" ] && grep -q "Please #include <dispatch/dispatch.h>" "$FROOT_INC/time.h" 2>/dev/null; then
+	mv "$FROOT_INC/time.h" "$FROOT_INC/dispatch-time.h"
+	log "dispatch time.h moved aside"
+fi
+
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         # the compat variant archives duplicate the plain symbols on this
@@ -759,7 +767,7 @@ build_ioni_gap() {
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	mkdir -p "$_dylddir" "$_gap"
-	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private"
+	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private -I$DEPS_DIR/libplatform/src/os/resolver"
 	_pobjs=""
 	for _f in "$DEPS_DIR/libplatform"/src/os/*.c \
 		"$DEPS_DIR/libplatform"/src/simple/*.c \
@@ -830,7 +838,7 @@ build_libsyscall_static() {
 	fi
 	cd "$_src"
 	_rc=0
-	env CPATH="$FAKEROOT/usr/local/include" \
+	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
