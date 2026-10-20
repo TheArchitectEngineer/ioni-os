@@ -21,6 +21,11 @@ DYLD_TAG="${DYLD_TAG:-dyld-1378}"
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
 
+if ! sudo grep -q FSOPT_UTIMES_NULL "$_sdk/usr/include/sys/fsctl.h" 2>/dev/null; then
+	printf '\n#ifndef FSOPT_UTIMES_NULL\n#define FSOPT_UTIMES_NULL 0x00000400\n#endif\n' | sudo tee -a "$_sdk/usr/include/sys/fsctl.h" > /dev/null
+	log "fsctl.h FSOPT_UTIMES_NULL: appended to sdk"
+fi
+
 mkdir -p "$FAKEROOT" "$DEPS_DIR"
 
 log() { echo "libsystem: $*" >&2; }
@@ -887,12 +892,12 @@ EOF
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_ccobjs=""
 	for _f in ccdigest_init ccdigest_update ccdigest_final_64be ccsha256_K ccsha256_initial_state ccsha256_ltc_compress ccsha256_ltc_di ccsha512_K ccsha512_initial_state ccsha512_ltc_compress ccsha512_ltc_di cc_clear cc_abort cc_cmp_safe; do
-		xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
+		xcrun clang $_cflags -I"$REPO_ROOT/osfmk" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
 		_ccobjs="$_ccobjs $_gap/cc-$_f.o"
 	done
 	_gobjs="$_ccobjs"
 	for _f in mvm ioni_crypto ioni_string ioni_stubs; do
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
 		_gobjs="$_gobjs $_gap/$_f.o"
 	done
 	cat > "$_gap/dtrace-stubs.c" <<'CSSEOF'
@@ -977,10 +982,6 @@ PYL
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
 		find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
 	fi
-	if ! sudo grep -q FSOPT_UTIMES_NULL "$_sdk/usr/include/sys/fsctl.h" 2>/dev/null; then
-		printf '\n#ifndef FSOPT_UTIMES_NULL\n#define FSOPT_UTIMES_NULL 0x00000400\n#endif\n' | sudo tee -a "$_sdk/usr/include/sys/fsctl.h" > /dev/null
-		log "fsctl.h FSOPT_UTIMES_NULL: appended to sdk"
-	fi
 	cd "$_src"
 	_rc=0
 	sudo mkdir -p "$_sdk/usr/local/include/mach" "$_sdk/usr/local/include/kern"
@@ -1060,7 +1061,7 @@ build_dyld() {
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
 	strip_tree "$DEPS_DIR/dyld"
 	perl -pi -e 's{__API_UNAVAILABLE\(bridgeos\)\s*}{}g' "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || true
-	mkdir -p "$DEPS_DIR/dyld/include/dyld" "$DEPS_DIR/dyld/include/os" "$DEPS_DIR/dyld/include/System/mach"
+	mkdir -p "$DEPS_DIR/dyld/include/dyld" "$DEPS_DIR/dyld/include/os" "$DEPS_DIR/dyld/include/System/mach" "$DEPS_DIR/dyld/include/System/sys" "$DEPS_DIR/dyld/include/System/machine"
 	cat > "$DEPS_DIR/dyld/include/dyld/VersionMap.h" <<'VMEOF'
 #ifndef _DYLD_VERSION_MAP_IONI_H
 #define _DYLD_VERSION_MAP_IONI_H
