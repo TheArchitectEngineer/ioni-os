@@ -194,6 +194,7 @@ jobs:
             BUILD/fakeroot/usr/**/*.a
             BUILD/fakeroot/usr/**/*.dylib
             BUILD/fakeroot/usr/**/*.tbd
+            BUILD/dyld-product/
           if-no-files-found: warn
 
   userland:

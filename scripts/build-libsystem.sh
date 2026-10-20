@@ -751,6 +751,184 @@ EOF
 }
 try libsystem_c build_libsystem_c
 
+build_ioni_gap() {
+	_dylddir="$FAKEROOT/usr/local/lib/dyld"
+	_gap="$BUILD_DIR/ioni-gap"
+	_sdk="$(xcrun -show-sdk-path)"
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers"
+	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
+	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+	mkdir -p "$_dylddir" "$_gap"
+	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private"
+	_pobjs=""
+	for _f in "$DEPS_DIR/libplatform"/src/os/*.c \
+		"$DEPS_DIR/libplatform"/src/simple/*.c \
+		"$DEPS_DIR/libplatform"/src/string/generic/*.c \
+		"$DEPS_DIR/libplatform"/src/timingsafe/x86_64/*.c \
+		"$DEPS_DIR/libplatform"/src/atomics/init.c; do
+		[ -f "$_f" ] || continue
+		_o="$_gap/platform-$(basename "${_f%.c}").o"
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$_f" -o "$_o" || return 1
+		_pobjs="$_pobjs $_o"
+	done
+	if [ -f "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" ]; then
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
+		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
+	fi
+	rm -f "$_dylddir/libioni_platform.a"
+	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
+	_ccobjs=""
+	for _f in ccdigest_init ccdigest_update ccdigest_final_64be ccsha256_K ccsha256_initial_state ccsha256_ltc_compress ccsha256_ltc_di ccsha512_K ccsha512_initial_state ccsha512_ltc_compress ccsha512_ltc_di cc_clear cc_abort cc_cmp_safe; do
+		xcrun clang $_cflags -I"$REPO_ROOT/EXTERNAL_HEADERS" -I"$REPO_ROOT/osfmk/corecrypto" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
+		_ccobjs="$_ccobjs $_gap/cc-$_f.o"
+	done
+	_gobjs="$_ccobjs"
+	for _f in mvm ioni_crypto ioni_string ioni_stubs; do
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/EXTERNAL_HEADERS" -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
+		_gobjs="$_gobjs $_gap/$_f.o"
+	done
+	cat > "$_gap/dtrace-stubs.c" <<'CSSEOF'
+#include <stdint.h>
+#include <stdio.h>
+
+void __dtrace_probe$magmalloc$allocRegion$v1$766f6964202a$696e74$766f6964202a$696e74(void);
+void __dtrace_probe$magmalloc$allocRegion$v1$766f6964202a$696e74$766f6964202a$696e74(void) {}
+void __dtrace_probe$magmalloc$deallocRegion$v1$766f6964202a$766f6964202a$696e74(void);
+void __dtrace_probe$magmalloc$deallocRegion$v1$766f6964202a$766f6964202a$696e74(void) {}
+void __dtrace_probe$magmalloc$depotRegion$v1$766f6964202a$696e74$766f6964202a$696e74$696e74(void);
+void __dtrace_probe$magmalloc$depotRegion$v1$766f6964202a$696e74$766f6964202a$696e74$696e74(void) {}
+void __dtrace_probe$magmalloc$madvfreeRegion$v1$766f6964202a$766f6964202a$766f6964202a$696e74(void);
+void __dtrace_probe$magmalloc$madvfreeRegion$v1$766f6964202a$766f6964202a$766f6964202a$696e74(void) {}
+void __dtrace_probe$magmalloc$mallocErrorBreak$v1(void);
+void __dtrace_probe$magmalloc$mallocErrorBreak$v1(void) {}
+void __dtrace_probe$magmalloc$pressureReliefBegin$v1$766f6964202a$63686172202a$696e74(void);
+void __dtrace_probe$magmalloc$pressureReliefBegin$v1$766f6964202a$63686172202a$696e74(void) {}
+void __dtrace_probe$magmalloc$pressureReliefEnd$v1$766f6964202a$63686172202a$696e74$696e74(void);
+void __dtrace_probe$magmalloc$pressureReliefEnd$v1$766f6964202a$63686172202a$696e74$696e74(void) {}
+void __dtrace_probe$magmalloc$recircRegion$v1$766f6964202a$696e74$766f6964202a$696e74$696e74(void);
+void __dtrace_probe$magmalloc$recircRegion$v1$766f6964202a$696e74$766f6964202a$696e74$696e74(void) {}
+int32_t __dtrace_stability$magmalloc$v1$5_5_4_1_1_0_1_1_0_5_5_4_5_5_4[128];
+int32_t __dtrace_typedefs$magmalloc$v2[16];
+int fdopen$DARWIN_EXTSN(int fd, const char *mode);
+int fdopen$DARWIN_EXTSN(int fd, const char *mode)
+{
+	return fdopen(fd, mode);
+}
+CSSEOF
+	env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/EXTERNAL_HEADERS" -c "$_gap/dtrace-stubs.c" -o "$_gap/dtrace-stubs.o" || return 1
+	_gobjs="$_gobjs $_gap/dtrace-stubs.o"
+	rm -f "$_dylddir/libioni_gap.a"
+	ar crs "$_dylddir/libioni_gap.a" $_gobjs || return 1
+	log "ioni gap archives: ok"
+}
+
+build_libsyscall_static() {
+	_src="$REPO_ROOT/libsyscall"
+	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
+	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
+		find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
+	fi
+	cd "$_src"
+	_rc=0
+	env CPATH="$FAKEROOT/usr/local/include" \
+		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
+		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
+		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+		RC_ProjectSourceVersion="$RC_DARWIN_KERNEL_VERSION" \
+		OBJROOT="$BUILD_DIR/obj.ikern" SYMROOT="$BUILD_DIR/sym.ikern" \
+		DSTROOT="$FAKEROOT" || _rc=$?
+	cd "$REPO_ROOT"
+	find "$FAKEROOT/usr/local/lib/dyld" -name "libsystem_kernel*.a" 2>/dev/null
+	return $_rc
+}
+
+build_pthread_dyld() {
+	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+	perl -pi -e 's{^#include <_types\.h>$}{#include <stddef.h>}' "$DEPS_DIR/libpthread/include/pthread/pthread.h"
+	cat > "$DEPS_DIR/libpthread/_ioni_pthread_prefix.h" <<'EOF'
+#ifndef _IONI_PTHREAD_PREFIX_H
+#define _IONI_PTHREAD_PREFIX_H
+#include <stdbool.h>
+#include <stdint.h>
+extern bool _os_xbs_chrooted;
+static inline bool os_thread_self_restrict_rwx_is_supported(void) { return false; }
+static inline void os_thread_self_restrict_rwx_to_rx(void) {}
+static inline void os_thread_self_restrict_rwx_to_rw(void) {}
+typedef uint64_t kqueue_id_t;
+#ifndef SWITCH_OPTION_OSLOCK_DEPRESS
+#define SWITCH_OPTION_OSLOCK_DEPRESS 4
+#endif
+#endif
+EOF
+	xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-Wno-error' '-fno-stack-protector'
+	xcset "$DEPS_DIR/libpthread" GCC_PREFIX_HEADER '_ioni_pthread_prefix.h'
+	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
+	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
+	xb "$DEPS_DIR/libpthread" libpthread.xcodeproj "libpthread dyld" pthreaddyld
+}
+
+build_dyld() {
+	_dylddir="$FAKEROOT/usr/local/lib/dyld"
+	_sdk="$(xcrun -show-sdk-path)"
+	for _a in libc liblibdispatch libmalloc_type_stubs liblibfirehose_server libioni_membership; do
+		[ -f "$FAKEROOT/usr/local/lib/system/$_a.a" ] && cp "$FAKEROOT/usr/local/lib/system/$_a.a" "$_dylddir/"
+	done
+	[ -f "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" ] && cp "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" "$_dylddir/"
+	_m="$BUILD_DIR/libmalloc_full.a"
+	find "$BUILD_DIR/obj.malloc" -path "*Objects-normal/x86_64/*.o" | sort -r > "$BUILD_DIR/libmalloc-objs.txt"
+	[ -s "$BUILD_DIR/libmalloc-objs.txt" ] || return 1
+	rm -f "$_m"
+	_seen=""
+	while IFS= read -r _o; do
+		_b="$(basename "$_o")"
+		case "$_seen" in
+			*"|$_b|"*) continue ;;
+		esac
+		_seen="$_seen|$_b|"
+		ar r "$_m" "$_o" || return 1
+	done < "$BUILD_DIR/libmalloc-objs.txt"
+	ranlib "$_m"
+	cp "$_m" "$_dylddir/"
+	log "dyld supply archives:"
+	ls -1 "$_dylddir"
+	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
+	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
+	sed -i '' 's/macosx\.internal/macosx/g' "$DEPS_DIR/dyld/build-scripts/generate-cache-config-header.sh"
+	cd "$DEPS_DIR/dyld"
+	_rc=0
+	env CPATH="$FAKEROOT/usr/local/include" \
+		xcodebuild build -project dyld.xcodeproj -target dyld -configuration Release \
+		-sdk macosx ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
+		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+		RC_ProjectSourceVersion="1378.120.2" \
+		OBJROOT="$BUILD_DIR/obj.dyld" SYMROOT="$BUILD_DIR/sym.dyld" || _rc=$?
+	if [ "$_rc" -ne 0 ]; then
+		cd "$REPO_ROOT"
+		return 1
+	fi
+	_bin="$(find "$BUILD_DIR/sym.dyld" -name dyld -type f | head -1)"
+	if [ -z "$_bin" ]; then
+		cd "$REPO_ROOT"
+		log "dyld product not found in symroot"
+		return 1
+	fi
+	file "$_bin"
+	otool -hv "$_bin"
+	otool -l "$_bin" | grep -A2 LC_UUID | head -5 || true
+	mkdir -p "$FAKEROOT/usr/lib" "$BUILD_DIR/dyld-product"
+	cp "$_bin" "$FAKEROOT/usr/lib/dyld"
+	cp "$_bin" "$BUILD_DIR/dyld-product/dyld"
+	otool -l "$_bin" | head -30 > "$BUILD_DIR/dyld-product/dyld.segments.txt"
+	cd "$REPO_ROOT"
+	log "dyld: built and staged"
+	return 0
+}
+
+try ioni_gap build_ioni_gap
+try libsyscall_static build_libsyscall_static
+try pthread_dyld build_pthread_dyld
+try dyld build_dyld
+
 log "fails:$FAILS"
 log "fakeroot libraries:"
 find "$FAKEROOT/usr" -name "*.dylib" -o -name "*.a" 2>/dev/null | head -30
