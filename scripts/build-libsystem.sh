@@ -806,14 +806,21 @@ build_ioni_gap() {
 #ifndef _IONI_GAP_PREFIX_H
 #define _IONI_GAP_PREFIX_H
 #define SPI_AVAILABLE(...)
-#define OS_SWIFT_NAME(_name) __attribute__((__swift_name__(#_name)))
 #define __unsafe_forge_bidi_indexable(type, val, size) ((type)(val))
 #define __unsafe_forge_single(type, val) ((type)(val))
-#define OSATOMIC_USE_INLINED 0
-#define OSATOMIC_DEPRECATED 0
-#define OSSPINLOCK_USE_INLINED 0
-#define OS_UNFAIR_LOCK_INLINE 0
 #define PRIVATE 1
+#define __PTHREAD_EXPOSE_INTERNALS__ 1
+#include <stdbool.h>
+#include <stdint.h>
+extern bool _os_xbs_chrooted;
+static inline bool os_thread_self_restrict_rwx_is_supported(void) { return false; }
+static inline void os_thread_self_restrict_rwx_to_rx(void) {}
+static inline void os_thread_self_restrict_rwx_to_rw(void) {}
+typedef uint64_t kqueue_id_t;
+#ifndef SWITCH_OPTION_OSLOCK_DEPRESS
+#define SWITCH_OPTION_OSLOCK_DEPRESS 4
+#define SWITCH_OPTION_OSLOCK_WAIT 5
+#endif
 #endif
 EOF
 	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
