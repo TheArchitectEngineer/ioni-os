@@ -13,6 +13,9 @@ for _f in BUILD/libsystem-build.log BUILD/utils-build.log BUILD/dyld-build.log; 
 	[ -f "$_f" ] && cp "$_f" "ci-logs/${LABEL}/$(basename "$_f")"
 done
 find BUILD/logs -maxdepth 1 -name "*-errors.txt" -exec cp {} "ci-logs/${LABEL}/" \; 2>/dev/null || true
+for _p in BUILD/probe-cerrs.txt BUILD/probe-hdrs.txt; do
+	[ -f "$_p" ] && cp "$_p" "ci-logs/${LABEL}/$(basename "$_p")"
+done
 
 _IDX="$PWD/.ci-logs-index"
 rm -f "$_IDX"
