@@ -831,7 +831,7 @@ typedef uint64_t kqueue_id_t;
 #endif
 #endif
 EOF
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -Wno-incompatible-function-pointer-types -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	strip_tree "$DEPS_DIR/libplatform"
@@ -905,6 +905,35 @@ build_libsyscall_static() {
 	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	_src="$REPO_ROOT/libsyscall"
 	xcset "$_src" OTHER_MIGFLAGS "-I$REPO_ROOT/osfmk"
+	_lsinc="$BUILD_DIR/libsys-includes"
+	rm -rf "$_lsinc"
+	mkdir -p "$_lsinc/mach" "$_lsinc/kern"
+	cp "$REPO_ROOT/osfmk/mach/message.h" "$_lsinc/mach/message.h"
+	cp "$REPO_ROOT/osfmk/kern/restartable.h" "$_lsinc/kern/restartable.h"
+	find "$_lsinc" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
+	python3 - "$_lsinc/mach/message.h" <<'PYL'
+import sys
+f = sys.argv[1]
+lines = open(f).readlines()
+out, depth = [], 0
+for ln in lines:
+    st = ln.strip()
+    if depth == 0 and st in ("#ifdef PRIVATE", "#if PRIVATE"):
+        depth = 1
+        out.append("/* IONI_PRIVATE_LIFTED */\n")
+        continue
+    if depth:
+        if st.startswith("#if"):
+            depth += 1
+        elif st.startswith("#endif"):
+            depth -= 1
+            if depth == 0:
+                continue
+        elif st == "#else" and depth == 1:
+            continue
+    out.append(ln)
+open(f, "w").writelines(out)
+PYL
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
 		find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
@@ -913,6 +942,7 @@ build_libsyscall_static() {
 	_rc=0
 	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
+		HEADER_SEARCH_PATHS="$_lsinc $(inherited)" \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		RC_ProjectSourceVersion="$RC_DARWIN_KERNEL_VERSION" \
@@ -983,6 +1013,7 @@ build_dyld() {
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
 	strip_tree "$DEPS_DIR/dyld"
 	sed -i '' 's/macosx\.internal/macosx/g' "$DEPS_DIR/dyld/build-scripts/generate-cache-config-header.sh"
+	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
