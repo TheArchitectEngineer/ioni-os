@@ -374,11 +374,6 @@ try libpthread build_libpthread
 # is internal - stand in the declarations the TU chain needs
 cat > "$BUILD_DIR/work_interval_instance_ioni.h" <<'EOF'
 /* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
-#if __has_include(<pthread/work_interval.h>)
-#include <pthread/work_interval.h>
-#else
-typedef struct work_interval_s *work_interval_t;
-#endif
 struct work_interval_data {
 	uint64_t _ioni_fields[8];
 	uint64_t wid_external_wakeups;
@@ -446,6 +441,18 @@ if [ ! -f "$FROOT_INC/CrashReporterClient.h" ]; then
 	cat > "$FROOT_INC/CrashReporterClient.h" <<'EOF'
 #ifndef _IONI_CRASHREPORTERCLIENT_H
 #define _IONI_CRASHREPORTERCLIENT_H
+#include <stdint.h>
+typedef struct {
+	uint64_t version_and_kind;
+	uint64_t message;
+	uint64_t abort_cause;
+	uint64_t big_msg;
+	uint64_t tv_sec;
+	uint64_t tv_usec;
+	uint64_t free_flags;
+	uint64_t spare[8];
+} CRAnnotations;
+extern CRAnnotations gCRAnnotations;
 void CRSetCrashLogMessage(const char *message);
 void CRSetCrashLogMessage2(const char *message);
 const char *CRGetCrashLogMessage(void);
@@ -454,7 +461,22 @@ EOF
 	log "CrashReporterClient.h stub: ok"
 fi
 if [ ! -f "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" ]; then
-        printf '/* Ioni: empty CrashReporterClient stub */\nint _ioni_crc_stub;\n' > "$DEPS_DIR/crc_stub.c"
+        cat > "$DEPS_DIR/crc_stub.c" <<'EOF'
+#include <CrashReporterClient.h>
+CRAnnotations gCRAnnotations;
+void CRSetCrashLogMessage(const char *message)
+{
+	(void)message;
+}
+void CRSetCrashLogMessage2(const char *message)
+{
+	(void)message;
+}
+const char *CRGetCrashLogMessage(void)
+{
+	return 0;
+}
+EOF
         xcrun clang -arch "$LIBARCHS" -c "$DEPS_DIR/crc_stub.c" -o "$DEPS_DIR/crc_stub.o"
         ar crs "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" "$DEPS_DIR/crc_stub.o"
         log "CrashReporterClient stub: ok"
@@ -849,6 +871,7 @@ CSSEOF
 
 build_libsyscall_static() {
 	sed -i "" "s|my @archs = split / /, \$ENV{\"ARCHS\"};|my @archs = (\"$LIBARCHS\");|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
+	sed -i "" "s|\"-x assembler-with-cpp\",|\"-x assembler-with-cpp\", \"-DPRIVATE=1\",|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	_src="$REPO_ROOT/libsyscall"
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
@@ -891,6 +914,7 @@ EOF
 	xcset "$DEPS_DIR/libpthread" GCC_PREFIX_HEADER '_ioni_pthread_prefix.h'
 	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
 	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
+	xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-include pthread/work_interval.h'
 	xb "$DEPS_DIR/libpthread" libpthread.xcodeproj "libpthread dyld" pthreaddyld
 }
 
