@@ -477,7 +477,7 @@ const char *CRGetCrashLogMessage(void)
 	return 0;
 }
 EOF
-        xcrun clang -arch "$LIBARCHS" -c "$DEPS_DIR/crc_stub.c" -o "$DEPS_DIR/crc_stub.o"
+        env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch "$LIBARCHS" -c "$DEPS_DIR/crc_stub.c" -o "$DEPS_DIR/crc_stub.o"
         ar crs "$FAKEROOT/usr/local/lib/libCrashReporterClient.a" "$DEPS_DIR/crc_stub.o"
         log "CrashReporterClient stub: ok"
 fi
@@ -802,7 +802,7 @@ build_ioni_gap() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_gap="$BUILD_DIR/ioni-gap"
 	_sdk="$(xcrun -show-sdk-path)"
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -DOS_SWIFT_NAME(_name)="
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -DOS_SWIFT_NAME(_name)=__attribute__((__swift_name__(#_name)))"
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	mkdir -p "$_dylddir" "$_gap"
