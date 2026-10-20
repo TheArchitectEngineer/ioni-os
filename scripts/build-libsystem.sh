@@ -839,6 +839,11 @@ EOF
 	printf '#include <stdint.h>\nint x(void){return 0;}\n' > "$BUILD_DIR/probe-stdint.c"
 	env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch $LIBARCHS -isysroot $_sdk -E -H "$BUILD_DIR/probe-stdint.c" -o /dev/null 2> "$BUILD_DIR/probe-hdrs.txt" || true
 	head -12 "$BUILD_DIR/probe-hdrs.txt" 1>&2 || true
+	( cd "$DEPS_DIR/libplatform/src/simple" 2>/dev/null && env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -E -dD string_io.c -o "$BUILD_DIR/probe-string_io.pp" ) > "$BUILD_DIR/probe-cerrs.txt" 2>&1 || true
+	for _kw in 'define signed' 'define char' 'define typedef' 'define int8_t' 'define unsigned' 'define short' 'define long' 'define int '; do
+		rg -n "$_kw" "$BUILD_DIR/probe-string_io.pp" 2>/dev/null | head -3 >> "$BUILD_DIR/probe-cerrs.txt" || true
+	done
+	rg -n "typedef signed char int8_t|typedef.*int8_t" "$BUILD_DIR/probe-string_io.pp" 2>/dev/null | head -5 >> "$BUILD_DIR/probe-cerrs.txt" || true
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	strip_tree "$DEPS_DIR/libplatform"
@@ -919,6 +924,7 @@ build_libsyscall_static() {
 	cp "$REPO_ROOT/osfmk/kern/restartable.h" "$_lsinc/kern/restartable.h"
 	cp "$REPO_ROOT/osfmk/mach/mach_types.h" "$_lsinc/mach/mach_types.h"
 	cp "$REPO_ROOT/osfmk/mach/vm_reclaim_private.h" "$_lsinc/mach/vm_reclaim_private.h"
+	cp "$REPO_ROOT/osfmk/mach/vm_reclaim.h" "$_lsinc/mach/vm_reclaim.h"
 	find "$_lsinc" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 	python3 - "$_lsinc/mach/message.h" <<'PYL'
 import sys
@@ -1026,6 +1032,7 @@ build_dyld() {
 	done
 	log "dyld macosx.internal sweep: done"
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
+	cp "$FAKEROOT/usr/local/include/_simple.h" "$DEPS_DIR/dyld/include/_simple.h"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
