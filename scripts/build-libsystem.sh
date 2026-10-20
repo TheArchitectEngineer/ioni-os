@@ -802,7 +802,20 @@ build_ioni_gap() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_gap="$BUILD_DIR/ioni-gap"
 	_sdk="$(xcrun -show-sdk-path)"
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -DOS_SWIFT_NAME(_name)=__attribute__((__swift_name__(#_name)))"
+	cat > "$BUILD_DIR/ioni-gap-prefix.h" <<'EOF'
+#ifndef _IONI_GAP_PREFIX_H
+#define _IONI_GAP_PREFIX_H
+#define SPI_AVAILABLE(...)
+#define OS_SWIFT_NAME(_name) __attribute__((__swift_name__(#_name)))
+#define __unsafe_forge_bidi_indexable(type, val, size) ((type)(val))
+#define __unsafe_forge_single(type, val) ((type)(val))
+#define OSATOMIC_USE_INLINED 0
+#define OSATOMIC_DEPRECATED 0
+#define OSSPINLOCK_USE_INLINED 1
+#define OS_UNFAIR_LOCK_INLINE 0
+#endif
+EOF
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	mkdir -p "$_dylddir" "$_gap"
