@@ -172,6 +172,17 @@ cat > "$FROOT_INC/sys/fsctl.h" <<'FSEOF'
 #endif
 FSEOF
 fi
+if [ ! -f "$FROOT_INC/sys/attr.h" ]; then
+cat > "$FROOT_INC/sys/attr.h" <<'ATTREOF'
+#ifndef _IONI_SYS_ATTR_SHIM_H
+#define _IONI_SYS_ATTR_SHIM_H
+#include_next <sys/attr.h>
+#ifndef FSOPT_UTIMES_NULL
+#define FSOPT_UTIMES_NULL 0x00000400
+#endif
+#endif
+ATTREOF
+fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
@@ -890,14 +901,20 @@ EOF
 	fi
 	rm -f "$_dylddir/libioni_platform.a"
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
+	_gapcc="$BUILD_DIR/gap-cc"
+	rm -rf "$_gapcc"
+	mkdir -p "$_gapcc/corecrypto"
+	cp "$REPO_ROOT"/EXTERNAL_HEADERS/corecrypto/*.h "$_gapcc/corecrypto/" 2>/dev/null || true
+	cp "$REPO_ROOT"/osfmk/corecrypto/*.h "$_gapcc/corecrypto/" 2>/dev/null || true
+	log "gap-cc root: $(ls "$_gapcc/corecrypto" | wc -l | tr -d ' ') headers"
 	_ccobjs=""
 	for _f in ccdigest_init ccdigest_update ccdigest_final_64be ccsha256_K ccsha256_initial_state ccsha256_ltc_compress ccsha256_ltc_di ccsha512_K ccsha512_initial_state ccsha512_ltc_compress ccsha512_ltc_di cc_clear cc_abort cc_cmp_safe; do
-		xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/vendor" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
+		xcrun clang $_cflags -I"$_gapcc" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
 		_ccobjs="$_ccobjs $_gap/cc-$_f.o"
 	done
 	_gobjs="$_ccobjs"
 	for _f in mvm ioni_crypto ioni_string ioni_stubs; do
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/vendor" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$_gapcc" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
 		_gobjs="$_gobjs $_gap/$_f.o"
 	done
 	cat > "$_gap/dtrace-stubs.c" <<'CSSEOF'
@@ -1027,7 +1044,7 @@ EOF
 build_dyld() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_sdk="$(xcrun -show-sdk-path)"
-	for _h in dyld/VersionMap.h mach-o/ldsyms.h os/security_config_private.h System/mach/dyld_pager.h CrashReporterClient.h libproc_internal.h Rosetta/Dyld/Traps.h; do
+	for _h in dyld/VersionMap.h mach-o/ldsyms.h os/security_config_private.h System/mach/dyld_pager.h CrashReporterClient.h libproc_internal.h Rosetta/Dyld/Traps.h corecrypto/ccdigest.h; do
 		if [ -f "$_sdk/usr/include/$_h" ]; then
 			log "sdk has $_h"
 		else
@@ -1108,6 +1125,8 @@ AMFIEOF
 	cp "$FAKEROOT/usr/local/include/_simple.h" "$DEPS_DIR/dyld/include/_simple.h"
 	cp "$FROOT_INC/CrashReporterClient.h" "$DEPS_DIR/dyld/include/CrashReporterClient.h" 2>/dev/null || true
 	cp "$FAKEROOT/usr/local/include/libproc_internal.h" "$DEPS_DIR/dyld/include/libproc_internal.h" 2>/dev/null || true
+	sudo rm -rf "$FROOT_INC/corecrypto"
+	log "dyld: fakeroot corecrypto shadow removed"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
