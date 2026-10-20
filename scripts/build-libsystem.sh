@@ -845,7 +845,7 @@ EOF
 	_probe() {
 		( cd "$DEPS_DIR/libplatform/src/simple" && env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -DNO_ANSI_KEYWORDS -fno-common -fno-stack-protector -fdollars-in-identifiers $1 -fsyntax-only string_io.c ) > "$BUILD_DIR/probe-$2.txt" 2>&1 || true
 		log "probe $2: $(grep -c 'error:' "$BUILD_DIR/probe-$2.txt" 2>/dev/null || echo 0) errors"
-		head -8 "$BUILD_DIR/probe-$2.txt" 2>/dev/null | while IFS= read -r _pl; do log "probe $2: $_pl"; done"
+		head -8 "$BUILD_DIR/probe-$2.txt" 2>/dev/null | while IFS= read -r _pl; do log "probe $2: $_pl"; done
 	}
 	_probe "" noprefix
 	_probe "-include $BUILD_DIR/ioni-gap-prefix.h" fullprefix
