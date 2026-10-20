@@ -842,8 +842,10 @@ EOF
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	strip_tree "$DEPS_DIR/libplatform"
+	mkdir -p "$_dylddir" "$_gap"
+	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private -I$DEPS_DIR/libplatform/src/os/resolver"
 	_probe() {
-		( cd "$DEPS_DIR/libplatform/src/simple" && env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -DNO_ANSI_KEYWORDS -fno-common -fno-stack-protector -fdollars-in-identifiers $1 -fsyntax-only string_io.c ) > "$BUILD_DIR/probe-$2.txt" 2>&1 || true
+		( cd "$DEPS_DIR/libplatform/src/simple" && env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_pincl -arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -DNO_ANSI_KEYWORDS -fno-common -fno-stack-protector -fdollars-in-identifiers $1 -fsyntax-only string_io.c ) > "$BUILD_DIR/probe-$2.txt" 2>&1 || true
 		log "probe $2: $(grep -c 'error:' "$BUILD_DIR/probe-$2.txt" 2>/dev/null || echo 0) errors"
 		head -8 "$BUILD_DIR/probe-$2.txt" 2>/dev/null | while IFS= read -r _pl; do log "probe $2: $_pl"; done
 	}
@@ -853,8 +855,6 @@ EOF
 	_probe "-include $BUILD_DIR/ioni-gap-nopriv.h" nopriv
 	sed '/__unsafe_forge/d' "$BUILD_DIR/ioni-gap-prefix.h" > "$BUILD_DIR/ioni-gap-noforge.h"
 	_probe "-include $BUILD_DIR/ioni-gap-noforge.h" noforge
-	mkdir -p "$_dylddir" "$_gap"
-	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private -I$DEPS_DIR/libplatform/src/os/resolver"
 	_pobjs=""
 	for _f in "$DEPS_DIR/libplatform"/src/os/*.c \
 		"$DEPS_DIR/libplatform"/src/simple/*.c \
