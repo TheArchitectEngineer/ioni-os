@@ -967,6 +967,8 @@ CSSEOF
 }
 
 build_libsyscall_static() {
+	mkdir -p "$FROOT_INC/mach"
+	cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 	sed -i "" "s|my @archs = split / /, \$ENV{\"ARCHS\"};|my @archs = (\"$LIBARCHS\");|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	sed -i "" "s|\"-x assembler-with-cpp\",|\"-x assembler-with-cpp\", \"-DPRIVATE=1\",|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
@@ -1121,6 +1123,12 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
+	cat > "$DEPS_DIR/dyld/include/System/atexit.h" <<'ATEOF'
+#ifndef _IONI_SYSTEMATEXIT_SHIM_H
+#define _IONI_SYSTEMATEXIT_SHIM_H
+#include <sys/cdefs.h>
+#endif
+ATEOF
 	cat > "$DEPS_DIR/dyld/include/fcntl.h" <<'FCNTEOF'
 #ifndef _IONI_DYLD_FCNTL_SHIM_H
 #define _IONI_DYLD_FCNTL_SHIM_H
