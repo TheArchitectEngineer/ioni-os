@@ -19,7 +19,7 @@ rm -f "$_IDX"
 _PARENT=""
 if git ls-remote --exit-code --heads origin ci-logs >/dev/null 2>&1; then
 	git fetch -q origin ci-logs
-	GIT_INDEX_FILE="$_IDX" git read-tree origin/ci-logs
+	GIT_INDEX_FILE="$_IDX" git read-tree --empty
 	_PARENT="-p origin/ci-logs"
 fi
 
