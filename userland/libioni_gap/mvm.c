@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <sys/mman.h>
 
 typedef struct _liblibc_plat_mem_map_t plat_map_t;

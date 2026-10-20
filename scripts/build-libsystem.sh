@@ -195,6 +195,8 @@ cat > "$FROOT_INC/sys/mount.h" <<'MNTEOF'
 MNTEOF
 fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/sfi.h" "$FROOT_INC/sys/sfi.h" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
@@ -250,7 +252,7 @@ cp "$REPO_ROOT/bsd/sys/proc_info_private.h" "$FROOT_INC/sys/proc_info_private.h"
 cp "$REPO_ROOT/bsd/sys/work_interval.h" "$FROOT_INC/sys/" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/persona.h" "$FROOT_INC/sys/persona.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/proc_info.h" "$FROOT_INC/sys/proc_info.h" 2>/dev/null || true
-for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h" "$FROOT_INC/sys/ulock.h"; do
+for _wh in "$FROOT_INC/sys/work_interval.h" "$FROOT_INC/sys/persona.h" "$FROOT_INC/sys/ulock.h" "$FROOT_INC/sys/sfi.h"; do
         [ -f "$_wh" ] || continue
         grep -q "IONI_PRIVATE_LIFTED" "$_wh" && continue
         python3 - "$_wh" <<'PYW'
@@ -1141,6 +1143,10 @@ AMFIEOF
 	mkdir -p "$DEPS_DIR/dyld/include/corecrypto"
 	cp "$REPO_ROOT"/vendor/corecrypto/*.h "$DEPS_DIR/dyld/include/corecrypto/"
 	log "dyld corecrypto headers: $(ls "$DEPS_DIR/dyld/include/corecrypto" | wc -l | tr -d ' ') staged"
+	if [ -f "$FROOT_INC/os/lock_private.h" ] && grep -q "SPI_AVAILABLE" "$FROOT_INC/os/lock_private.h"; then
+		perl -0777 -pi -e 's/\bSPI_AVAILABLE\s*\((?:[^()]|\([^()]*\))*\)\s*//g' "$FROOT_INC/os/lock_private.h"
+		log "dyld: lock_private SPI_AVAILABLE stripped"
+	fi
 	cd "$DEPS_DIR/dyld"
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
