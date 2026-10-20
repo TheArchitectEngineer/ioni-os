@@ -21,14 +21,14 @@ DYLD_TAG="${DYLD_TAG:-dyld-1378}"
 : "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
 export RC_DARWIN_KERNEL_VERSION
 
+mkdir -p "$FAKEROOT" "$DEPS_DIR"
+
+log() { echo "libsystem: $*" >&2; }
+
 if ! sudo grep -q FSOPT_UTIMES_NULL "$_sdk/usr/include/sys/fsctl.h" 2>/dev/null; then
 	printf '\n#ifndef FSOPT_UTIMES_NULL\n#define FSOPT_UTIMES_NULL 0x00000400\n#endif\n' | sudo tee -a "$_sdk/usr/include/sys/fsctl.h" > /dev/null
 	log "fsctl.h FSOPT_UTIMES_NULL: appended to sdk"
 fi
-
-mkdir -p "$FAKEROOT" "$DEPS_DIR"
-
-log() { echo "libsystem: $*" >&2; }
 
 clone() {
         _repo="$1"; _tag="$2"; _dst="$3"
@@ -892,12 +892,12 @@ EOF
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_ccobjs=""
 	for _f in ccdigest_init ccdigest_update ccdigest_final_64be ccsha256_K ccsha256_initial_state ccsha256_ltc_compress ccsha256_ltc_di ccsha512_K ccsha512_initial_state ccsha512_ltc_compress ccsha512_ltc_di cc_clear cc_abort cc_cmp_safe; do
-		xcrun clang $_cflags -I"$REPO_ROOT/osfmk" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
+		xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/vendor" -c "$REPO_ROOT/osfmk/corecrypto/$_f.c" -o "$_gap/cc-$_f.o" || return 1
 		_ccobjs="$_ccobjs $_gap/cc-$_f.o"
 	done
 	_gobjs="$_ccobjs"
 	for _f in mvm ioni_crypto ioni_string ioni_stubs; do
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -I"$REPO_ROOT/osfmk/corecrypto" -I"$REPO_ROOT/vendor" -I"$REPO_ROOT/userland/libioni_gap" -c "$REPO_ROOT/userland/libioni_gap/$_f.c" -o "$_gap/$_f.o" || return 1
 		_gobjs="$_gobjs $_gap/$_f.o"
 	done
 	cat > "$_gap/dtrace-stubs.c" <<'CSSEOF'
@@ -1090,6 +1090,13 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
+	cat > "$DEPS_DIR/dyld/include/libamfi.h" <<'AMFIEOF'
+#ifndef _IONI_LIBAMFI_H
+#define _IONI_LIBAMFI_H
+#include <stdint.h>
+extern int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags);
+#endif
+AMFIEOF
 	log "dyld include shims: staged"
 	log "dyld.h bridgeos left: $(grep -c bridgeos "$DEPS_DIR/dyld/include/mach-o/dyld.h" 2>/dev/null || echo ?)"
 	grep -rl 'macosx\.internal' "$DEPS_DIR/dyld" 2>/dev/null | while IFS= read -r _f; do
