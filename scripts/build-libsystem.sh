@@ -106,6 +106,8 @@ try() {
         else
                 log "$_name: FAILED (see log above)"
                 FAILS="$FAILS $_name"
+                mkdir -p "$BUILD_DIR/logs"
+                log "$_name: failed at $(date -u +%H:%M:%S)" >> "$BUILD_DIR/logs/${_name}-errors.txt"
         fi
 }
 
@@ -946,6 +948,13 @@ EOF
 build_dyld() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_sdk="$(xcrun -show-sdk-path)"
+	for _h in dyld/VersionMap.h mach-o/ldsyms.h os/security_config_private.h System/mach/dyld_pager.h CrashReporterClient.h libproc_internal.h Rosetta/Dyld/Traps.h; do
+		if [ -f "$_sdk/usr/include/$_h" ]; then
+			log "sdk has $_h"
+		else
+			log "SDK LACKS $_h"
+		fi
+	done
 	for _a in libc liblibdispatch libmalloc_type_stubs liblibfirehose_server libioni_membership; do
 		[ -f "$FAKEROOT/usr/local/lib/system/$_a.a" ] && cp "$FAKEROOT/usr/local/lib/system/$_a.a" "$_dylddir/"
 	done

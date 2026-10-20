@@ -179,11 +179,16 @@ jobs:
     name: libsystem chain (experimental)
     runs-on: macos-26
     timeout-minutes: 90
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - name: build open libs
-        run: ./scripts/build-libsystem.sh
+        run: |
+          set -o pipefail
+          mkdir -p BUILD
+          ./scripts/build-libsystem.sh 2>&1 | tee BUILD/libsystem-build.log
         continue-on-error: true
 
       - name: upload fakeroot libs
@@ -197,12 +202,18 @@ jobs:
             BUILD/dyld-product/
           if-no-files-found: warn
 
+      - name: push build log
+        if: always()
+        run: ./scripts/ci-push-log.sh libsystem
+
   bsd-utils:
     name: bsd utils on native libc
     runs-on: macos-26
     timeout-minutes: 30
     needs: libsystem
     if: always() && needs.libsystem.result != 'skipped'
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -213,7 +224,14 @@ jobs:
           path: BUILD/fakeroot
 
       - name: build utilities
-        run: ./scripts/build-utils.sh
+        run: |
+          set -o pipefail
+          mkdir -p BUILD
+          ./scripts/build-utils.sh 2>&1 | tee BUILD/utils-build.log
+
+      - name: push build log
+        if: always()
+        run: ./scripts/ci-push-log.sh utils
 
       - name: upload utilities
         uses: actions/upload-artifact@v4

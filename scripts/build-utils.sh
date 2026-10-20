@@ -94,7 +94,7 @@ build_util() {
                 _o="$_obj/$_name-$(basename "${_s%.c}").o"
                 [ -f "$_o" ] && continue
                 ( cd "$(dirname "$_s")" && env CPATH="$_incl" xcrun clang $_cflags \
-                        -c "$(basename "$_s")" -o "$_o" ) || return 1
+                        -c "$(basename "$_s")" -o "$_o" ) || { log "util $_name: TU $(basename "$_s") FAILED"; return 1; }
                 _oobjs="$_oobjs $_o"
         done < "$_srcs"
         _ldargs=""
@@ -108,7 +108,7 @@ build_util() {
                 -Wl,-e,start -Wl,-all_load -Wl,-dead_strip \
                 -arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
                 "$BUILD_DIR/crt0.o" $_ldargs $SYSARCHIVES \
-                -o "$_out/$_name" || return 1
+                -o "$_out/$_name" || { log "util $_name: LINK FAILED"; return 1; }
         file "$_out/$_name"
 }
 
