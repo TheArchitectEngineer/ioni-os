@@ -157,6 +157,7 @@ cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/mach/thread_switch.h" "$FROOT_INC/mach/" 2>/dev/null || true
 cp "$REPO_ROOT/libsyscall/mach/mach/mach_sync_ipc.h" "$FROOT_INC/mach/" 2>/dev/null || true
 printf "#ifndef _IONI_MEMBERSHIP_PRIV_H\n#define _IONI_MEMBERSHIP_PRIV_H\n#include <membership.h>\n#endif\n" > "$FROOT_INC/membershipPriv.h"
 cp "$REPO_ROOT/osfmk/mach/arm/syscall_sw.h" "$FROOT_INC/mach/arm/" 2>/dev/null || true
@@ -373,6 +374,7 @@ try libpthread build_libpthread
 # is internal - stand in the declarations the TU chain needs
 cat > "$BUILD_DIR/work_interval_instance_ioni.h" <<'EOF'
 /* IONI_WORK_INTERVAL_INSTANCE: internal pthread surface */
+#include <pthread/work_interval.h>
 struct work_interval_data {
 	uint64_t _ioni_fields[8];
 	uint64_t wid_external_wakeups;
@@ -763,7 +765,7 @@ build_ioni_gap() {
 	_dylddir="$FAKEROOT/usr/local/lib/dyld"
 	_gap="$BUILD_DIR/ioni-gap"
 	_sdk="$(xcrun -show-sdk-path)"
-	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers"
+	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -DOSATOMIC_USE_INLINED=0 -DOSATOMIC_DEPRECATED=0 -DOSSPINLOCK_USE_INLINED=1 -DOS_UNFAIR_LOCK_INLINE=0 -D'OS_SWIFT_NAME(_name)='"
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
 	mkdir -p "$_dylddir" "$_gap"
@@ -831,6 +833,7 @@ CSSEOF
 }
 
 build_libsyscall_static() {
+	env IONI_ARCH="$LIBARCHS" perl -pi -e 's{\$ENV\{"ARCHS"\}}{(\$ENV{"ARCHS"} || \$ENV{"IONI_ARCH"})}' "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	_src="$REPO_ROOT/libsyscall"
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
