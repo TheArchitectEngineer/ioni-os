@@ -845,6 +845,7 @@ EOF
 	_probe() {
 		( cd "$DEPS_DIR/libplatform/src/simple" && env CPATH="$FAKEROOT/usr/local/include" xcrun clang -arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -Wno-int-conversion -DNO_ANSI_KEYWORDS -fno-common -fno-stack-protector -fdollars-in-identifiers $1 -fsyntax-only string_io.c ) > "$BUILD_DIR/probe-$2.txt" 2>&1 || true
 		log "probe $2: $(grep -c 'error:' "$BUILD_DIR/probe-$2.txt" 2>/dev/null || echo 0) errors"
+		head -8 "$BUILD_DIR/probe-$2.txt" 2>/dev/null | while IFS= read -r _pl; do log "probe $2: $_pl"; done"
 	}
 	_probe "" noprefix
 	_probe "-include $BUILD_DIR/ioni-gap-prefix.h" fullprefix
@@ -932,7 +933,8 @@ build_libsyscall_static() {
 	cp "$REPO_ROOT/osfmk/mach/vm_reclaim.h" "$_lsinc/mach/vm_reclaim.h"
 	_mig="$(xcrun -sdk "$_sdk" -find mig)"
 	_migcc="$(xcrun -sdk "$_sdk" -find cc)"
-	env MIGCC="$_migcc" "$_mig" -novouchers -arch i386 -cc "$_migcc" -header "$_lsinc/mach/mach_vm_internal.h" -DLIBSYSCALL_INTERFACE -I"$REPO_ROOT/osfmk" "$REPO_ROOT/osfmk/mach/mach_vm.defs" > "$BUILD_DIR/mig-vm.log" 2>&1 || log "mig mach_vm_internal: FAILED (see BUILD/mig-vm.log)"
+	env MIGCC="$_migcc" "$_mig" -novouchers -arch i386 -cc "$_migcc" -header "$_lsinc/mach/mach_vm_internal.h" -I"$REPO_ROOT/osfmk" "$REPO_ROOT/osfmk/mach/mach_vm.defs" > "$BUILD_DIR/mig-vm.log" 2>&1 || log "mig mach_vm_internal: FAILED (see BUILD/mig-vm.log)"
+	rg -c "mach_vm_deferred_reclamation_buffer_allocate" "$_lsinc/mach/mach_vm_internal.h" >> "$BUILD_DIR/mig-vm.log" 2>&1 || true"
 	[ -f "$_lsinc/mach/mach_vm_internal.h" ] && log "mig mach_vm_internal: ok"
 	find "$_lsinc" -name "*.h" -exec sed -E -i '' "$STRIP_BOUNDS" {} + 2>/dev/null || true
 	python3 - "$_lsinc/mach/message.h" <<'PYL'
@@ -1041,6 +1043,7 @@ build_dyld() {
 	done
 	log "dyld macosx.internal sweep: done"
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
+	perl -pi -e 's{(-DBUILDING_DYLD=1 -std=c\+\+2a)}{-DDYLD_EXCLAVEKIT_UNAVAILABLE= -DBUILDING_DYLD=1 -std=c++2a}' "$DEPS_DIR/dyld/build-scripts/prebuilt-loader-hash.sh" 2>/dev/null || true"
 	cp "$FAKEROOT/usr/local/include/_simple.h" "$DEPS_DIR/dyld/include/_simple.h"
 	cp "$FROOT_INC/CrashReporterClient.h" "$DEPS_DIR/dyld/include/CrashReporterClient.h" 2>/dev/null || true
 	cp "$FAKEROOT/usr/local/include/libproc_internal.h" "$DEPS_DIR/dyld/include/libproc_internal.h" 2>/dev/null || true
