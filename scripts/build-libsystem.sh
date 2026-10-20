@@ -811,8 +811,9 @@ build_ioni_gap() {
 #define __unsafe_forge_single(type, val) ((type)(val))
 #define OSATOMIC_USE_INLINED 0
 #define OSATOMIC_DEPRECATED 0
-#define OSSPINLOCK_USE_INLINED 1
+#define OSSPINLOCK_USE_INLINED 0
 #define OS_UNFAIR_LOCK_INLINE 0
+#define PRIVATE 1
 #endif
 EOF
 	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
