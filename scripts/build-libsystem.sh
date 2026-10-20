@@ -1124,6 +1124,13 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
+	cat > "$DEPS_DIR/dyld/include/libproc.h" <<'LPIEOF'
+#ifndef _IONI_DYLD_LIBPROC_SHIM_H
+#define _IONI_DYLD_LIBPROC_SHIM_H
+#include_next <libproc.h>
+int proc_set_dyld_all_image_info(void *buffer, int buffersize);
+#endif
+LPIEOF
 	cat > "$DEPS_DIR/dyld/include/System/atexit.h" <<'ATEOF'
 #ifndef _IONI_SYSTEMATEXIT_SHIM_H
 #define _IONI_SYSTEMATEXIT_SHIM_H
