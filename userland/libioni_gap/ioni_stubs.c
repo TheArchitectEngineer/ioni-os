@@ -4,8 +4,25 @@
 #include <stdio.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <asl.h>
-#include <notify.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <utmpx.h>
+#include <mach-o/dyld.h>
+
+typedef void *asl_object_t;
+
+asl_object_t asl_open(const char *ident, const char *facility, uint32_t opts);
+asl_object_t asl_new(uint32_t type);
+void asl_set(asl_object_t msg, const char *key, const char *value);
+const char *asl_get(asl_object_t msg, const char *key);
+asl_object_t asl_send(asl_object_t msg);
+void asl_release(asl_object_t obj);
+void asl_append(asl_object_t msg, asl_object_t entry);
+asl_object_t asl_next(asl_object_t iter, asl_object_t msg);
+int asl_match(asl_object_t msg, asl_object_t query);
+void asl_set_query(asl_object_t msg, const char *key, const char *value, uint32_t op);
+uint32_t notify_post(const char *name);
+
 #include <pthread.h>
 
 int __unix_conforming = 1;
@@ -66,7 +83,7 @@ _tlv_exit(void)
 {
 }
 
-void *
+asl_object_t
 asl_open(const char *ident, const char *facility, uint32_t opts)
 {
         (void)ident;
@@ -98,11 +115,11 @@ asl_get(asl_object_t msg, const char *key)
         return NULL;
 }
 
-int
+asl_object_t
 asl_send(asl_object_t msg)
 {
         (void)msg;
-        return -1;
+        return NULL;
 }
 
 void
@@ -143,10 +160,11 @@ asl_set_query(asl_object_t msg, const char *key, const char *value, uint32_t op)
         (void)op;
 }
 
-void
+uint32_t
 notify_post(const char *name)
 {
         (void)name;
+        return 0;
 }
 
 uint64_t
@@ -394,7 +412,7 @@ getgroupcount(const char *name, gid_t basegid)
 }
 
 int
-getgrouplist(const char *name, gid_t basegid, gid_t *groups, int *ngroups)
+getgrouplist(const char *name, int basegid, int *groups, int *ngroups)
 {
         (void)name;
         (void)basegid;

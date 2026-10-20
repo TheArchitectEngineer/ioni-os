@@ -196,6 +196,7 @@ MNTEOF
 fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/sfi.h" "$FROOT_INC/sys/sfi.h" 2>/dev/null || true
+mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
@@ -1119,6 +1120,7 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/codesign.h" "$DEPS_DIR/dyld/include/System/sys/codesign.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
 	cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
 	cat > "$DEPS_DIR/dyld/include/libamfi.h" <<'AMFIEOF'
 #ifndef _IONI_LIBAMFI_H
