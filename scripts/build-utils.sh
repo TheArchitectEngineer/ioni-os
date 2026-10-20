@@ -61,9 +61,14 @@ mkdir -p "$_obj" "$_out"
 
 SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libmalloc_full.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a"
 
+_miss=""
 for _a in $SYSARCHIVES; do
-        [ -f "$_a" ] || { log "missing supply archive $_a"; exit 1; }
+        [ -f "$_a" ] || _miss="$_miss $(basename "$_a")"
 done
+if [ -n "$_miss" ]; then
+        log "missing supply archives:$_miss"
+        exit 1
+fi
 
 build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"

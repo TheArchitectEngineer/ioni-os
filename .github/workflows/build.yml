@@ -191,15 +191,17 @@ jobs:
           ./scripts/build-libsystem.sh 2>&1 | tee BUILD/libsystem-build.log
         continue-on-error: true
 
+      - name: stage supply
+        run: |
+          mkdir -p BUILD/supply
+          cp -R BUILD/fakeroot BUILD/supply/fakeroot
+          [ -d BUILD/dyld-product ] && cp -R BUILD/dyld-product BUILD/supply/dyld-product || true
+
       - name: upload fakeroot libs
         uses: actions/upload-artifact@v4
         with:
           name: libsystem-fakeroot
-          path: |
-            BUILD/fakeroot/usr/**/*.a
-            BUILD/fakeroot/usr/**/*.dylib
-            BUILD/fakeroot/usr/**/*.tbd
-            BUILD/dyld-product/
+          path: BUILD/supply/
           if-no-files-found: warn
 
       - name: push build log
@@ -221,7 +223,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: libsystem-fakeroot
-          path: BUILD/fakeroot
+          path: BUILD
 
       - name: build utilities
         run: |

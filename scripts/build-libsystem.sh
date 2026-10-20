@@ -815,6 +815,9 @@ build_ioni_gap() {
 #define __unsafe_forge_single(type, val) ((type)(val))
 #define PRIVATE 1
 #define __PTHREAD_EXPOSE_INTERNALS__ 1
+#ifndef OS_ALLOC_ONCE_KEY_LIBSYSTEM_PLATFORM_ASL
+#define OS_ALLOC_ONCE_KEY_LIBSYSTEM_PLATFORM_ASL 63
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 extern bool _os_xbs_chrooted;
@@ -897,11 +900,11 @@ CSSEOF
 }
 
 build_libsyscall_static() {
-	xcset "$_src" OTHER_MIGFLAGS "-I$REPO_ROOT/osfmk"
 	sed -i "" "s|my @archs = split / /, \$ENV{\"ARCHS\"};|my @archs = (\"$LIBARCHS\");|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	sed -i "" "s|\"-x assembler-with-cpp\",|\"-x assembler-with-cpp\", \"-DPRIVATE=1\",|" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	grep -n "my @archs" "$REPO_ROOT/libsyscall/xcodescripts/compile-syscalls.pl"
 	_src="$REPO_ROOT/libsyscall"
+	xcset "$_src" OTHER_MIGFLAGS "-I$REPO_ROOT/osfmk"
 	DEVDIR="$(xcode-select -p 2>/dev/null || true)"
 	if [ -n "$DEVDIR" ] && [ ! -f "$DEVDIR/Makefiles/CoreOS/Xcode/BSD.xcconfig" ]; then
 		find "$_src" -name "*.xcconfig" -exec sed -i '' 's|^#include.*CoreOS/.*||g' {} + 2>/dev/null || true
@@ -986,6 +989,7 @@ build_dyld() {
 		xcodebuild build -project dyld.xcodeproj -target dyld -configuration Release \
 		-sdk macosx ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+		GCC_PREPROCESSOR_DEFINITIONS="DYLD_VERSION=1378.120.2 BUILDING_DYLD=1 DYLD_EXCLAVEKIT_UNAVAILABLE=" \
 		RC_ProjectSourceVersion="1378.120.2" \
 		OBJROOT="$BUILD_DIR/obj.dyld" SYMROOT="$BUILD_DIR/sym.dyld" || _rc=$?
 	if [ "$_rc" -ne 0 ]; then
@@ -1010,8 +1014,22 @@ build_dyld() {
 	return 0
 }
 
+refresh_mach_headers() {
+	_cp() { cp "$REPO_ROOT/$1" "$FROOT_INC/$2" 2>/dev/null || true; }
+	_cp osfmk/mach/coalition.h mach/coalition.h
+	_cp osfmk/mach/thread_switch.h mach/thread_switch.h
+	_cp osfmk/mach/mach_eventlink_types.h mach/mach_eventlink_types.h
+	_cp osfmk/mach/i386/syscall_sw.h mach/i386/syscall_sw.h
+	_cp osfmk/mach/arm/syscall_sw.h mach/arm/syscall_sw.h
+	_cp libsyscall/mach/mach/mach_sync_ipc.h mach/mach_sync_ipc.h
+	mkdir -p "$FROOT_INC/AppleFeatures"
+	printf "#ifndef _IONI_APPLEFEATURES_H\n#define _IONI_APPLEFEATURES_H\n#endif\n" > "$FROOT_INC/AppleFeatures/AppleFeatures.h"
+	log "mach headers refresh: ok"
+}
+
 try ioni_gap build_ioni_gap
 try libsyscall_static build_libsyscall_static
+refresh_mach_headers
 try pthread_dyld build_pthread_dyld
 try dyld build_dyld
 
