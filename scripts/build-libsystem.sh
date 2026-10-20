@@ -384,17 +384,17 @@ struct work_interval_data {
 	uint64_t wid_system_time_mach;
 };
 typedef struct work_interval_instance *work_interval_instance_t;
-work_interval_instance_t work_interval_instance_alloc(work_interval_t wi);
-void work_interval_instance_free(work_interval_instance_t wil);
-int work_interval_instance_clear(work_interval_instance_t wil);
-int work_interval_instance_start(work_interval_instance_t wil);
-int work_interval_instance_update(work_interval_instance_t wil);
-int work_interval_instance_finish(work_interval_instance_t wil);
-int work_interval_instance_set_finish(work_interval_instance_t wil, uint32_t type);
-int work_interval_instance_set_start(work_interval_instance_t wil, uint64_t start);
-int work_interval_instance_set_deadline(work_interval_instance_t wil, uint64_t deadline);
-int work_interval_instance_set_complexity(work_interval_instance_t wil, uint64_t complexity);
-int work_interval_instance_get_telemetry_data(work_interval_instance_t wil, void *data, size_t size);
+void *work_interval_instance_alloc(void *wi);
+void work_interval_instance_free(void *wil);
+int work_interval_instance_clear(void *wil);
+int work_interval_instance_start(void *wil);
+int work_interval_instance_update(void *wil);
+int work_interval_instance_finish(void *wil);
+int work_interval_instance_set_finish(void *wil, uint32_t type);
+int work_interval_instance_set_start(void *wil, uint64_t start);
+int work_interval_instance_set_deadline(void *wil, uint64_t deadline);
+int work_interval_instance_set_complexity(void *wil, uint64_t complexity);
+int work_interval_instance_get_telemetry_data(void *wil, void *data, size_t size);
 EOF
 for _wgh in "$DEPS_DIR/libpthread/private/pthread/workgroup_private.h" "$FROOT_INC/pthread/workgroup_private.h"; do
         if [ -f "$_wgh" ] && ! grep -q "IONI_WORK_INTERVAL_INSTANCE" "$_wgh"; then
@@ -826,6 +826,7 @@ EOF
 	_cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -Wno-error -fno-common -fno-stack-protector -fdollars-in-identifiers -include $BUILD_DIR/ioni-gap-prefix.h"
 	clone libplatform "$LIBPLATFORM_TAG" "$DEPS_DIR/libplatform"
 	clone libpthread "$LIBPTHREAD_TAG" "$DEPS_DIR/libpthread"
+	strip_tree "$DEPS_DIR/libplatform"
 	mkdir -p "$_dylddir" "$_gap"
 	_pincl="-I$DEPS_DIR/libplatform/include -I$DEPS_DIR/libplatform/internal -I$DEPS_DIR/libplatform/private -I$DEPS_DIR/libplatform/src/os/resolver"
 	_pobjs=""
@@ -935,7 +936,6 @@ EOF
 	xcset "$DEPS_DIR/libpthread" GCC_PREFIX_HEADER '_ioni_pthread_prefix.h'
 	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'SPI_AVAILABLE(...)=' ' __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val))'
 	xcset "$DEPS_DIR/libpthread" GCC_PREPROCESSOR_DEFINITIONS 'THREAD_QOS_UNSPECIFIED=0 THREAD_QOS_MAINTENANCE=1 THREAD_QOS_BACKGROUND=2 THREAD_QOS_UTILITY=3 THREAD_QOS_LEGACY=4 THREAD_QOS_USER_INITIATED=5 THREAD_QOS_USER_INTERACTIVE=6 THREAD_QOS_LAST=7 thread_qos_t=uint8_t PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1'
-	xcset "$DEPS_DIR/libpthread" OTHER_CFLAGS '-include pthread/work_interval.h'
 	xb "$DEPS_DIR/libpthread" libpthread.xcodeproj "libpthread dyld" pthreaddyld
 }
 
@@ -965,6 +965,7 @@ build_dyld() {
 	ls -1 "$_dylddir"
 	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
 	sudo cp "$_dylddir"/*.a "$_sdk/usr/local/lib/dyld/"
+	strip_tree "$DEPS_DIR/dyld"
 	sed -i '' 's/macosx\.internal/macosx/g' "$DEPS_DIR/dyld/build-scripts/generate-cache-config-header.sh"
 	cd "$DEPS_DIR/dyld"
 	_rc=0
