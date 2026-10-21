@@ -212,6 +212,7 @@ PROCEOF
 fi
 mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
+cp "$REPO_ROOT/osfmk/mach/syscall_sw.h" "$FROOT_INC/mach/syscall_sw.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
@@ -1377,6 +1378,7 @@ refresh_mach_headers() {
 	_cp osfmk/mach/arm/syscall_sw.h mach/arm/syscall_sw.h
 	_cp libsyscall/mach/mach/mach_sync_ipc.h mach/mach_sync_ipc.h
 	_cp osfmk/mach/sfi_class.h mach/sfi_class.h
+	_cp osfmk/mach/syscall_sw.h mach/syscall_sw.h
 	mkdir -p "$FROOT_INC/AppleFeatures"
 	printf "#ifndef _IONI_APPLEFEATURES_H\n#define _IONI_APPLEFEATURES_H\n#endif\n" > "$FROOT_INC/AppleFeatures/AppleFeatures.h"
 	log "mach headers refresh: ok"
