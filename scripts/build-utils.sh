@@ -110,7 +110,7 @@ build_util() {
                 _ldargs="$_ldargs $_o"
         done
         env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie \
-                -Wl,-e,start -Wl,-all_load -Wl,-dead_strip \
+                -Wl,-e,start -Wl,-dead_strip \
                 -arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
                 "$BUILD_DIR/crt0.o" $_ldargs $SYSARCHIVES \
                 -o "$_out/$_name" || { log "util $_name: LINK FAILED"; return 1; }
