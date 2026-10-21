@@ -745,6 +745,13 @@ if [ -f "$FROOT_INC/time.h" ] && grep -q "Please #include <dispatch/dispatch.h>"
 	log "dispatch time.h moved aside"
 fi
 
+build_dispatch_mp() {
+	xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj "libdispatch mp static" dispatchmp "" 'OS_OBJECT_USE_OBJC=0 GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h'
+	find "$BUILD_DIR/sym.dispatchmp" -name "libdispatch.a" -exec cp {} "$FAKEROOT/usr/local/lib/system/liblibdispatch.a" \; || return 1
+	log "dispatch mp static archive: $(find "$BUILD_DIR/sym.dispatchmp" -name libdispatch.a | head -1)"
+}
+try dispatchmp build_dispatch_mp
+
 build_libc_static() {
         clone Libc "$LIBC_TAG" "$DEPS_DIR/Libc"
         # the compat variant archives duplicate the plain symbols on this
