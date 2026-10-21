@@ -74,6 +74,10 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nvoid __start(int argc, const char **argv, const char **envp)\n{\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
+                        -nostdlib -Wno-error -O1 \
+                        -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -DOLD_LIBSYSTEM_SUPPORT -nostdlib -keep_private_externs \
                         -Wno-error -O2 \
@@ -82,7 +86,7 @@ build_crt() {
                         -nostdlib -keep_private_externs -Wno-error -O2 \
                         -c "$DEPS_DIR/Csu/crt.c" -o "$_obj/crt-crt.o" || return 1
                 ld -r -arch $LIBARCHS -keep_private_externs \
-                        "$_obj/crt-start.o" "$_obj/crt-crt.o" -o "$_crt" || return 1
+                        "$_obj/crt-start.o" "$_obj/crt-crt.o" "$_obj/crt-ustart.o" -o "$_crt" || return 1
         fi
 }
 
