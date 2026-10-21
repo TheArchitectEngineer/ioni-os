@@ -1165,7 +1165,7 @@ MTEOF
 		OBJROOT="$BUILD_DIR/obj.ikern" SYMROOT="$BUILD_DIR/sym.ikern" \
 		DSTROOT="$FAKEROOT" \
 		GCC_PREFIX_HEADER="$BUILD_DIR/ioni-machtraps-prefix.h" GCC_PRECOMPILE_PREFIX_HEADER=NO \
-		GCC_PREPROCESSOR_DEFINITIONS="PRIVATE=1" || _rc=$?
+		GCC_PREPROCESSOR_DEFINITIONS="PRIVATE=1 SPI_AVAILABLE(...)=" || _rc=$?
 	cd "$REPO_ROOT"
 	find "$FAKEROOT/usr/local/lib/dyld" -name "libsystem_kernel*.a" 2>/dev/null
 	return $_rc
