@@ -1092,6 +1092,20 @@ extern mach_port_name_t thread_self_trap(void);
 extern mach_port_name_t task_self_trap(void);
 extern mach_port_name_t host_self_trap(void);
 extern mach_port_name_t mach_reply_port(void);
+#ifndef IOPOL_CMD_GET
+#define IOPOL_CMD_GET 0x00000001
+#endif
+#ifndef IOPOL_CMD_SET
+#define IOPOL_CMD_SET 0x00000002
+#endif
+#ifndef _SYS_RESOURCE_PRIVATE_IOPOL_IONI
+#define _SYS_RESOURCE_PRIVATE_IOPOL_IONI
+struct _iopol_param_t {
+	int iop_scope;
+	int iop_iotype;
+	int iop_policy;
+};
+#endif
 #ifndef COMM_PAGE_READ
 #define COMM_PAGE_READ(type_t, slot) (*(type_t volatile *)_COMM_PAGE_##slot)
 #endif
