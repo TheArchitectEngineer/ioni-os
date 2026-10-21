@@ -1064,6 +1064,11 @@ extern kern_return_t semaphore_timedwait_signal_trap(mach_port_name_t wait_name,
 #ifndef __improbable
 #define __improbable(x) __builtin_expect(!!(x), 0)
 #endif
+#ifndef KDEBUG_TRACE_DECLARED
+#define KDEBUG_TRACE_DECLARED
+#include <stdint.h>
+int kdebug_trace(uint32_t debugid, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4);
+#endif
 #ifndef PROC_PIDREGIONPATHINFO2
 #define PROC_PIDREGIONPATHINFO2 22
 #endif
