@@ -746,10 +746,20 @@ if [ -f "$FROOT_INC/time.h" ] && grep -q "Please #include <dispatch/dispatch.h>"
 fi
 
 build_dispatch_mp() {
-	xb "$DEPS_DIR/libdispatch" libdispatch.xcodeproj "libdispatch mp static" dispatchmp "$DEPS_DIR/libdispatch" \
-		'GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h "GCC_PREPROCESSOR_DEFINITIONS=OS_OBJECT_USE_OBJC=0 SPI_AVAILABLE(...)= __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val)) __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1 OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1 DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0"' || return 1
-	find "$BUILD_DIR/sym.dispatchmp" -name "liblibdispatch.a" -exec cp {} "$FAKEROOT/usr/local/lib/system/liblibdispatch.a" \; || true
-	log "dispatch mp static archive: $(find "$BUILD_DIR/sym.dispatchmp" -name libdispatch.a | head -1)"
+	_sdk="$(xcrun -show-sdk-path)"
+	_rc=0
+	env CPATH="$FAKEROOT/usr/local/include:$DEPS_DIR/libdispatch" \
+		LD="$(xcrun -find clang)" LDPLUSPLUS="$(xcrun -find clang++)" \
+		xcodebuild install -sdk macosx -project "$DEPS_DIR/libdispatch/libdispatch.xcodeproj" \
+		-target "libdispatch mp static" ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
+		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+		GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h \
+		'GCC_PREPROCESSOR_DEFINITIONS=OS_OBJECT_USE_OBJC=0 SPI_AVAILABLE(...)= __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val)) __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1 OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1 DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0' \
+		OBJROOT="$BUILD_DIR/obj.dispatchmp" SYMROOT="$BUILD_DIR/sym.dispatchmp" \
+		DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
+		RC_ProjectNameAndSourceVersion=dispatchmp || _rc=$?
+	[ "$_rc" -eq 0 ] || return 1
+	log "dispatch mp static: objc-free archive staged"
 }
 try dispatchmp build_dispatch_mp
 
