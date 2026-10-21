@@ -213,15 +213,6 @@ cat > "$FROOT_INC/sys/proc.h" <<'PROCEOF'
 #endif
 PROCEOF
 fi
-if [ ! -f "$FROOT_INC/sys/resource.h" ]; then
-cat > "$FROOT_INC/sys/resource.h" <<'RESEOF'
-#ifndef _IONI_SYS_RESOURCE_SHIM_H
-#define _IONI_SYS_RESOURCE_SHIM_H
-#include_next <sys/resource.h>
-#include <sys/resource_private.h>
-#endif
-RESEOF
-fi
 mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 cp "$REPO_ROOT/osfmk/mach/syscall_sw.h" "$FROOT_INC/mach/syscall_sw.h" 2>/dev/null || true
