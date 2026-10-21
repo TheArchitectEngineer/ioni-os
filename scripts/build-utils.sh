@@ -109,7 +109,7 @@ build_util() {
         for _o in $_oobjs; do
                 _ldargs="$_ldargs $_o"
         done
-        env CPATH="$_incl" xcrun clang -nostdlib -static -no_pie \
+        env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie \
                 -Wl,-e,start -Wl,-all_load -Wl,-dead_strip \
                 -arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
                 "$BUILD_DIR/crt0.o" $_ldargs $SYSARCHIVES \
