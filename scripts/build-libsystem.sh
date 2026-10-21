@@ -965,6 +965,9 @@ EOF
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
 	fi
+	printf "void _preempt(void)\n{\n}\n" > "$_gap/ioni-preempt.c"
+	env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -c "$_gap/ioni-preempt.c" -o "$_gap/platform-preempt.o" || return 1
+	_pobjs="$_pobjs $_gap/platform-preempt.o"
 	rm -f "$_dylddir/libioni_platform.a"
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_gapcc="$BUILD_DIR/gap-cc"
@@ -1360,6 +1363,8 @@ STUBEOF
 	ar rcs "$_dylddir/libioni_stub.a" "$BUILD_DIR/ioni-dyld-stub.o"
 	log "dispatch archive objc syms: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "OBJC_CLASS")"
 	log "dispatch archive objc members: $(xcrun nm -A "$_dylddir/liblibdispatch.a" 2>/dev/null | grep OBJC_CLASS | cut -d: -f1 | sort -u | head -4 | tr "\n" " ")"
+	log "dylddir stub preempt: $(xcrun nm "$_dylddir/libioni_stub.a" 2>/dev/null | grep -c _preempt)"
+	log "sdk stub preempt: $(xcrun nm "$_sdk/usr/local/lib/dyld/libioni_stub.a" 2>/dev/null | grep -c _preempt)"
 	log "dispatch archive client_callout: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "_dispatch_client_callout")"
 	log "dyld supply archives:"
 	ls -1 "$_dylddir"
