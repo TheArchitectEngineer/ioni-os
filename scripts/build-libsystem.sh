@@ -201,6 +201,8 @@ cp "$REPO_ROOT/bsd/sys/proc_private.h" "$FROOT_INC/sys/proc_private.h" 2>/dev/nu
 mkdir -p "$FROOT_INC/skywalk"
 find "$REPO_ROOT/bsd/skywalk" -name "*.h" -exec cp {} "$FROOT_INC/skywalk/" \; 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/os_log_coprocessor.h" "$FROOT_INC/sys/os_log_coprocessor.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/kern_debug.h" "$FROOT_INC/sys/kern_debug.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/kdebug_private.h" "$FROOT_INC/sys/kdebug_private.h" 2>/dev/null || true
 if [ ! -f "$FROOT_INC/sys/proc.h" ]; then
 cat > "$FROOT_INC/sys/proc.h" <<'PROCEOF'
 #ifndef _IONI_SYS_PROC_SHIM_H
