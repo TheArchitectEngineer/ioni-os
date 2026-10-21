@@ -967,8 +967,6 @@ EOF
 	fi
 	perl -pi -e 's/^\tcall\t_preempt.*$//g' "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s"
 	log "OSAtomic preempt calls left: $(grep -c "call.*_preempt" "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" || echo 0)"
-	env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -c "$_gap/ioni-preempt.c" -o "$_gap/platform-preempt.o" || return 1
-	_pobjs="$_pobjs $_gap/platform-preempt.o"
 	rm -f "$_dylddir/libioni_platform.a"
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_gapcc="$BUILD_DIR/gap-cc"
