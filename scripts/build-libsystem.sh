@@ -1022,6 +1022,8 @@ PYL
 	sudo cp "$_lsinc"/mach/*.h "$_sdk/usr/local/include/mach/"
 	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
 	sudo cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$_sdk/usr/local/include/mach/sfi_class.h"
+	sudo cp "$REPO_ROOT/osfmk/mach/coalition.h" "$_sdk/usr/local/include/mach/coalition.h" 2>/dev/null || true
+	cp "$REPO_ROOT/osfmk/mach/coalition.h" "$FROOT_INC/mach/coalition.h" 2>/dev/null || true
 	cat > "$BUILD_DIR/ioni-machtraps-prefix.h" <<'MTEOF'
 #ifndef _IONI_MACHTRAPS_PREFIX_H
 #define _IONI_MACHTRAPS_PREFIX_H
@@ -1191,6 +1193,11 @@ __BEGIN_DECLS
 typedef uint64_t sandbox_filter_type;
 #define SANDBOX_FILTER_NONE 0x0000ULL
 #define SANDBOX_FILTER_PATH 0x0002ULL
+#define SANDBOX_FILTER_GLOBAL_NAME 0x0004ULL
+#define SANDBOX_FILTER_LOCAL_NAME 0x0008ULL
+#define SANDBOX_FILTER_APPLEEVENT_DESTINATION 0x0010ULL
+#define SANDBOX_FILTER_SYSCALL_NUMBER 0x0020ULL
+#define SANDBOX_FILTER_SYSMACH_PORT 0x0040ULL
 #define SANDBOX_CHECK_NO_REPORT 0x0000000100000000ULL
 int sandbox_check(pid_t pid, const char *operation, sandbox_filter_type filters, ...);
 __END_DECLS
