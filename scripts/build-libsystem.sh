@@ -1284,6 +1284,17 @@ int sandbox_check(pid_t pid, const char *operation, uint64_t filters, ...)
 {
 	return 0;
 }
+struct ioni_crannotations {
+	uint64_t version_and_kind;
+	uint64_t message;
+	uint64_t abort_cause;
+	uint64_t big_msg;
+	uint64_t tv_sec;
+	uint64_t tv_usec;
+	uint64_t free_flags;
+	uint64_t spare[8];
+};
+struct ioni_crannotations gCRAnnotations;
 void *__dispatch_objc_retain(void *o)
 {
 	return o;
