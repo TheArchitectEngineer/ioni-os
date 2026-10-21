@@ -196,6 +196,7 @@ MNTEOF
 fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/sfi.h" "$FROOT_INC/sys/sfi.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/process_policy.h" "$FROOT_INC/sys/process_policy.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
@@ -490,6 +491,7 @@ if [ ! -f "$FROOT_INC/CrashReporterClient.h" ]; then
 #ifndef _IONI_CRASHREPORTERCLIENT_H
 #define _IONI_CRASHREPORTERCLIENT_H
 #include <stdint.h>
+#include <sys/cdefs.h>
 typedef struct {
 	uint64_t version_and_kind;
 	uint64_t message;
@@ -500,10 +502,12 @@ typedef struct {
 	uint64_t free_flags;
 	uint64_t spare[8];
 } CRAnnotations;
+__BEGIN_DECLS
 extern CRAnnotations gCRAnnotations;
 void CRSetCrashLogMessage(const char *message);
 void CRSetCrashLogMessage2(const char *message);
 const char *CRGetCrashLogMessage(void);
+__END_DECLS
 #endif
 EOF
 	log "CrashReporterClient.h stub: ok"
@@ -1119,6 +1123,23 @@ build_dyld() {
 	done < "$BUILD_DIR/libmalloc-objs.txt"
 	ranlib "$_m"
 	cp "$_m" "$_dylddir/"
+	cat > "$BUILD_DIR/ioni-dyld-stub.c" <<'STUBEOF'
+#include <stdint.h>
+#include <sys/types.h>
+int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t *output_flags)
+{
+	if (output_flags != 0) {
+		*output_flags = 0x3ffull;
+	}
+	return 0;
+}
+int sandbox_check(pid_t pid, const char *operation, uint64_t filters, ...)
+{
+	return 0;
+}
+STUBEOF
+	xcrun clang -arch "$LIBARCHS" -isysroot "$_sdk" -O1 -c "$BUILD_DIR/ioni-dyld-stub.c" -o "$BUILD_DIR/ioni-dyld-stub.o" || return 1
+	ar rcs "$_dylddir/libioni_stub.a" "$BUILD_DIR/ioni-dyld-stub.o"
 	log "dyld supply archives:"
 	ls -1 "$_dylddir"
 	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
@@ -1242,6 +1263,7 @@ FCNTEOF
 #ifndef _IONI_LIBAMFI_H
 #define _IONI_LIBAMFI_H
 #include <stdint.h>
+#include <sys/cdefs.h>
 #ifndef PLATFORM_IOSMAC
 #define PLATFORM_IOSMAC 7
 #endif
@@ -1262,7 +1284,9 @@ enum amfi_dyld_policy_output_flag_set {
     AMFI_DYLD_OUTPUT_ALLOW_DEVELOPMENT_VARS = (1 << 8),
     AMFI_DYLD_OUTPUT_ALLOW_LIBSYSTEM_OVERRIDE = (1 << 9),
 };
+__BEGIN_DECLS
 extern int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags);
+__END_DECLS
 #endif
 AMFIEOF
 	log "dyld include shims: staged"
