@@ -1020,6 +1020,9 @@ build_libsyscall_static() {
 	cp "$REPO_ROOT/osfmk/kern/remote_time.h" "$_lsinc/kern/remote_time.h" 2>/dev/null || true
 	cp "$REPO_ROOT/osfmk/mach/exclaves.h" "$_lsinc/mach/exclaves.h" 2>/dev/null || true
 	cp "$REPO_ROOT/osfmk/mach/exclaves_l4.h" "$_lsinc/mach/exclaves_l4.h" 2>/dev/null || true
+	cp "$REPO_ROOT/osfmk/kern/arithmetic_128.h" "$_lsinc/kern/arithmetic_128.h" 2>/dev/null || true
+	mkdir -p "$FROOT_INC/kern"
+	cp "$REPO_ROOT/osfmk/kern/arithmetic_128.h" "$FROOT_INC/kern/arithmetic_128.h" 2>/dev/null || true
 	sudo mkdir -p "$_sdk/usr/local/include/string"
 	printf "#ifndef _IONI_STRING_STRINGS_SHIM_H\n#define _IONI_STRING_STRINGS_SHIM_H\n#include <string.h>\n#endif\n" | sudo tee "$_sdk/usr/local/include/string/strings.h" > /dev/null
 	_mig="$(xcrun -sdk "$_sdk" -find mig)"
