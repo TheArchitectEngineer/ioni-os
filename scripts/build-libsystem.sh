@@ -297,6 +297,7 @@ extern int proc_importance_assertion_complete(uint64_t assertion_token);
 #endif
 EOF
 fi
+cp "$REPO_ROOT/libsyscall/wrappers/libproc/libproc_internal.h" "$FROOT_INC/libproc_internal.h" 2>/dev/null || true
 
 # os/alloc_once_private.h: Apple-internal, absent from every public tree; the
 # libplatform impl header carries the API, we add the key pthread asks for
