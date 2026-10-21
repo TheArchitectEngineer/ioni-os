@@ -1285,9 +1285,6 @@ int sandbox_check(pid_t pid, const char *operation, uint64_t filters, ...)
 {
 	return 0;
 }
-void _preempt(void)
-{
-}
 void *__dispatch_objc_retain(void *o)
 {
 	return o;
