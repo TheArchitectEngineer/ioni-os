@@ -1039,6 +1039,12 @@ extern kern_return_t semaphore_wait_trap(mach_port_name_t wait_name);
 extern kern_return_t semaphore_timedwait_trap(mach_port_name_t wait_name, unsigned int sec, clock_res_t nsec);
 extern kern_return_t semaphore_wait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name);
 extern kern_return_t semaphore_timedwait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name, unsigned int sec, clock_res_t nsec);
+#ifndef PROC_PIDREGIONPATHINFO2
+#define PROC_PIDREGIONPATHINFO2 22
+#endif
+#ifndef PROC_PIDREGIONPATHINFO3
+#define PROC_PIDREGIONPATHINFO3 23
+#endif
 __END_DECLS
 #endif
 MTEOF
@@ -1171,6 +1177,7 @@ CPEOF
 	cat > "$DEPS_DIR/dyld/include/vproc_priv.h" <<'VPEOF'
 #ifndef _IONI_VPROC_PRIV_SHIM_H
 #define _IONI_VPROC_PRIV_SHIM_H
+#include <fcntl.h>
 #endif
 VPEOF
 	mkdir -p "$DEPS_DIR/dyld/include/sandbox"
@@ -1222,10 +1229,32 @@ int openbyid_np(const void *fsid, const void *objid, int oflags);
 FCNTEOF
 
 	cp "$REPO_ROOT/osfmk/i386/cpu_capabilities.h" "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/commpage.h" "$DEPS_DIR/dyld/include/sys/commpage.h" 2>/dev/null || true
+	perl -0777 -pi -e 's/^#ifdef\s+PRIVATE\n//m; s/#endif \/\* PRIVATE \*\/\n?\z//' "$DEPS_DIR/dyld/include/System/machine/cpu_capabilities.h" 2>/dev/null || true
 	cat > "$DEPS_DIR/dyld/include/libamfi.h" <<'AMFIEOF'
 #ifndef _IONI_LIBAMFI_H
 #define _IONI_LIBAMFI_H
 #include <stdint.h>
+#ifndef PLATFORM_IOSMAC
+#define PLATFORM_IOSMAC 7
+#endif
+enum {
+    AMFI_DYLD_INPUT_PROC_IN_SIMULATOR = (1 << 0),
+    AMFI_DYLD_INPUT_PROC_HAS_RESTRICT_SEG = (1 << 1),
+    AMFI_DYLD_INPUT_PROC_IS_ENCRYPTED = (1 << 2),
+};
+enum amfi_dyld_policy_output_flag_set {
+    AMFI_DYLD_OUTPUT_ALLOW_AT_PATH = (1 << 0),
+    AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS = (1 << 1),
+    AMFI_DYLD_OUTPUT_ALLOW_CUSTOM_SHARED_CACHE = (1 << 2),
+    AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS = (1 << 3),
+    AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS = (1 << 4),
+    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION = (1 << 5),
+    AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING = (1 << 6),
+    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS = (1 << 7),
+    AMFI_DYLD_OUTPUT_ALLOW_DEVELOPMENT_VARS = (1 << 8),
+    AMFI_DYLD_OUTPUT_ALLOW_LIBSYSTEM_OVERRIDE = (1 << 9),
+};
 extern int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags);
 #endif
 AMFIEOF
