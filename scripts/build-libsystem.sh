@@ -1001,6 +1001,7 @@ build_libsyscall_static() {
 	cp "$REPO_ROOT/osfmk/mach/mach_types.h" "$_lsinc/mach/mach_types.h"
 	cp "$REPO_ROOT/osfmk/mach/vm_reclaim_private.h" "$_lsinc/mach/vm_reclaim_private.h"
 	cp "$REPO_ROOT/osfmk/mach/vm_reclaim.h" "$_lsinc/mach/vm_reclaim.h"
+	cp "$REPO_ROOT/osfmk/mach/mach_eventlink_types.h" "$_lsinc/mach/mach_eventlink_types.h" 2>/dev/null || true
 	_mig="$(xcrun -sdk "$_sdk" -find mig)"
 	_migcc="$(xcrun -sdk "$_sdk" -find cc)"
 	env MIGCC="$_migcc" "$_mig" -novouchers -arch i386 -cc "$_migcc" -header "$_lsinc/mach/mach_vm_internal.h" -I"$REPO_ROOT/osfmk" "$REPO_ROOT/osfmk/mach/mach_vm.defs" > "$BUILD_DIR/mig-vm.log" 2>&1 || log "mig mach_vm_internal: FAILED (see BUILD/mig-vm.log)"
