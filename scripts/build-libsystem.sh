@@ -960,13 +960,13 @@ EOF
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$_f" -o "$_o" || return 1
 		_pobjs="$_pobjs $_o"
 	done
+	perl -pi -e 's/^\tcall\t_preempt.*$//g' "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s"
+	log "OSAtomic preempt calls left: $(grep -c "call.*_preempt" "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" || echo 0)"
 	if [ -f "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" ]; then
 		_asmflags=$(printf '%s' "$_cflags" | sed 's| -include [^ ]*||')
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
 	fi
-	perl -pi -e 's/^\tcall\t_preempt.*$//g' "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s"
-	log "OSAtomic preempt calls left: $(grep -c "call.*_preempt" "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" || echo 0)"
 	rm -f "$_dylddir/libioni_platform.a"
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
 	_gapcc="$BUILD_DIR/gap-cc"
@@ -1546,7 +1546,6 @@ DAGEOF
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild build -project dyld.xcodeproj -target dyld -configuration Release \
-		OTHER_LDFLAGS="-Wl,-U,_preempt" \
 		-sdk macosx ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		GCC_PREPROCESSOR_DEFINITIONS="DYLD_VERSION=1378.120.2 BUILDING_DYLD=1 DYLD_EXCLAVEKIT_UNAVAILABLE= CORECRYPTO_DONOT_USE_TRANSPARENT_UNION" \
