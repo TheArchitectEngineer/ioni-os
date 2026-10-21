@@ -1086,6 +1086,22 @@ extern mach_port_name_t thread_get_special_reply_port(void);
 extern mach_port_name_t thread_self_trap(void);
 extern mach_port_name_t task_self_trap(void);
 extern mach_port_name_t host_self_trap(void);
+extern mach_port_name_t mach_reply_port(void);
+#ifndef COMM_PAGE_READ
+#define COMM_PAGE_READ(type_t, slot) (*(type_t volatile *)_COMM_PAGE_##slot)
+#endif
+#ifndef _COMM_PAGE_START_ADDRESS
+#define _COMM_PAGE_START_ADDRESS 0x00007fffffe00000ULL
+#endif
+#ifndef _COMM_PAGE_VERSION
+#define _COMM_PAGE_VERSION (_COMM_PAGE_START_ADDRESS+0x01E)
+#endif
+#ifndef _COMM_PAGE_KERNEL_PAGE_SHIFT
+#define _COMM_PAGE_KERNEL_PAGE_SHIFT (_COMM_PAGE_START_ADDRESS+0x04D)
+#endif
+#ifndef _COMM_PAGE_USER_PAGE_SHIFT_64
+#define _COMM_PAGE_USER_PAGE_SHIFT_64 (_COMM_PAGE_START_ADDRESS+0x04E)
+#endif
 #ifndef PROC_PIDREGIONPATHINFO2
 #define PROC_PIDREGIONPATHINFO2 22
 #endif
