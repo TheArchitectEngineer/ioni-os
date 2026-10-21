@@ -1058,6 +1058,12 @@ extern kern_return_t semaphore_wait_trap(mach_port_name_t wait_name);
 extern kern_return_t semaphore_timedwait_trap(mach_port_name_t wait_name, unsigned int sec, clock_res_t nsec);
 extern kern_return_t semaphore_wait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name);
 extern kern_return_t semaphore_timedwait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name, unsigned int sec, clock_res_t nsec);
+#ifndef __probable
+#define __probable(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef __improbable
+#define __improbable(x) __builtin_expect(!!(x), 0)
+#endif
 #ifndef PROC_PIDREGIONPATHINFO2
 #define PROC_PIDREGIONPATHINFO2 22
 #endif
@@ -1074,7 +1080,8 @@ MTEOF
 		RC_ProjectSourceVersion="$RC_DARWIN_KERNEL_VERSION" \
 		OBJROOT="$BUILD_DIR/obj.ikern" SYMROOT="$BUILD_DIR/sym.ikern" \
 		DSTROOT="$FAKEROOT" \
-		GCC_PREFIX_HEADER="$BUILD_DIR/ioni-machtraps-prefix.h" GCC_PRECOMPILE_PREFIX_HEADER=NO || _rc=$?
+		GCC_PREFIX_HEADER="$BUILD_DIR/ioni-machtraps-prefix.h" GCC_PRECOMPILE_PREFIX_HEADER=NO \
+		GCC_PREPROCESSOR_DEFINITIONS="PRIVATE=1" || _rc=$?
 	cd "$REPO_ROOT"
 	find "$FAKEROOT/usr/local/lib/dyld" -name "libsystem_kernel*.a" 2>/dev/null
 	return $_rc
