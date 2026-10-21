@@ -1140,6 +1140,22 @@ struct _iopol_param_t {
 	int iop_policy;
 };
 #endif
+#ifndef COMM_PAGE_SLOT_TYPE
+#define COMM_PAGE_SLOT_TYPE(type_t) type_t volatile *
+#endif
+#ifndef COMM_PAGE_SLOT
+#define COMM_PAGE_SLOT(type_t, name) ((COMM_PAGE_SLOT_TYPE(type_t))_COMM_PAGE_##name)
+#endif
+#ifndef _COMM_PAGE_NEWTIMEOFDAY_DATA
+#define _COMM_PAGE_NEWTIMEOFDAY_DATA (_COMM_PAGE_START_ADDRESS+0x0D0)
+#endif
+typedef volatile struct commpage_timeofday_data {
+	uint64_t TimeStamp_tick;
+	uint64_t TimeStamp_sec;
+	uint64_t TimeStamp_frac;
+	uint64_t Ticks_scale;
+	uint64_t Ticks_per_sec;
+} new_commpage_timeofday_data_t;
 #ifndef COMM_PAGE_READ
 #define COMM_PAGE_READ(type_t, slot) (*(type_t volatile *)_COMM_PAGE_##slot)
 #endif
