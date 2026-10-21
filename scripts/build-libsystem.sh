@@ -197,6 +197,16 @@ fi
 cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/sfi.h" "$FROOT_INC/sys/sfi.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/process_policy.h" "$FROOT_INC/sys/process_policy.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/proc_private.h" "$FROOT_INC/sys/proc_private.h" 2>/dev/null || true
+if [ ! -f "$FROOT_INC/sys/proc.h" ]; then
+cat > "$FROOT_INC/sys/proc.h" <<'PROCEOF'
+#ifndef _IONI_SYS_PROC_SHIM_H
+#define _IONI_SYS_PROC_SHIM_H
+#include_next <sys/proc.h>
+#include <sys/proc_private.h>
+#endif
+PROCEOF
+fi
 mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
@@ -1136,6 +1146,9 @@ int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t *output_flags)
 int sandbox_check(pid_t pid, const char *operation, uint64_t filters, ...)
 {
 	return 0;
+}
+void _preempt(void)
+{
 }
 STUBEOF
 	xcrun clang -arch "$LIBARCHS" -isysroot "$_sdk" -O1 -c "$BUILD_DIR/ioni-dyld-stub.c" -o "$BUILD_DIR/ioni-dyld-stub.o" || return 1
