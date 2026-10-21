@@ -1041,6 +1041,12 @@ PYL
 	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
 	sudo cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$_sdk/usr/local/include/mach/sfi_class.h"
 	sudo cp "$REPO_ROOT/osfmk/mach/coalition.h" "$_sdk/usr/local/include/mach/coalition.h" 2>/dev/null || true
+	sudo mkdir -p "$_sdk/usr/local/include/mach/i386" "$_sdk/usr/local/include/mach/machine"
+	sudo cp "$REPO_ROOT/osfmk/mach/syscall_sw.h" "$_sdk/usr/local/include/mach/syscall_sw.h" 2>/dev/null || true
+	sudo cp "$REPO_ROOT/osfmk/mach/machine/syscall_sw.h" "$_sdk/usr/local/include/mach/machine/syscall_sw.h" 2>/dev/null || true
+	sudo cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$_sdk/usr/local/include/mach/i386/syscall_sw.h" 2>/dev/null || true
+	sudo cp "$REPO_ROOT/osfmk/mach/vm_region_private.h" "$_sdk/usr/local/include/mach/vm_region_private.h" 2>/dev/null || true
+	cp "$REPO_ROOT/osfmk/mach/vm_region_private.h" "$FROOT_INC/mach/vm_region_private.h" 2>/dev/null || true
 	sudo mkdir -p "$_sdk/usr/local/include/mach/i386"
 	sudo cp "$REPO_ROOT/osfmk/mach/syscall_sw.h" "$_sdk/usr/local/include/mach/syscall_sw.h" 2>/dev/null || true
 	sudo cp "$REPO_ROOT/osfmk/mach/machine/syscall_sw.h" "$_sdk/usr/local/include/mach/machine/syscall_sw.h" 2>/dev/null || true
