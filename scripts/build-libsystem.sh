@@ -1285,9 +1285,81 @@ int sandbox_check(pid_t pid, const char *operation, uint64_t filters, ...)
 void _preempt(void)
 {
 }
+void *__dispatch_objc_retain(void *o)
+{
+	return o;
+}
+void __dispatch_objc_release(void *o)
+{
+	(void)o;
+}
+void __dispatch_objc_suspend(void *o)
+{
+	(void)o;
+}
+void __dispatch_objc_resume(void *o)
+{
+	(void)o;
+}
+void __dispatch_objc_set_context(void *o, void *c)
+{
+	(void)o;
+	(void)c;
+}
+void __dispatch_objc_activate(void *o)
+{
+	(void)o;
+}
+void __dispatch_last_resort_autorelease_pool_push(void *dic)
+{
+	(void)dic;
+}
+void __dispatch_last_resort_autorelease_pool_pop(void *dic)
+{
+	(void)dic;
+}
+void *__os_object_alloc_bridged(const void *cls, size_t size)
+{
+	(void)cls;
+	(void)size;
+	return 0;
+}
+void *__os_object_alloc_realized(const void *cls, size_t size)
+{
+	(void)cls;
+	(void)size;
+	return 0;
+}
+void _os_object_dispose(void *o, const void *cls)
+{
+	(void)o;
+	(void)cls;
+}
+void _os_object_xref_dispose(void *o, const void *cls)
+{
+	(void)o;
+	(void)cls;
+}
+void __dispatch_client_callout(void *ctxt, void *f)
+{
+	(void)ctxt;
+	(void)f;
+}
+void __dispatch_client_callout3(void *ctxt, void *f)
+{
+	(void)ctxt;
+	(void)f;
+}
+void __dispatch_client_callout4(void *ctxt, void *f)
+{
+	(void)ctxt;
+	(void)f;
+}
 STUBEOF
 	xcrun clang -arch "$LIBARCHS" -isysroot "$_sdk" -O1 -c "$BUILD_DIR/ioni-dyld-stub.c" -o "$BUILD_DIR/ioni-dyld-stub.o" || return 1
 	ar rcs "$_dylddir/libioni_stub.a" "$BUILD_DIR/ioni-dyld-stub.o"
+	log "dispatch archive objc syms: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "OBJC_CLASS")"
+	log "dispatch archive client_callout: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "_dispatch_client_callout")"
 	log "dyld supply archives:"
 	ls -1 "$_dylddir"
 	sudo mkdir -p "$_sdk/usr/local/lib/dyld"
