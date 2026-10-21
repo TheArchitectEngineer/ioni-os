@@ -198,7 +198,6 @@ cp "$REPO_ROOT/bsd/sys/ulock.h" "$FROOT_INC/sys/ulock.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/sfi.h" "$FROOT_INC/sys/sfi.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach"
 cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$FROOT_INC/mach/sfi_class.h" 2>/dev/null || true
-cp "$REPO_ROOT/osfmk/mach/mach_traps.h" "$FROOT_INC/mach/mach_traps.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/dirent_private.h" "$FROOT_INC/sys/dirent_private.h" 2>/dev/null || true
 mkdir -p "$FROOT_INC/mach/i386" "$FROOT_INC/mach/arm"
 cp "$REPO_ROOT/osfmk/mach/i386/syscall_sw.h" "$FROOT_INC/mach/i386/" 2>/dev/null || true
@@ -1023,14 +1022,34 @@ PYL
 	sudo cp "$_lsinc"/mach/*.h "$_sdk/usr/local/include/mach/"
 	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
 	sudo cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$_sdk/usr/local/include/mach/sfi_class.h"
-	log "fakeroot mach dir: $(ls "$FROOT_INC/mach" 2>/dev/null | tr "\n" " ")"
+	cat > "$BUILD_DIR/ioni-machtraps-prefix.h" <<'MTEOF'
+#ifndef _IONI_MACHTRAPS_PREFIX_H
+#define _IONI_MACHTRAPS_PREFIX_H
+#include <sys/cdefs.h>
+#include <stdint.h>
+#include <mach/kern_return.h>
+#include <mach/std_types.h>
+#include <mach/port.h>
+#include <mach/clock_types.h>
+__BEGIN_DECLS
+extern kern_return_t semaphore_signal_trap(mach_port_name_t signal_name);
+extern kern_return_t semaphore_signal_all_trap(mach_port_name_t signal_name);
+extern kern_return_t semaphore_signal_thread_trap(mach_port_name_t signal_name, mach_port_name_t thread_name);
+extern kern_return_t semaphore_wait_trap(mach_port_name_t wait_name);
+extern kern_return_t semaphore_timedwait_trap(mach_port_name_t wait_name, unsigned int sec, clock_res_t nsec);
+extern kern_return_t semaphore_wait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name);
+extern kern_return_t semaphore_timedwait_signal_trap(mach_port_name_t wait_name, mach_port_name_t signal_name, unsigned int sec, clock_res_t nsec);
+__END_DECLS
+#endif
+MTEOF
 	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		RC_ProjectSourceVersion="$RC_DARWIN_KERNEL_VERSION" \
 		OBJROOT="$BUILD_DIR/obj.ikern" SYMROOT="$BUILD_DIR/sym.ikern" \
-		DSTROOT="$FAKEROOT" || _rc=$?
+		DSTROOT="$FAKEROOT" \
+		GCC_PREFIX_HEADER="$BUILD_DIR/ioni-machtraps-prefix.h" GCC_PRECOMPILE_PREFIX_HEADER=NO || _rc=$?
 	cd "$REPO_ROOT"
 	find "$FAKEROOT/usr/local/lib/dyld" -name "libsystem_kernel*.a" 2>/dev/null
 	return $_rc
@@ -1123,6 +1142,8 @@ VMEOF
 #endif
 SCEOF
 	cp "$REPO_ROOT/osfmk/mach/dyld_pager.h" "$DEPS_DIR/dyld/include/System/mach/dyld_pager.h" 2>/dev/null || true
+	cp "$DEPS_DIR/Libc/darwin/libc_private.h" "$DEPS_DIR/dyld/include/libc_private.h" 2>/dev/null || true
+	cp "$DEPS_DIR/Libc/include/_bounds.h" "$DEPS_DIR/dyld/include/_bounds.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/codesign.h" "$DEPS_DIR/dyld/include/System/sys/codesign.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
@@ -1268,7 +1289,6 @@ refresh_mach_headers() {
 	_cp osfmk/mach/arm/syscall_sw.h mach/arm/syscall_sw.h
 	_cp libsyscall/mach/mach/mach_sync_ipc.h mach/mach_sync_ipc.h
 	_cp osfmk/mach/sfi_class.h mach/sfi_class.h
-	_cp osfmk/mach/mach_traps.h mach/mach_traps.h
 	mkdir -p "$FROOT_INC/AppleFeatures"
 	printf "#ifndef _IONI_APPLEFEATURES_H\n#define _IONI_APPLEFEATURES_H\n#endif\n" > "$FROOT_INC/AppleFeatures/AppleFeatures.h"
 	log "mach headers refresh: ok"
