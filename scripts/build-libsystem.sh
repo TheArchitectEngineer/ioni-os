@@ -1521,10 +1521,12 @@ AMFIEOF
 	log "dyld macosx.internal sweep: done"
 	cat > "$DEPS_DIR/dyld/build-scripts/configure-dyld-archives.sh" <<'DAGEOF'
 #!/bin/sh
-D="${SRCROOT}/../fakeroot/usr/local/lib/dyld"
+D="${SDKROOT}/usr/local/lib/dyld"
 ls -1 "$D"/*.a | grep -v libcompiler_rt | grep -v libunwind | grep -v libc++abi > "${DERIVED_SOURCES_DIR}/archives.txt"
 cp "${SRCROOT}/dyld/dyld.dirty" "${DERIVED_SOURCES_DIR}/dyld.dirty"
 echo "DYLD-ARCHIVES-FORCED:"; cat "${DERIVED_SOURCES_DIR}/archives.txt"
+echo "DYLD-PLAT-U-PREEMPT: $(nm -A "$D/libioni_platform.a" 2>/dev/null | grep OSAtomic | grep -c 'U _preempt')"
+echo "DYLD-PLAT-T-PREEMPT: $(nm -A "$D/libioni_platform.a" 2>/dev/null | grep OSAtomic | grep -c 'T _preempt')"
 DAGEOF
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
 	perl -pi -e 's{(-DBUILDING_DYLD=1 -std=c\+\+2a)}{-DDYLD_EXCLAVEKIT_UNAVAILABLE= -DBUILDING_DYLD=1 -std=c++2a}' "$DEPS_DIR/dyld/build-scripts/prebuilt-loader-hash.sh" 2>/dev/null || true
@@ -1544,6 +1546,7 @@ DAGEOF
 	_rc=0
 	env CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild build -project dyld.xcodeproj -target dyld -configuration Release \
+		OTHER_LDFLAGS="-Wl,-U,_preempt" \
 		-sdk macosx ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		GCC_PREPROCESSOR_DEFINITIONS="DYLD_VERSION=1378.120.2 BUILDING_DYLD=1 DYLD_EXCLAVEKIT_UNAVAILABLE= CORECRYPTO_DONOT_USE_TRANSPARENT_UNION" \
