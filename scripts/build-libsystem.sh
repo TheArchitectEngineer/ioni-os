@@ -965,7 +965,8 @@ EOF
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
 	fi
-	printf "void _preempt(void)\n{\n}\n" > "$_gap/ioni-preempt.c"
+	perl -pi -e 's/^\tcall\t_preempt.*$//g' "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s"
+	log "OSAtomic preempt calls left: $(grep -c "call.*_preempt" "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" || echo 0)"
 	env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -c "$_gap/ioni-preempt.c" -o "$_gap/platform-preempt.o" || return 1
 	_pobjs="$_pobjs $_gap/platform-preempt.o"
 	rm -f "$_dylddir/libioni_platform.a"
