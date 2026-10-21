@@ -207,6 +207,13 @@ cp "$REPO_ROOT/bsd/sys/kdebug_private.h" "$FROOT_INC/sys/kdebug_private.h" 2>/de
 cp "$REPO_ROOT/bsd/sys/snapshot.h" "$FROOT_INC/sys/snapshot.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/attr_private.h" "$FROOT_INC/sys/attr_private.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/appleapiopts.h" "$FROOT_INC/sys/appleapiopts.h" 2>/dev/null || true
+cat > "$FROOT_INC/AvailabilityInternalPrivate.h" <<'AVIPEOF'
+#ifndef _IONI_AVAILABILITY_INTERNAL_PRIVATE_SHIM_H
+#define _IONI_AVAILABILITY_INTERNAL_PRIVATE_SHIM_H
+#include <Availability.h>
+#endif
+AVIPEOF
+cp "$REPO_ROOT/osfmk/mach/exclaves.h" "$FROOT_INC/mach/exclaves.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/resource_private.h" "$FROOT_INC/sys/resource_private.h" 2>/dev/null || true
 if [ ! -f "$FROOT_INC/sys/proc.h" ]; then
 cat > "$FROOT_INC/sys/proc.h" <<'PROCEOF'
@@ -1010,6 +1017,7 @@ build_libsyscall_static() {
 	cp "$REPO_ROOT/osfmk/mach/vm_reclaim.h" "$_lsinc/mach/vm_reclaim.h"
 	cp "$REPO_ROOT/osfmk/mach/mach_eventlink_types.h" "$_lsinc/mach/mach_eventlink_types.h" 2>/dev/null || true
 	cp "$REPO_ROOT/osfmk/kern/remote_time.h" "$_lsinc/kern/remote_time.h" 2>/dev/null || true
+	cp "$REPO_ROOT/osfmk/mach/exclaves.h" "$_lsinc/mach/exclaves.h" 2>/dev/null || true
 	_mig="$(xcrun -sdk "$_sdk" -find mig)"
 	_migcc="$(xcrun -sdk "$_sdk" -find cc)"
 	env MIGCC="$_migcc" "$_mig" -novouchers -arch i386 -cc "$_migcc" -header "$_lsinc/mach/mach_vm_internal.h" -I"$REPO_ROOT/osfmk" "$REPO_ROOT/osfmk/mach/mach_vm.defs" > "$BUILD_DIR/mig-vm.log" 2>&1 || log "mig mach_vm_internal: FAILED (see BUILD/mig-vm.log)"
