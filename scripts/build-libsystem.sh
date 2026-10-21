@@ -1523,7 +1523,6 @@ AMFIEOF
 		sed -i '' 's/macosx\.internal/macosx/g' "$_f"
 	done
 	log "dyld macosx.internal sweep: done"
-	printf 'echo "DYLD-ARCHIVES-DIAG SDKROOT=$SDKROOT"; ls -la "${SDKROOT}/usr/local/lib/dyld/" 2>&1 | head -16; echo "DYLD-STUB-PREEMPT: $(nm "${SDKROOT}/usr/local/lib/dyld/libioni_stub.a" 2>&1 | grep -c _preempt); echo "DYLD-PLAT-PREEMPT: $(nm "${SDKROOT}/usr/local/lib/dyld/libioni_platform.a" 2>&1 | grep -c _preempt)"\n' | cat - "$DEPS_DIR/dyld/build-scripts/configure-dyld-archives.sh" > "$BUILD_DIR/cfg-dyld-archives.sh" && cp "$BUILD_DIR/cfg-dyld-archives.sh" "$DEPS_DIR/dyld/build-scripts/configure-dyld-archives.sh"
 	perl -pi -e 's{^\s*return std::move\(lohErr\);\s*$}{    return Error::none();}' "$DEPS_DIR/dyld/mach_o/LinkerOptimizationHints.cpp"
 	perl -pi -e 's{(-DBUILDING_DYLD=1 -std=c\+\+2a)}{-DDYLD_EXCLAVEKIT_UNAVAILABLE= -DBUILDING_DYLD=1 -std=c++2a}' "$DEPS_DIR/dyld/build-scripts/prebuilt-loader-hash.sh" 2>/dev/null || true
 	cp "$FAKEROOT/usr/local/include/_simple.h" "$DEPS_DIR/dyld/include/_simple.h"
