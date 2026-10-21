@@ -1521,7 +1521,7 @@ AMFIEOF
 	log "dyld macosx.internal sweep: done"
 	cat > "$DEPS_DIR/dyld/build-scripts/configure-dyld-archives.sh" <<'DAGEOF'
 #!/bin/sh
-D="$FAKEROOT_DIR/usr/local/lib/dyld"
+D="${SRCROOT}/../fakeroot/usr/local/lib/dyld"
 ls -1 "$D"/*.a | grep -v libcompiler_rt | grep -v libunwind | grep -v libc++abi > "${DERIVED_SOURCES_DIR}/archives.txt"
 cp "${SRCROOT}/dyld/dyld.dirty" "${DERIVED_SOURCES_DIR}/dyld.dirty"
 echo "DYLD-ARCHIVES-FORCED:"; cat "${DERIVED_SOURCES_DIR}/archives.txt"
