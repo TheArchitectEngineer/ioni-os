@@ -754,7 +754,7 @@ build_dispatch_mp() {
 		-target "libdispatch mp static" ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
 		GCC_PREFIX_HEADER=_ioni_dispatch_prefix.h \
-		'GCC_PREPROCESSOR_DEFINITIONS=OS_OBJECT_USE_OBJC=0 SPI_AVAILABLE(...)= __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val)) __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1 OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1 DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0' \
+		'GCC_PREPROCESSOR_DEFINITIONS=USE_OBJC=0 OS_OBJECT_USE_OBJC=0 SPI_AVAILABLE(...)= __unsafe_forge_bidi_indexable(type,val,size)=((type)(val)) __unsafe_forge_single(type,val)=((type)(val)) __DISPATCH_INDIRECT__=1 __DISPATCH_BUILDING_DISPATCH__=1 __OS_WORKGROUP_INDIRECT__=1 __OS_WORKGROUP_PRIVATE_INDIRECT__=1 OS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 PRIVATE=1 __PTHREAD_EXPOSE_INTERNALS__=1 DISPATCH_USE_DTRACE=0 DISPATCH_USE_DTRACE_INTROSPECTION=0' \
 		OBJROOT="$BUILD_DIR/obj.dispatchmp" SYMROOT="$BUILD_DIR/sym.dispatchmp" \
 		DSTROOT="$FAKEROOT" FAKEROOT_DIR="$FAKEROOT" \
 		RC_ProjectNameAndSourceVersion=dispatchmp || _rc=$?
@@ -1359,6 +1359,7 @@ STUBEOF
 	xcrun clang -arch "$LIBARCHS" -isysroot "$_sdk" -O1 -c "$BUILD_DIR/ioni-dyld-stub.c" -o "$BUILD_DIR/ioni-dyld-stub.o" || return 1
 	ar rcs "$_dylddir/libioni_stub.a" "$BUILD_DIR/ioni-dyld-stub.o"
 	log "dispatch archive objc syms: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "OBJC_CLASS")"
+	log "dispatch archive objc members: $(xcrun nm -A "$_dylddir/liblibdispatch.a" 2>/dev/null | grep OBJC_CLASS | cut -d: -f1 | sort -u | head -4 | tr "\n" " ")"
 	log "dispatch archive client_callout: $(xcrun nm "$_dylddir/liblibdispatch.a" 2>/dev/null | grep -c "_dispatch_client_callout")"
 	log "dyld supply archives:"
 	ls -1 "$_dylddir"
