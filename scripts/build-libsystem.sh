@@ -1125,6 +1125,7 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/csr.h" "$DEPS_DIR/dyld/include/System/sys/csr.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
+	cp "$REPO_ROOT/bsd/sys/commpage.h" "$DEPS_DIR/dyld/include/System/sys/commpage.h" 2>/dev/null || true
 	cat > "$DEPS_DIR/dyld/include/libproc.h" <<'LPIEOF'
 #ifndef _IONI_DYLD_LIBPROC_SHIM_H
 #define _IONI_DYLD_LIBPROC_SHIM_H
@@ -1136,6 +1137,14 @@ LPIEOF
 #ifndef _IONI_SYSTEMATEXIT_SHIM_H
 #define _IONI_SYSTEMATEXIT_SHIM_H
 #include <sys/cdefs.h>
+#include <stdint.h>
+
+typedef struct __cxa_range_t {
+    void *addr;
+    size_t length;
+} __cxa_range_t;
+
+int __cxa_finalize_ranges(const __cxa_range_t *ranges, uint32_t count);
 #endif
 ATEOF
 	cat > "$DEPS_DIR/dyld/include/fcntl.h" <<'FCNTEOF'
