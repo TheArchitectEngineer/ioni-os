@@ -177,6 +177,7 @@ cat > "$FROOT_INC/sys/attr.h" <<'ATTREOF'
 #ifndef _IONI_SYS_ATTR_SHIM_H
 #define _IONI_SYS_ATTR_SHIM_H
 #include_next <sys/attr.h>
+#include <sys/attr_private.h>
 #ifndef FSOPT_UTIMES_NULL
 #define FSOPT_UTIMES_NULL 0x00000400
 #endif
@@ -203,6 +204,9 @@ find "$REPO_ROOT/bsd/skywalk" -name "*.h" -exec cp {} "$FROOT_INC/skywalk/" \; 2
 cp "$REPO_ROOT/bsd/sys/os_log_coprocessor.h" "$FROOT_INC/sys/os_log_coprocessor.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/kern_debug.h" "$FROOT_INC/sys/kern_debug.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/kdebug_private.h" "$FROOT_INC/sys/kdebug_private.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/snapshot.h" "$FROOT_INC/sys/snapshot.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/attr_private.h" "$FROOT_INC/sys/attr_private.h" 2>/dev/null || true
+cp "$REPO_ROOT/bsd/sys/appleapiopts.h" "$FROOT_INC/sys/appleapiopts.h" 2>/dev/null || true
 cp "$REPO_ROOT/bsd/sys/resource_private.h" "$FROOT_INC/sys/resource_private.h" 2>/dev/null || true
 if [ ! -f "$FROOT_INC/sys/proc.h" ]; then
 cat > "$FROOT_INC/sys/proc.h" <<'PROCEOF'
@@ -1092,6 +1096,21 @@ extern mach_port_name_t thread_self_trap(void);
 extern mach_port_name_t task_self_trap(void);
 extern mach_port_name_t host_self_trap(void);
 extern mach_port_name_t mach_reply_port(void);
+#ifndef F_OPENFROM
+#define F_OPENFROM 56
+#endif
+#ifndef F_UNLINKFROM
+#define F_UNLINKFROM 57
+#endif
+#ifndef F_OFD_GETLKPID
+#define F_OFD_GETLKPID 94
+#endif
+#ifndef F_ASSERT_BG_ACCESS
+#define F_ASSERT_BG_ACCESS 108
+#endif
+#ifndef F_DIRLSEEK
+#define F_DIRLSEEK 114
+#endif
 #ifndef IOPOL_CMD_GET
 #define IOPOL_CMD_GET 0x00000001
 #endif
