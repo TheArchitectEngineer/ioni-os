@@ -1022,7 +1022,8 @@ PYL
 	sudo cp "$_lsinc"/mach/*.h "$_sdk/usr/local/include/mach/"
 	sudo cp "$_lsinc"/kern/*.h "$_sdk/usr/local/include/kern/"
 	sudo cp "$REPO_ROOT/osfmk/mach/sfi_class.h" "$_sdk/usr/local/include/mach/sfi_class.h"
-	log "fakeroot mach dir: $(ls "$FROOT_INC/mach" 2>/dev/null | tr "\n" " ")"	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
+	log "fakeroot mach dir: $(ls "$FROOT_INC/mach" 2>/dev/null | tr "\n" " ")"
+	env ARCHS="$LIBARCHS" CPATH="$FAKEROOT/usr/local/include" \
 		xcodebuild install -sdk macosx -project Libsyscall.xcodeproj -target Libsyscall_static \
 		-configuration Release ARCHS="$LIBARCHS" VALID_ARCHS="$LIBARCHS" \
 		CODE_SIGN_IDENTITY="-" GCC_TREAT_WARNINGS_AS_ERRORS=NO \
@@ -1126,6 +1127,46 @@ SCEOF
 	cp "$REPO_ROOT/bsd/sys/reason.h" "$DEPS_DIR/dyld/include/System/sys/reason.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/fsgetpath.h" "$DEPS_DIR/dyld/include/System/sys/fsgetpath.h" 2>/dev/null || true
 	cp "$REPO_ROOT/bsd/sys/commpage.h" "$DEPS_DIR/dyld/include/System/sys/commpage.h" 2>/dev/null || true
+	cat > "$DEPS_DIR/dyld/include/System/sys/content_protection.h" <<'CPEOF'
+#ifndef _IONI_SYS_CONTENT_PROTECTION_SHIM_H
+#define _IONI_SYS_CONTENT_PROTECTION_SHIM_H
+#include <sys/cdefs.h>
+#include <sys/types.h>
+__BEGIN_DECLS
+#define PROTECTION_CLASS_DIR_NONE 0
+#define PROTECTION_CLASS_A  1
+#define PROTECTION_CLASS_B  2
+#define PROTECTION_CLASS_C  3
+#define PROTECTION_CLASS_D  4
+#define PROTECTION_CLASS_E  5
+#define PROTECTION_CLASS_F  6
+#define PROTECTION_CLASS_CX 7
+#define PROTECTION_CLASS_DEFAULT  (-1)
+int open_dprotected_np(const char *, int, int, int, ...);
+__END_DECLS
+#endif
+CPEOF
+	cat > "$DEPS_DIR/dyld/include/vproc_priv.h" <<'VPEOF'
+#ifndef _IONI_VPROC_PRIV_SHIM_H
+#define _IONI_VPROC_PRIV_SHIM_H
+#endif
+VPEOF
+	mkdir -p "$DEPS_DIR/dyld/include/sandbox"
+	cat > "$DEPS_DIR/dyld/include/sandbox/private.h" <<'SBXEOF'
+#ifndef _IONI_SANDBOX_PRIVATE_SHIM_H
+#define _IONI_SANDBOX_PRIVATE_SHIM_H
+#include <sys/cdefs.h>
+#include <sys/types.h>
+#include <stdint.h>
+__BEGIN_DECLS
+typedef uint64_t sandbox_filter_type;
+#define SANDBOX_FILTER_NONE 0x0000ULL
+#define SANDBOX_FILTER_PATH 0x0002ULL
+#define SANDBOX_CHECK_NO_REPORT 0x0000000100000000ULL
+int sandbox_check(pid_t pid, const char *operation, sandbox_filter_type filters, ...);
+__END_DECLS
+#endif
+SBXEOF
 	cat > "$DEPS_DIR/dyld/include/libproc.h" <<'LPIEOF'
 #ifndef _IONI_DYLD_LIBPROC_SHIM_H
 #define _IONI_DYLD_LIBPROC_SHIM_H
