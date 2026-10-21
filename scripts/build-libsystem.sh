@@ -1081,7 +1081,6 @@ extern kern_return_t semaphore_timedwait_signal_trap(mach_port_name_t wait_name,
 #include <stdint.h>
 int kdebug_trace(uint32_t debugid, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4);
 #endif
-typedef uint64_t mach_msg_option64_t;
 extern mach_msg_return_t mach_msg2_trap(void *data, mach_msg_option64_t options, uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority, uint64_t timeout);
 extern mach_port_name_t thread_get_special_reply_port(void);
 #ifndef PROC_PIDREGIONPATHINFO2
