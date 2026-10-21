@@ -294,10 +294,10 @@ cat > "$FROOT_INC/libproc_internal.h" <<'EOF'
 #include <mach/mach.h>
 extern int proc_importance_assertion_begin_with_msg(void *msg, uint32_t *base_priority, uint64_t *assertion_token);
 extern int proc_importance_assertion_complete(uint64_t assertion_token);
+extern int proc_set_dyld_all_image_info(void *buffer, int buffersize);
 #endif
 EOF
 fi
-cp "$REPO_ROOT/libsyscall/wrappers/libproc/libproc_internal.h" "$FROOT_INC/libproc_internal.h" 2>/dev/null || true
 
 # os/alloc_once_private.h: Apple-internal, absent from every public tree; the
 # libplatform impl header carries the API, we add the key pthread asks for
