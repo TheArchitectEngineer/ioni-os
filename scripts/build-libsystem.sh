@@ -1406,8 +1406,9 @@ int removefile(const char *path, void *state, unsigned int flags)
 }
 unsigned int sleep(unsigned int seconds)
 {
-	struct timespec ts = { seconds, 0 };
-	nanosleep(&ts, 0);
+	extern int nanosleep(const void *rqtp, void *rmtp);
+	const long ts[2] = { seconds, 0 };
+	nanosleep(ts, 0);
 	return 0;
 }
 void *__dispatch_objc_retain(void *o)
