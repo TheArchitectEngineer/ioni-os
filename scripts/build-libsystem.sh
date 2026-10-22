@@ -1315,19 +1315,17 @@ int nanosleep(const void *rqtp, void *rmtp)
 	(void)rmtp;
 	return 0;
 }
-int _fcntl_nocancel_shim(int fildes, int cmd, ...) __asm("_fcntl$NOCANCEL");
-int _fcntl_nocancel_shim(int fildes, int cmd, ...)
+int _fcntl_nocancel_shim(int fildes, int cmd, long a1, long a2, long a3, long a4, long a5, long a6) __asm("_fcntl$NOCANCEL");
+int _fcntl_nocancel_shim(int fildes, int cmd, long a1, long a2, long a3, long a4, long a5, long a6)
 {
 	extern int fcntl(int, int, ...);
-	void *arg = __builtin_va_arg_pack();
-	return fcntl(fildes, cmd, arg);
+	return fcntl(fildes, cmd, a1, a2, a3, a4, a5, a6);
 }
-int _syslog_darwin_extsn_shim(int priority, const char *message, ...) __asm("_syslog$DARWIN_EXTSN");
-int _syslog_darwin_extsn_shim(int priority, const char *message, ...)
+int _syslog_darwin_extsn_shim(int priority, const char *message, long a1, long a2, long a3, long a4, long a5, long a6) __asm("_syslog$DARWIN_EXTSN");
+int _syslog_darwin_extsn_shim(int priority, const char *message, long a1, long a2, long a3, long a4, long a5, long a6)
 {
 	extern int syslog(int, const char *, ...);
-	void *arg = __builtin_va_arg_pack();
-	return syslog(priority, message, arg);
+	return syslog(priority, message, a1, a2, a3, a4, a5, a6);
 }
 void _Unwind_Resume(void *exc)
 {
