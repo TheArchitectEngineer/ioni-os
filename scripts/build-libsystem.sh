@@ -970,7 +970,7 @@ EOF
 	fi
 	if [ -f "$DEPS_DIR/libplatform/src/setjmp/x86_64/_sigtramp.s" ]; then
 		cp "$DEPS_DIR/libplatform/src/setjmp/x86_64/_sigtramp.s" "$BUILD_DIR/ioni-sigtramp.S"
-		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$BUILD_DIR/ioni-sigtramp.S" -o "$_gap/platform-sigtramp.o" || return 1
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 -U__DYNAMIC__ $_pincl -c "$BUILD_DIR/ioni-sigtramp.S" -o "$_gap/platform-sigtramp.o" || return 1
 		printf '\t.text\n\t.globl _sigtramp\n_sigtramp:\n\tjmp\t__sigtramp\n\t.globl ___sigreturn\n___sigreturn:\n\tmovl\t$0x20000b8, %%eax\n\tsyscall\n\tud2\n' > "$BUILD_DIR/ioni-sigtramp-alias.s"
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$BUILD_DIR/ioni-sigtramp-alias.s" -o "$_gap/platform-sigtramp-alias.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-sigtramp.o $_gap/platform-sigtramp-alias.o"
