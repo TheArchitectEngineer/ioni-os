@@ -66,6 +66,7 @@ if [ ! -f "$_lutil_h" ]; then
 #ifndef _IONI_LIBUTIL_H_
 #define _IONI_LIBUTIL_H_
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #define HN_DECIMAL 0x01
 #define HN_NOSPACE 0x02
@@ -75,6 +76,7 @@ if [ ! -f "$_lutil_h" ]; then
 #define HN_GETSCALE 0x10
 #define HN_AUTOSCALE 0x20
 int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags);
+int expand_number(const char *buf, uint64_t *num);
 #endif
 LUEOF
 fi
@@ -83,7 +85,11 @@ if [ ! -f "$_dylddir/libutil.a" ]; then
 #include <sys/types.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <stdarg.h>
 #include <libutil.h>
 static const int hn_maxscale = 6;
 int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags)
@@ -178,9 +184,198 @@ int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix,
 			sep, &prefixes[i * 3], suffix);
 	return (r);
 }
+int expand_number(const char *buf, uint64_t *num)
+{
+	char *endptr;
+	uintmax_t umaxval;
+	uint64_t number;
+	unsigned shift;
+	int serrno;
+	serrno = errno;
+	errno = 0;
+	umaxval = strtoumax(buf, &endptr, 0);
+	if (umaxval > UINT64_MAX)
+		errno = ERANGE;
+	if (errno != 0)
+		return (-1);
+	errno = serrno;
+	number = umaxval;
+	switch (tolower((unsigned char)*endptr)) {
+	case 'e':
+		shift = 60;
+		break;
+	case 'p':
+		shift = 50;
+		break;
+	case 't':
+		shift = 40;
+		break;
+	case 'g':
+		shift = 30;
+		break;
+	case 'm':
+		shift = 20;
+		break;
+	case 'k':
+		shift = 10;
+		break;
+	case 'b':
+	case 0:
+		*num = number;
+		return (0);
+	default:
+		errno = EINVAL;
+		return (-1);
+	}
+	if ((number << shift) >> shift != number) {
+		errno = ERANGE;
+		return (-1);
+	}
+	*num = number << shift;
+	return (0);
+}
+int mbr_identifier_translate(unsigned int fromtype, const void *fromident, size_t identlen, unsigned int totype, void **toident, unsigned int *recname_type)
+{
+	(void)fromtype;
+	(void)fromident;
+	(void)identlen;
+	(void)totype;
+	if (toident != 0)
+		*toident = 0;
+	if (recname_type != 0)
+		*recname_type = 0;
+	return (-1);
+}
+int usleep(unsigned int usec)
+{
+	(void)usec;
+	return (0);
+}
+int xo_parse_args(int argc, char **argv)
+{
+	(void)argv;
+	return (argc);
+}
+int xo_finish(void)
+{
+	fflush(stdout);
+	return (0);
+}
+int xo_emit(const char *fmt, ...)
+{
+	va_list ap;
+	int r;
+	va_start(ap, fmt);
+	r = vprintf(fmt, ap);
+	va_end(ap);
+	return (r);
+}
+int xo_attr(const char *name, const char *fmt, ...)
+{
+	(void)name;
+	(void)fmt;
+	return (0);
+}
+int xo_open_container(const char *name)
+{
+	(void)name;
+	return (0);
+}
+int xo_close_container(const char *name)
+{
+	(void)name;
+	return (0);
+}
+int xo_open_list(const char *name)
+{
+	(void)name;
+	return (0);
+}
+int xo_close_list(const char *name)
+{
+	(void)name;
+	return (0);
+}
+void xo_warn(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+}
+void xo_warnx(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+}
+void xo_err(int eval, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+	exit(eval);
+}
+void xo_errx(int eval, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+	exit(eval);
+}
 LUCEOF
 	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -O2 -Wno-error -c "$BUILD_DIR/ioni-libutil.c" -o "$_obj/ioni-libutil.o" || exit 1
 	ar rcs "$_dylddir/libutil.a" "$_obj/ioni-libutil.o"
+fi
+if [ ! -f "$_incl/membership.h" ]; then
+	mkdir -p "$_incl"
+	cat > "$_incl/membership.h" <<'MBEOF'
+#ifndef _IONI_MEMBERSHIP_H
+#define _IONI_MEMBERSHIP_H
+#include <stdint.h>
+#include <stddef.h>
+enum { ID_TYPE_NONE = 0, ID_TYPE_UUID = 1, ID_TYPE_NAME = 2, ID_TYPE_SID = 3, ID_TYPE_GID = 4, ID_TYPE_UID = 5, ID_TYPE_X509CERT = 6 };
+enum { MBR_REC_TYPE_UNKNOWN = 0, MBR_REC_TYPE_USER = 1, MBR_REC_TYPE_GROUP = 2, MBR_REC_TYPE_AUTO = 3 };
+int mbr_identifier_translate(unsigned int fromtype, const void *fromident, size_t identlen, unsigned int totype, void **toident, unsigned int *recname_type);
+#endif
+MBEOF
+fi
+if [ ! -f "$_incl/membershipPriv.h" ]; then
+	cat > "$_incl/membershipPriv.h" <<'MBPEOF'
+#ifndef _IONI_MEMBERSHIPPRIV_H
+#define _IONI_MEMBERSHIPPRIV_H
+#include <membership.h>
+#endif
+MBPEOF
+fi
+if [ ! -f "$_incl/libxo/xo.h" ]; then
+	mkdir -p "$_incl/libxo"
+	cat > "$_incl/libxo/xo.h" <<'XOEOF'
+#ifndef _IONI_LIBXO_XO_H
+#define _IONI_LIBXO_XO_H
+#include <stdarg.h>
+#include <stdio.h>
+int xo_parse_args(int argc, char **argv);
+int xo_finish(void);
+int xo_emit(const char *fmt, ...);
+int xo_attr(const char *name, const char *fmt, ...);
+int xo_open_container(const char *name);
+int xo_close_container(const char *name);
+int xo_open_list(const char *name);
+int xo_close_list(const char *name);
+void xo_warn(const char *fmt, ...);
+void xo_warnx(const char *fmt, ...);
+void xo_err(int eval, const char *fmt, ...);
+void xo_errx(int eval, const char *fmt, ...);
+#endif
+XOEOF
 fi
 
 SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libmalloc_full.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a $_dylddir/libioni_stub.a $_dylddir/libCrashReporterClient.a $_dylddir/libutil.a"
@@ -198,7 +393,7 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
-                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -nostdlib -Wno-error -O1 \
                         -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
