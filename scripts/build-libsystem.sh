@@ -1315,6 +1315,103 @@ int nanosleep(const void *rqtp, void *rmtp)
 	(void)rmtp;
 	return 0;
 }
+int _fcntl_nocancel_shim(int fildes, int cmd, ...) __asm("_fcntl$NOCANCEL");
+int _fcntl_nocancel_shim(int fildes, int cmd, ...)
+{
+	extern int fcntl(int, int, ...);
+	void *arg = __builtin_va_arg_pack();
+	return fcntl(fildes, cmd, arg);
+}
+int _syslog_darwin_extsn_shim(int priority, const char *message, ...) __asm("_syslog$DARWIN_EXTSN");
+int _syslog_darwin_extsn_shim(int priority, const char *message, ...)
+{
+	extern int syslog(int, const char *, ...);
+	void *arg = __builtin_va_arg_pack();
+	return syslog(priority, message, arg);
+}
+void _Unwind_Resume(void *exc)
+{
+	extern void abort(void) __attribute__((noreturn));
+	(void)exc;
+	abort();
+}
+int __gcc_personality_v0(int version, int actions, unsigned long long ue_class, void *ue, void *ctx)
+{
+	(void)version;
+	(void)actions;
+	(void)ue_class;
+	(void)ue;
+	(void)ctx;
+	return 1;
+}
+int dyld_get_program_min_os_version(void *info)
+{
+	(void)info;
+	return -1;
+}
+const void *dyld_image_header_containing_address(const void *addr)
+{
+	(void)addr;
+	return 0;
+}
+int getaddrinfo(const char *node, const char *service, const void *hints, void *res)
+{
+	(void)node;
+	(void)service;
+	(void)hints;
+	(void)res;
+	return 8;
+}
+void freeaddrinfo(void *res)
+{
+	(void)res;
+}
+const char *gai_strerror(int err)
+{
+	(void)err;
+	return "name resolution unavailable";
+}
+char *group_from_gid(unsigned int gid, char *buf)
+{
+	(void)gid;
+	(void)buf;
+	return 0;
+}
+char *user_from_uid(unsigned int uid, char *buf)
+{
+	(void)uid;
+	(void)buf;
+	return 0;
+}
+int modify_file_acl(void *p, const char *path, const void *entry)
+{
+	(void)p;
+	(void)path;
+	(void)entry;
+	return -1;
+}
+int parse_acl_entries(int argc, const char **argv, void *buf, unsigned long size, int flags)
+{
+	(void)argc;
+	(void)argv;
+	(void)buf;
+	(void)size;
+	(void)flags;
+	return -1;
+}
+int removefile(const char *path, void *state, unsigned int flags)
+{
+	(void)path;
+	(void)state;
+	(void)flags;
+	return -1;
+}
+unsigned int sleep(unsigned int seconds)
+{
+	struct timespec ts = { seconds, 0 };
+	nanosleep(&ts, 0);
+	return 0;
+}
 void *__dispatch_objc_retain(void *o)
 {
 	return o;
