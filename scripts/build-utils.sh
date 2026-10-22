@@ -470,7 +470,7 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
-                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\n__attribute__((weak)) extern char _mh_execute_header;\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nstatic void ioni_run_mod_inits(void)\n{\n\tunsigned long mh = (unsigned long)&_mh_execute_header;\n\tif (mh < 0x1000) { mh = 0x100000000UL; }\n\tunsigned int *hdr = (unsigned int *)mh;\n\tif (hdr[0] != 0xfeedfacf) { return; }\n\tunsigned int ncmds = hdr[5];\n\tunsigned char *lc = (unsigned char *)(mh + 32);\n\tunsigned int i;\n\tfor (i = 0; i < ncmds; i++) {\n\t\tunsigned int cmd = ((unsigned int *)lc)[0];\n\t\tunsigned int cmdsize = ((unsigned int *)lc)[1];\n\t\tif (cmd == 0x19) {\n\t\t\tchar *seg = lc + 8;\n\t\t\tunsigned int nsects = ((unsigned int *)(lc + 64))[0];\n\t\t\tunsigned char *se = lc + 72;\n\t\t\tunsigned int j;\n\t\t\tfor (j = 0; j < nsects; j++) {\n\t\t\t\tchar *sn = (char *)se;\n\t\t\t\tif (sn[0] == 95 && sn[1] == 95 && sn[2] == 109 && sn[3] == 111 && sn[4] == 100) {\n\t\t\t\t\tunsigned long *fp = (unsigned long *)*((unsigned long *)(se + 32));\n\t\t\t\t\tunsigned long sz = *((unsigned long *)(se + 40)) / 8;\n\t\t\t\t\tunsigned long k;\n\t\t\t\t\tfor (k = 0; k < sz; k++) {\n\t\t\t\t\t\tvoid (*fn)(void) = (void (*)(void))fp[k];\n\t\t\t\t\t\tif (fn != 0) { fn(); }\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tse += 80;\n\t\t\t}\n\t\t}\n\t\tif (cmdsize == 0) { break; }\n\t\tlc += cmdsize;\n\t}\n}\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\t((unsigned long *)ioni_tsd)[0] = (unsigned long)ioni_tsd;\n\t((unsigned long *)ioni_tsd)[3] = 0x1234;\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\tioni_run_mod_inits();\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\n__attribute__((weak)) extern char _mh_execute_header;\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nstatic void ioni_run_mod_inits(void)\n{\n\tunsigned long mh = (unsigned long)&_mh_execute_header;\n\tif (mh < 0x1000) { mh = 0x100000000UL; }\n\tunsigned int *hdr = (unsigned int *)mh;\n\tif (hdr[0] != 0xfeedfacf) { return; }\n\tunsigned int ncmds = hdr[4];\n\tunsigned char *lc = (unsigned char *)(mh + 32);\n\tunsigned int i;\n\tfor (i = 0; i < ncmds; i++) {\n\t\tunsigned int cmd = ((unsigned int *)lc)[0];\n\t\tunsigned int cmdsize = ((unsigned int *)lc)[1];\n\t\tif (cmd == 0x19) {\n\t\t\tchar *seg = lc + 8;\n\t\t\tunsigned int nsects = ((unsigned int *)(lc + 64))[0];\n\t\t\tunsigned char *se = lc + 72;\n\t\t\tunsigned int j;\n\t\t\tfor (j = 0; j < nsects; j++) {\n\t\t\t\tchar *sn = (char *)se;\n\t\t\t\tif (sn[0] == 95 && sn[1] == 95 && sn[2] == 109 && sn[3] == 111 && sn[4] == 100) {\n\t\t\t\t\tunsigned long a = (unsigned long)*(unsigned int *)(se + 32);\n\t\t\t\t\tunsigned long sz = (unsigned long)*(unsigned int *)(se + 36) / 8;\n\t\t\t\t\tunsigned long *fp = (unsigned long *)a;\n\t\t\t\t\tunsigned long k;\n\t\t\t\t\tfor (k = 0; k < sz; k++) {\n\t\t\t\t\t\tvoid (*fn)(void) = (void (*)(void))fp[k];\n\t\t\t\t\t\tif (fn != 0) { fn(); }\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tse += 80;\n\t\t\t}\n\t\t}\n\t\tif (cmdsize == 0) { break; }\n\t\tlc += cmdsize;\n\t}\n}\nstatic void ioni_m(const char *s, unsigned long n)\n{\n\tlong r = 0x2000004;\n\t__asm__ volatile(\"syscall\" : \"+a\"(r) : \"D\"(1L), \"S\"(s), \"d\"(n) : \"rcx\", \"r11\", \"memory\");\n\t(void)r;\n}\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\t((unsigned long *)ioni_tsd)[0] = (unsigned long)ioni_tsd;\n\t((unsigned long *)ioni_tsd)[3] = 0x1234;\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\tioni_m(\"inits-start\\n\", 12);\n\tioni_run_mod_inits();\n\tioni_m(\"inits-done\\n\", 11);\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -nostdlib -Wno-error -O1 \
                         -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
@@ -650,8 +650,24 @@ run_probe() {
 			nm -nU "$_out/$_pname" 2>/dev/null | awk -v r="$_rip16" '$1 <= r {l=$0} END {if (l != "") print "nm: " l}'
 		fi
 		if [ -f "/tmp/$_pname.sample" ]; then log "sample $_pname:"; head -40 "/tmp/$_pname.sample"; fi
+		log "mod_init section:"
+		otool -s __DATA __mod_init_func "$_out/$_pname" 2>/dev/null | head -8
 		_addrs=$(grep -o '\[0x[0-9a-f]*\]' "/tmp/$_pname.sample" 2>/dev/null | tr -d "[]" | sort -u | head -6)
-		if [ -n "$_addrs" ]; then log "sample symbols:"; xcrun atos -o "$_out/$_pname" -l 0x100000000 $_addrs 2>/dev/null | head -8; fi
+		if [ -n "$_addrs" ]; then
+			log "sample symbols:"
+			xcrun atos -o "$_out/$_pname" -l 0x100000000 $_addrs 2>/dev/null | head -8
+			for _a in $_addrs; do
+				_a16=$(printf '%016x' "$_a")
+				nm -nU "$_out/$_pname" 2>/dev/null | awk -v r="$_a16" 'tolower($1) <= r {l=$0} END {if (l != "") print "nm " r ": " l}'
+			done
+		fi
+		if [ "$_rc" = 137 ] && [ -n "$_addrs" ]; then
+			otool -tV "$_out/$_pname" 2>/dev/null > "/tmp/$_pname.dis"
+			for _a in $_addrs; do
+				_a16=$(printf '%016x' "$_a")
+				grep -B2 -A4 "^$_a16" "/tmp/$_pname.dis" | head -14
+			done
+		fi
 	fi
 }
 run_probe probe4 <<'P4EOF'
@@ -842,6 +858,81 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P14EOF
+run_probe probe15 <<'P15EOF'
+extern void environ_lock_np(void);
+extern void environ_unlock_np(void);
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "15-pre-lock\n", 12);
+	environ_lock_np();
+	write(1, "15-locked\n", 10);
+	environ_unlock_np();
+	write(1, "15-unlocked\n", 12);
+	return 0;
+}
+P15EOF
+run_probe probe16 <<'P16EOF'
+extern char *getenv(const char *);
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "16-pre-getenv\n", 14);
+	char *p = getenv("PATH");
+	write(1, "16-post-getenv\n", 15);
+	if (p != 0) { write(1, "16-env-ok\n", 10); }
+	if (p == 0) { write(1, "16-env-null\n", 12); }
+	return 0;
+}
+P16EOF
+run_probe probe17 <<'P17EOF'
+extern char **environ;
+extern long write(int, const void *, unsigned long);
+static unsigned long p17gs(unsigned long off)
+{
+	unsigned long v;
+	__asm__ volatile("movq %%gs:(%1), %0" : "=r"(v) : "r"(off));
+	return v;
+}
+static void p17hex(unsigned long v)
+{
+	char b[19];
+	int i;
+	b[0] = 48; b[1] = 120;
+	for (i = 0; i < 16; i++) {
+		int d = (int)((v >> (60 - 4 * i)) & 0xf);
+		b[2 + i] = (char)(d < 10 ? 48 + d : 87 + d);
+	}
+	b[18] = 10;
+	write(1, b, 19);
+}
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "17-gs0:", 7);
+	p17hex(p17gs(0));
+	write(1, "17-gs24:", 8);
+	p17hex(p17gs(24));
+	write(1, "17-env:", 7);
+	p17hex((unsigned long)environ);
+	if (environ != 0) {
+		write(1, "17-env0:", 8);
+		p17hex((unsigned long)environ[0]);
+	}
+	return 0;
+}
+P17EOF
 log "mod_init sections:"
 log "  libc.a mod_init:"
 	otool -s __DATA __mod_init_func "$_dylddir/libc.a" 2>/dev/null | head -6
