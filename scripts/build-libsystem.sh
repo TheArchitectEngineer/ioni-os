@@ -1295,6 +1295,26 @@ struct ioni_crannotations {
 	uint64_t spare[8];
 };
 struct ioni_crannotations gCRAnnotations;
+void __chkstk_darwin(void)
+{
+}
+int _platform_sigaction(int sig, const void *nsa, void *osa)
+{
+	extern int __sigaction(int, const void *, void *, int);
+	return __sigaction(sig, nsa, osa, 32);
+}
+int pthread_key_init_np(int key, void (*dtor)(void *))
+{
+	(void)key;
+	(void)dtor;
+	return 1;
+}
+int nanosleep(const void *rqtp, void *rmtp)
+{
+	(void)rqtp;
+	(void)rmtp;
+	return 0;
+}
 void *__dispatch_objc_retain(void *o)
 {
 	return o;
