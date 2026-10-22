@@ -455,7 +455,7 @@ void xo_error(const char *fmt, ...);
 XOEOF
 fi
 
-SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libmalloc_full.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a $_dylddir/libioni_stub.a $_dylddir/libCrashReporterClient.a $_dylddir/libutil.a"
+SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a $_dylddir/libioni_stub.a $_dylddir/libCrashReporterClient.a $_dylddir/libutil.a"
 
 _miss=""
 for _a in $SYSARCHIVES; do
@@ -485,6 +485,164 @@ CEOF
 	log "crt_externs: replaced (static _NSGetEnviron)"
 }
 fix_crt_externs || exit 1
+
+build_ioni_malloc() {
+	cat > "$BUILD_DIR/ioni-malloc.c" <<'IMCEOF'
+#include <stdint.h>
+#include <string.h>
+extern void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long offset);
+extern long munmap(void *addr, unsigned long len);
+struct ioni_zone_s { int dummy; };
+typedef struct ioni_zone_s ioni_zone_t;
+static ioni_zone_t ioni_zone_instance;
+#define IONI_CHUNK (1UL << 20)
+static char *ioni_bump;
+static unsigned long ioni_left;
+static void *ioni_map(unsigned long sz)
+{
+        return mmap(0, sz, 3, 0x1002, -1, 0);
+}
+static void *ioni_alloc(unsigned long n)
+{
+        n = (n + 15UL) & ~15UL;
+        if (n + 16UL > ioni_left) {
+                unsigned long want = IONI_CHUNK;
+                while (want < n + 16UL) { want <<= 1; }
+                char *m = (char *)ioni_map(want);
+                if (m == (char *)-1) { return 0; }
+                ioni_bump = m;
+                ioni_left = want;
+        }
+        void *p = ioni_bump;
+        ioni_bump += n;
+        ioni_left -= n;
+        return p;
+}
+void *malloc(unsigned long n)
+{
+        if (n == 0) { n = 1; }
+        return ioni_alloc(n);
+}
+void free(void *p)
+{
+        (void)p;
+}
+void *calloc(unsigned long a, unsigned long b)
+{
+        unsigned long n = a * b;
+        void *p = malloc(n);
+        if (p != 0) { memset(p, 0, n); }
+        return p;
+}
+void *realloc(void *p, unsigned long n)
+{
+        if (p == 0) { return malloc(n); }
+        if (n == 0) { free(p); return 0; }
+        void *q = malloc(n);
+        if (q != 0) { memcpy(q, p, n < 32 ? n : 32); }
+        return q;
+}
+void *valloc(unsigned long n)
+{
+        (void)n;
+        return ioni_alloc(4096);
+}
+void *aligned_alloc(unsigned long al, unsigned long sz)
+{
+        if (al < 16) { al = 16; }
+        unsigned long need = sz + al;
+        char *raw = (char *)ioni_alloc(need);
+        if (raw == 0) { return 0; }
+        unsigned long a = (unsigned long)raw;
+        unsigned long mis = a % al;
+        if (mis != 0) { a += al - mis; }
+        return (void *)a;
+}
+int posix_memalign(void **out, unsigned long al, unsigned long sz)
+{
+        if (out == 0) { return 22; }
+        void *p = aligned_alloc(al, sz);
+        if (p == 0) { return 12; }
+        *out = p;
+        return 0;
+}
+unsigned long malloc_size(const void *p)
+{
+        (void)p;
+        return 0;
+}
+unsigned long malloc_good_size(unsigned long n)
+{
+        return (n + 15UL) & ~15UL;
+}
+ioni_zone_t *malloc_default_zone(void)
+{
+        return &ioni_zone_instance;
+}
+ioni_zone_t *malloc_create_zone(void *mt, const char *name, unsigned f, unsigned long st, unsigned long m, unsigned long r1, unsigned long r2, unsigned r3)
+{
+        (void)mt; (void)name; (void)f; (void)st; (void)m; (void)r1; (void)r2; (void)r3;
+        return &ioni_zone_instance;
+}
+void malloc_zone_free(void *z, void *p)
+{
+        (void)z; free(p);
+}
+void *malloc_zone_malloc(void *z, unsigned long n)
+{
+        (void)z;
+        return malloc(n);
+}
+void *malloc_zone_calloc(void *z, unsigned long a, unsigned long b)
+{
+        (void)z;
+        return calloc(a, b);
+}
+void *malloc_zone_realloc(void *z, void *p, unsigned long n)
+{
+        (void)z;
+        return realloc(p, n);
+}
+void *malloc_zone_valloc(void *z, unsigned long n)
+{
+        (void)z;
+        return valloc(n);
+}
+void *malloc_zone_memalign(void *z, unsigned long al, unsigned long sz)
+{
+        (void)z;
+        return aligned_alloc(al, sz);
+}
+void malloc_zone_register(void *z)
+{
+        (void)z;
+}
+void malloc_zone_unregister(void *z)
+{
+        (void)z;
+}
+void *malloc_zone_from_ptr(const void *p)
+{
+        (void)p;
+        return &ioni_zone_instance;
+}
+unsigned long malloc_zone_pressure_relief(void *z, unsigned long n)
+{
+        (void)z; (void)n;
+        return 0;
+}
+void malloc_zone_pressure_relief_zones(void) {}
+void malloc_enter_process_memory_limit(unsigned long n) { (void)n; }
+void malloc_leave_process_memory_limit(void) {}
+unsigned long malloc_zone_inuse_enumerator(void *z, void *ctx) { (void)z; (void)ctx; return 0; }
+void malloc_set_zone_name(void *z, const char *n) { (void)z; (void)n; }
+void free_zones(void) {}
+void malloc_zone_print_stats(void) {}
+IMCEOF
+	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -O2 -c "$BUILD_DIR/ioni-malloc.c" -o "$BUILD_DIR/ioni-malloc.o" || return 1
+	log "ioni malloc: built"
+}
+build_ioni_malloc || exit 1
 
 build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
@@ -532,7 +690,7 @@ build_util() {
         env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie \
                 -Wl,-e,start -Wl,-dead_strip \
                 -arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-                "$BUILD_DIR/crt0.o" $_ldargs $SYSARCHIVES \
+                "$BUILD_DIR/crt0.o" $_ldargs "$BUILD_DIR/ioni-malloc.o" $SYSARCHIVES \
                 -o "$_out/$_name" || { log "util $_name: LINK FAILED"; return 1; }
         file "$_out/$_name"
 }
@@ -647,7 +805,7 @@ run_probe() {
 	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -Dmain=ioni_real_main -c "$BUILD_DIR/$_pname.c" -o "$_obj/$_pname.o" || { log "$_pname: compile FAILED"; return 1; }
 	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
 		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-		"$BUILD_DIR/crt0.o" "$_obj/$_pname.o" "$_obj/probe-main.o" $SYSARCHIVES -o "$_out/$_pname" \
+		"$BUILD_DIR/crt0.o" "$_obj/$_pname.o" "$_obj/probe-main.o" "$BUILD_DIR/ioni-malloc.o" $SYSARCHIVES -o "$_out/$_pname" \
 		|| { log "$_pname: build FAILED"; return 1; }
 	"$_out/$_pname" > "/tmp/$_pname.out" 2>&1 &
 	_p=$!
@@ -988,7 +1146,7 @@ P18EOF
 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -c "$BUILD_DIR/probe18.c" -o "$_obj/probe18.o" || log "probe18: compile FAILED"
 env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
 	-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-	"$BUILD_DIR/crt0.o" "$_obj/probe18.o" $SYSARCHIVES -o "$_out/probe18" || log "probe18: build FAILED"
+	"$BUILD_DIR/crt0.o" "$_obj/probe18.o" "$BUILD_DIR/ioni-malloc.o" $SYSARCHIVES -o "$_out/probe18" || log "probe18: build FAILED"
 "$_out/probe18" > "/tmp/probe18.out" 2>&1 &
 _p=$!
 ( sleep 15; kill -9 "$_p" 2>/dev/null ) &
