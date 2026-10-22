@@ -648,6 +648,8 @@ run_probe() {
 			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rip" 2>/dev/null | head -2
 		fi
 		if [ -f "/tmp/$_pname.sample" ]; then log "sample $_pname:"; head -40 "/tmp/$_pname.sample"; fi
+		_addrs=$(grep -o '\[0x[0-9a-f]*\]' "/tmp/$_pname.sample" 2>/dev/null | tr -d "[]" | sort -u | head -6)
+		if [ -n "$_addrs" ]; then log "sample symbols:"; xcrun atos -o "$_out/$_pname" -l 0x100000000 $_addrs 2>/dev/null | head -8; fi
 	fi
 }
 run_probe probe4 <<'P4EOF'
@@ -772,6 +774,23 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P11EOF
+run_probe probe12 <<'P12EOF'
+extern void os_unfair_lock_lock_with_options(void *, unsigned int);
+extern void os_unfair_lock_unlock(void *);
+extern long write(int, const void *, unsigned long);
+static unsigned long p12lock[2] = { 0, 0 };
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	os_unfair_lock_lock_with_options(p12lock, 2);
+	write(1, "lockopt-ok\n", 11);
+	os_unfair_lock_unlock(p12lock);
+	return 0;
+}
+P12EOF
 log "mod_init sections:"
 log "  libc.a mod_init:"
 	otool -s __DATA __mod_init_func "$_dylddir/libc.a" 2>/dev/null | head -6
