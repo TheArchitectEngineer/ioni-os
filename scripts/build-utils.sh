@@ -59,7 +59,131 @@ _cflags="-arch $LIBARCHS -isysroot $_sdk -O2 -I$_incl -Wno-error -D_FORTIFY_SOUR
 
 mkdir -p "$_obj" "$_out"
 
-SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libmalloc_full.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a $_dylddir/libioni_stub.a $_dylddir/libCrashReporterClient.a"
+_lutil_h="$_incl/libutil.h"
+if [ ! -f "$_lutil_h" ]; then
+	mkdir -p "$_incl"
+	cat > "$_lutil_h" <<'LUEOF'
+#ifndef _IONI_LIBUTIL_H_
+#define _IONI_LIBUTIL_H_
+#include <stdint.h>
+#include <sys/types.h>
+#define HN_DECIMAL 0x01
+#define HN_NOSPACE 0x02
+#define HN_B 0x04
+#define HN_DIVISOR_1000 0x08
+#define HN_IEC_PREFIXES 0x10
+#define HN_GETSCALE 0x10
+#define HN_AUTOSCALE 0x20
+int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags);
+#endif
+LUEOF
+fi
+if [ ! -f "$_dylddir/libutil.a" ]; then
+	cat > "$BUILD_DIR/ioni-libutil.c" <<'LUCEOF'
+#include <sys/types.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+#include <libutil.h>
+static const int hn_maxscale = 6;
+int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags)
+{
+	const char *prefixes, *sep;
+	int i, r, remainder, s1, s2, sign;
+	int divisordeccut;
+	int64_t divisor, max;
+	size_t baselen;
+	if (len > 0)
+		buf[0] = 0;
+	if (buf == 0 || suffix == 0)
+		return (-1);
+	if (scale < 0)
+		return (-1);
+	else if (scale > hn_maxscale && ((scale & ~(HN_AUTOSCALE|HN_GETSCALE)) != 0))
+		return (-1);
+	if ((flags & HN_DIVISOR_1000) && (flags & HN_IEC_PREFIXES))
+		return (-1);
+	remainder = 0;
+	if (flags & HN_IEC_PREFIXES) {
+		baselen = 2;
+		divisor = 1024;
+		divisordeccut = 973;
+		if (flags & HN_B)
+			prefixes = "B\0\0Ki\0Mi\0Gi\0Ti\0Pi\0Ei";
+		else
+			prefixes = "\0\0\0Ki\0Mi\0Gi\0Ti\0Pi\0Ei";
+	} else {
+		baselen = 1;
+		if (flags & HN_DIVISOR_1000) {
+			divisor = 1000;
+			divisordeccut = 950;
+			if (flags & HN_B)
+				prefixes = "B\0\0k\0\0M\0\0G\0\0T\0\0P\0\0E";
+			else
+				prefixes = "\0\0\0k\0\0M\0\0G\0\0T\0\0P\0\0E";
+		} else {
+			divisor = 1024;
+			divisordeccut = 973;
+			if (flags & HN_B)
+				prefixes = "B\0\0K\0\0M\0\0G\0\0T\0\0P\0\0E";
+			else
+				prefixes = "\0\0\0K\0\0M\0\0G\0\0T\0\0P\0\0E";
+		}
+	}
+	if (quotient < 0) {
+		sign = -1;
+		quotient = -quotient;
+		baselen += 2;
+	} else {
+		sign = 1;
+		baselen += 1;
+	}
+	if (flags & HN_NOSPACE)
+		sep = "";
+	else {
+		sep = " ";
+		baselen++;
+	}
+	baselen += strlen(suffix);
+	if (len < baselen + 1)
+		return (-1);
+	if (scale & (HN_AUTOSCALE | HN_GETSCALE)) {
+		for (max = 1, i = len - baselen; i-- > 0 && max <= (INT64_MAX / 10);)
+			max *= 10;
+		for (i = 0;
+			(quotient >= max || (quotient == max - 1 &&
+			(remainder >= divisordeccut || remainder >=
+			divisor / 2))) && i < hn_maxscale; i++) {
+				remainder = quotient % divisor;
+				quotient /= divisor;
+			}
+		if (scale & HN_GETSCALE)
+			return (i);
+	} else {
+		for (i = 0; i < scale && i < hn_maxscale; i++) {
+			remainder = quotient % divisor;
+			quotient /= divisor;
+		}
+	}
+	if (((quotient == 9 && remainder < divisordeccut) || quotient < 9) &&
+		i > 0 && flags & HN_DECIMAL) {
+		s1 = (int)quotient + ((remainder * 10 + divisor / 2) /
+			divisor / 10);
+		s2 = ((remainder * 10 + divisor / 2) / divisor) % 10;
+		r = snprintf(buf, len, "%d.%d%s%s%s",
+			sign * s1, s2, sep, &prefixes[i * 3], suffix);
+	} else
+		r = snprintf(buf, len, "%" PRId64 "%s%s%s",
+			sign * (quotient + (remainder + divisor / 2) / divisor),
+			sep, &prefixes[i * 3], suffix);
+	return (r);
+}
+LUCEOF
+	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -O2 -Wno-error -c "$BUILD_DIR/ioni-libutil.c" -o "$_obj/ioni-libutil.o" || exit 1
+	ar rcs "$_dylddir/libutil.a" "$_obj/ioni-libutil.o"
+fi
+
+SYSARCHIVES="$_dylddir/libc.a $_dylddir/libsystem_kernel.a $_dylddir/libmalloc_full.a $_dylddir/libpthread_dyld.a $_dylddir/libblocks.a $_dylddir/liblibdispatch.a $_dylddir/libioni_platform.a $_dylddir/libioni_gap.a $_dylddir/libioni_stub.a $_dylddir/libCrashReporterClient.a $_dylddir/libutil.a"
 
 _miss=""
 for _a in $SYSARCHIVES; do
@@ -188,6 +312,40 @@ echo hello | "$_out/cat" || true
 "$_out/ls" "$REPO_ROOT" | head -5 || true
 "$_out/env" | head -3 || true
 "$_out/test" -f "$REPO_ROOT/README.md" && echo "test: ok"
+
+log "probe:"
+if [ -f "$BUILD_DIR/crt0.o" ]; then
+	cat > "$BUILD_DIR/ioni-probe.c" <<'PROBEEOF'
+void exit(int status)
+{
+	long s = status;
+	__asm__ volatile("syscall" : : "a"(0x2000001L), "D"(s) : "rcx", "r11", "memory");
+	for (;;) { }
+}
+extern int main(int, const char **, const char **, const char **);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	return 0;
+}
+PROBEEOF
+	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
+		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
+		"$BUILD_DIR/crt0.o" "$BUILD_DIR/ioni-probe.c" -o "$_out/ioni-probe" \
+		&& { "$_out/ioni-probe"; log "probe: ok"; } || log "probe: FAILED rc=$?"
+fi
+log "lldb true:"
+xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/true" 2>&1 | head -60 || true
+log "crash reports:"
+sleep 8
+for _r in $(ls -t "$HOME/Library/Logs/DiagnosticReports"/true-*.ips "$HOME/Library/Logs/DiagnosticReports"/uname-*.ips 2>/dev/null | head -3); do
+	echo "--- report: $_r"
+	head -c 6000 "$_r"
+	echo
+done
 
 log "fails:$FAILS"
 log "products:"

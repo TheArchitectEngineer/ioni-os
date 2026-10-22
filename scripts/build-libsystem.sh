@@ -1324,8 +1324,20 @@ int _fcntl_nocancel_shim(int fildes, int cmd, long a1, long a2, long a3, long a4
 int _syslog_darwin_extsn_shim(int priority, const char *message, long a1, long a2, long a3, long a4, long a5, long a6) __asm("_syslog$DARWIN_EXTSN");
 int _syslog_darwin_extsn_shim(int priority, const char *message, long a1, long a2, long a3, long a4, long a5, long a6)
 {
-	extern int syslog(int, const char *, ...);
-	return syslog(priority, message, a1, a2, a3, a4, a5, a6);
+	(void)priority;
+	(void)message;
+	(void)a1;
+	(void)a2;
+	(void)a3;
+	(void)a4;
+	(void)a5;
+	(void)a6;
+	return 0;
+}
+void syslog(int priority, const char *message, ...)
+{
+	(void)priority;
+	(void)message;
 }
 void _Unwind_Resume(void *exc)
 {
