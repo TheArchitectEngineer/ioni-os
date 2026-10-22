@@ -144,14 +144,16 @@ jobs:
     name: boot KC in QEMU (xnu-loader, fileset path)
     runs-on: ubuntu-24.04
     needs: kernel-kc
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf mtools dosfstools
+          # --no-install-recommends: OVMF/pflash boot path needs neither seabios
+          # nor ipxe roms; halves the 80+ package dep tree on a slow mirror day
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf mtools dosfstools
 
       - name: build gnu-efi
         run: ./scripts/gnuefi.sh
