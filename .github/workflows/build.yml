@@ -114,6 +114,74 @@ jobs:
             BUILD/hunt/hunt.gdb
           if-no-files-found: warn
 
+  kernel-kc:
+    name: kernelcache X86_64 (kc-tools)
+    runs-on: macos-26
+    timeout-minutes: 20
+    needs: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-RELEASE-X86_64
+          path: BUILD/obj
+
+      - name: build kernelcache
+        run: ./scripts/build-kc.sh BUILD/obj/RELEASE_X86_64/kernel BUILD/ioni.kc
+
+      - name: upload kernelcache
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioni-kc-X86_64
+          path: BUILD/ioni.kc
+          if-no-files-found: error
+
+  boot-kc:
+    name: boot KC in QEMU (xnu-loader, fileset path)
+    runs-on: ubuntu-24.04
+    needs: kernel-kc
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf mtools dosfstools
+
+      - name: build gnu-efi
+        run: ./scripts/gnuefi.sh
+
+      - name: build xnu-loader
+        run: |
+          cmake -S boot/xnu-loader -B boot/xnu-loader/build -DCMAKE_BUILD_TYPE=Release -DGNU_EFI_DIR=$HOME/.local/gnu-efi
+          cmake --build boot/xnu-loader/build -j
+
+      - name: fetch kernelcache
+        uses: actions/download-artifact@v4
+        with:
+          name: ioni-kc-X86_64
+          path: BUILD/kc
+
+      - name: boot KC in qemu
+        run: |
+          KC=$(find BUILD/kc -type f -name '*.kc' | head -n1)
+          echo "kc: $KC"
+          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8 kt=2 startup_debug=1" IONI_QEMU_TIMEOUT=600 IONI_QEMU_SMP=1 ./scripts/qemu-boot.sh "$KC" BUILD/kc-boot
+
+      - name: upload KC boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-boot-kc-logs
+          path: |
+            BUILD/kc-boot/qemu-serial.log
+            BUILD/kc-boot/qemu-stdout.log
+            BUILD/kc-boot/qemu-debug.log
+          if-no-files-found: warn
+
   kernel-arm64:
     name: kernel RELEASE ARM64 (VMAPPLE, KDK)
     runs-on: macos-26
