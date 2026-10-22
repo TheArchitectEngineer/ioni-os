@@ -421,7 +421,7 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
-                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\nextern char *setlocale(int, const char *);\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\tsetlocale(6, "C");\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -nostdlib -Wno-error -O1 \
                         -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
@@ -557,7 +557,7 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 PROBEEOF
 	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
 		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-		"$BUILD_DIR/crt0.o" "$BUILD_DIR/ioni-probe.c" -o "$_out/ioni-probe" || exit 1
+		"$BUILD_DIR/crt0.o" "$BUILD_DIR/ioni-probe.c" -o "$_out/ioni-probe" || log "probe: build FAILED"
 	"$_out/ioni-probe" &
 	_p=$!
 	( sleep 15; kill -9 "$_p" 2>/dev/null ) &
@@ -643,6 +643,23 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P7EOF
+run_probe probe8 <<'P8EOF'
+extern char *setlocale(int, const char *);
+extern int printf(const char *, ...);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	if (setlocale(6, "C") == 0) {
+		write(1, "loc-null\n", 9);
+		return 0;
+	}
+	printf("probe8 %d\n", 7);
+	return 0;
+}
+P8EOF
 log "lldb uname:"
 xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/uname" > /tmp/lldb-uname.log 2>&1 &
 _lp=$!
