@@ -1283,7 +1283,30 @@ build_dyld() {
 	cp "$_m" "$_dylddir/"
 	cat > "$BUILD_DIR/ioni-dyld-stub.c" <<'STUBEOF'
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>
+int32_t NSVersionOfLinkTimeLibrary(const char *libraryName)
+{
+	(void)libraryName;
+	return 0;
+}
+uint32_t dyld_get_active_platform(void)
+{
+	return 1;
+}
+uint64_t dyld_get_program_sdk_version_token(void)
+{
+	return 0;
+}
+bool dyld_process_is_restricted(void)
+{
+	return 0;
+}
+bool dyld_program_sdk_at_least(uint64_t version)
+{
+	(void)version;
+	return 1;
+}
 int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t *output_flags)
 {
 	if (output_flags != 0) {
