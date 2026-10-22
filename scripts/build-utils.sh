@@ -791,6 +791,20 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P12EOF
+run_probe probe13 <<'P13EOF'
+extern unsigned long _os_lock_owner_get_self(void);
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	unsigned long own = _os_lock_owner_get_self();
+	write(1, own != 0 ? "owner-nonzero\n" : "owner-zero\n", 14);
+	return 0;
+}
+P13EOF
 log "mod_init sections:"
 log "  libc.a mod_init:"
 	otool -s __DATA __mod_init_func "$_dylddir/libc.a" 2>/dev/null | head -6
