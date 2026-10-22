@@ -416,6 +416,8 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	sigaction(SIGSEGV, &sa, 0);
 	sigaction(SIGBUS, &sa, 0);
 	sigaction(SIGILL, &sa, 0);
+	sigaction(SIGTRAP, &sa, 0);
+	sigaction(SIGABRT, &sa, 0);
 	return ioni_real_main(argc, argv, envp, apple);
 }
 PMEOF
@@ -636,7 +638,7 @@ run_probe() {
 	kill "$_w" 2>/dev/null
 	wait "$_w" 2>/dev/null
 	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
-		log "$_pname: FAILED rc=$_rc"
+		if [ "$_rc" = 137 ]; then log "$_pname: HUNG (watchdog killed)"; else log "$_pname: FAILED rc=$_rc"; fi
 		cat "/tmp/$_pname.out"
 		_rip=$(sed -n 's/.*RIP=0x\([0-9a-f]*\).*/\1/p' "/tmp/$_pname.out" | head -1)
 		if [ -n "$_rip" ]; then
