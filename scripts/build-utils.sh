@@ -640,12 +640,14 @@ run_probe() {
 	kill "$_w" "$_s" 2>/dev/null
 	wait "$_w" 2>/dev/null
 	wait "$_s" 2>/dev/null
+	cat "/tmp/$_pname.out"
 	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
 		if [ "$_rc" = 137 ]; then log "$_pname: HUNG (watchdog killed)"; else log "$_pname: FAILED rc=$_rc"; fi
-		cat "/tmp/$_pname.out"
 		_rip=$(sed -n 's/.*RIP=0x\([0-9a-f]*\).*/\1/p' "/tmp/$_pname.out" | head -1)
 		if [ -n "$_rip" ]; then
 			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rip" 2>/dev/null | head -2
+			_rip16=$(printf '%016x' "$_rip")
+			nm -nU "$_out/$_pname" 2>/dev/null | awk -v r="$_rip16" '$1 <= r {l=$0} END {if (l != "") print "nm: " l}'
 		fi
 		if [ -f "/tmp/$_pname.sample" ]; then log "sample $_pname:"; head -40 "/tmp/$_pname.sample"; fi
 		_addrs=$(grep -o '\[0x[0-9a-f]*\]' "/tmp/$_pname.sample" 2>/dev/null | tr -d "[]" | sort -u | head -6)
