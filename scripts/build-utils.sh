@@ -421,7 +421,7 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
-                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\nextern char __mh_execute_header;\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nstatic void ioni_run_mod_inits(void)\n{\n\tunsigned long mh = (unsigned long)&__mh_execute_header;\n\tunsigned int *hdr = (unsigned int *)mh;\n\tif (hdr[0] != 0xfeedfacf) { return; }\n\tunsigned int ncmds = hdr[5];\n\tunsigned char *lc = (unsigned char *)(mh + 32);\n\tunsigned int i;\n\tfor (i = 0; i < ncmds; i++) {\n\t\tunsigned int cmd = ((unsigned int *)lc)[0];\n\t\tunsigned int cmdsize = ((unsigned int *)lc)[1];\n\t\tif (cmd == 0x19) {\n\t\t\tchar *seg = lc + 8;\n\t\t\tunsigned int nsects = ((unsigned int *)(lc + 64))[0];\n\t\t\tunsigned char *se = lc + 72;\n\t\t\tunsigned int j;\n\t\t\tfor (j = 0; j < nsects; j++) {\n\t\t\t\tchar *sn = (char *)se;\n\t\t\t\tif (sn[0] == 95 && sn[1] == 95 && sn[2] == 109 && sn[3] == 111 && sn[4] == 100) {\n\t\t\t\t\tunsigned long *fp = (unsigned long *)*((unsigned long *)(se + 32));\n\t\t\t\t\tunsigned long sz = *((unsigned long *)(se + 40)) / 8;\n\t\t\t\t\tunsigned long k;\n\t\t\t\t\tfor (k = 0; k < sz; k++) {\n\t\t\t\t\t\tvoid (*fn)(void) = (void (*)(void))fp[k];\n\t\t\t\t\t\tif (fn != 0) { fn(); }\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tse += 80;\n\t\t\t}\n\t\t}\n\t\tif (cmdsize == 0) { break; }\n\t\tlc += cmdsize;\n\t}\n}\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\tioni_run_mod_inits();\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -nostdlib -Wno-error -O1 \
                         -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
@@ -646,6 +646,7 @@ P7EOF
 run_probe probe8 <<'P8EOF'
 extern char *setlocale(int, const char *);
 extern int printf(const char *, ...);
+extern long write(int, const void *, unsigned long);
 int main(int argc, const char **argv, const char **envp, const char **apple)
 {
 	(void)argc;
@@ -660,6 +661,11 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P8EOF
+log "mod_init sections:"
+for _an in libc.a liblibdispatch.a libmalloc_full.a libpthread_dyld.a libsystem_kernel.a libioni_platform.a libblocks.a; do
+	_c=$(otool -s __DATA __mod_init_func "$_dylddir/$_an" 2>/dev/null | grep -c "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]  ")
+	log "  $_an: $_c"
+done
 log "lldb uname:"
 xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/uname" > /tmp/lldb-uname.log 2>&1 &
 _lp=$!
