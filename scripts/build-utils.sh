@@ -845,6 +845,10 @@ P14EOF
 log "mod_init sections:"
 log "  libc.a mod_init:"
 	otool -s __DATA __mod_init_func "$_dylddir/libc.a" 2>/dev/null | head -6
+	log "  unfair lock copies:"
+	nm "$_dylddir/libc.a" 2>/dev/null | grep "os_unfair_lock" | head -4
+	nm "$_dylddir/libioni_platform.a" 2>/dev/null | grep "T _os_unfair_lock_lock_w" | head -3
+	nm "$_dylddir/libioni_gap.a" 2>/dev/null | grep "unfair" | head -3
 	otool -s __DATA __mod_init_func "$_dylddir/liblibdispatch.a" 2>/dev/null | head -4
 	otool -s __DATA __mod_init_func "$_dylddir/libpthread_dyld.a" 2>/dev/null | head -4
 log "lldb uname:"
