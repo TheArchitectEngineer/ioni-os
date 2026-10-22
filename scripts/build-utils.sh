@@ -635,11 +635,14 @@ run_probe() {
 	_w=$!
 	( sleep 5; sample "$_p" 2 -file "/tmp/$_pname.sample" >/dev/null 2>&1 ) &
 	_s=$!
+	( sleep 6; vmmap "$_p" > "/tmp/$_pname.vmmap" 2>&1 ) &
+	_v=$!
 	wait "$_p" 2>/dev/null
 	_rc=$?
-	kill "$_w" "$_s" 2>/dev/null
+	kill "$_w" "$_s" "$_v" 2>/dev/null
 	wait "$_w" 2>/dev/null
 	wait "$_s" 2>/dev/null
+	wait "$_v" 2>/dev/null
 	cat "/tmp/$_pname.out"
 	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
 		if [ "$_rc" = 137 ]; then log "$_pname: HUNG (watchdog killed)"; else log "$_pname: FAILED rc=$_rc"; fi
@@ -652,6 +655,11 @@ run_probe() {
 		if [ -f "/tmp/$_pname.sample" ]; then log "sample $_pname:"; head -40 "/tmp/$_pname.sample"; fi
 		log "mod_init section:"
 		otool -s __DATA __mod_init_func "$_out/$_pname" 2>/dev/null | head -8
+		log "segments:"
+		otool -l "$_out/$_pname" 2>/dev/null | grep -A3 "segname __" | grep -E "segname|vmsize" | head -12
+		log "nm tail:"
+		nm -nU "$_out/$_pname" 2>/dev/null | tail -5
+		if [ -f "/tmp/$_pname.vmmap" ]; then log "vmmap:"; grep -E "100000000|__TEXT|__DATA|Stack" "/tmp/$_pname.vmmap" | head -10; fi
 		_addrs=$(grep -o '\[0x[0-9a-f]*\]' "/tmp/$_pname.sample" 2>/dev/null | tr -d "[]" | sort -u | head -6)
 		if [ -n "$_addrs" ]; then
 			log "sample symbols:"
@@ -933,6 +941,77 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P17EOF
+cat > "$BUILD_DIR/probe18.c" <<'P18EOF'
+extern char *getenv(const char *);
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "18-pre-getenv\n", 14);
+	char *p = getenv("PATH");
+	write(1, "18-post-getenv\n", 15);
+	if (p != 0) { write(1, "18-env-ok\n", 10); }
+	if (p == 0) { write(1, "18-env-null\n", 12); }
+	return 0;
+}
+P18EOF
+env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -c "$BUILD_DIR/probe18.c" -o "$_obj/probe18.o" || log "probe18: compile FAILED"
+env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
+	-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
+	"$BUILD_DIR/crt0.o" "$_obj/probe18.o" $SYSARCHIVES -o "$_out/probe18" || log "probe18: build FAILED"
+"$_out/probe18" > "/tmp/probe18.out" 2>&1 &
+_p=$!
+( sleep 15; kill -9 "$_p" 2>/dev/null ) &
+_w=$!
+( sleep 5; sample "$_p" 2 -file "/tmp/probe18.sample" >/dev/null 2>&1 ) &
+_s=$!
+wait "$_p" 2>/dev/null
+_rc18=$?
+kill "$_w" "$_s" 2>/dev/null
+wait "$_w" 2>/dev/null
+wait "$_s" 2>/dev/null
+cat "/tmp/probe18.out"
+if [ "$_rc18" = 0 ]; then log "probe18: ok"; else
+	if [ "$_rc18" = 137 ]; then log "probe18: HUNG"; else log "probe18: FAILED rc=$_rc18"; fi
+fi
+run_probe probe20 <<'P20EOF'
+extern char *getenv(const char *);
+extern void environ_lock_np(void);
+extern void environ_unlock_np(void);
+extern char ***_NSGetEnviron(void);
+extern long write(int, const void *, unsigned long);
+static void p20hex(unsigned long v)
+{
+	char b[19];
+	int i;
+	b[0] = 48; b[1] = 120;
+	for (i = 0; i < 16; i++) {
+		int d = (int)((v >> (60 - 4 * i)) & 0xf);
+		b[2 + i] = (char)(d < 10 ? 48 + d : 87 + d);
+	}
+	b[18] = 10;
+	write(1, b, 19);
+}
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "20-getenv:", 10);
+	p20hex((unsigned long)getenv);
+	write(1, "20-locknp:", 10);
+	p20hex((unsigned long)environ_lock_np);
+	write(1, "20-nsenv:", 9);
+	p20hex((unsigned long)_NSGetEnviron);
+	write(1, "20-envval:", 10);
+	p20hex((unsigned long)*_NSGetEnviron());
+	return 0;
+}
+P20EOF
 log "mod_init sections:"
 log "  libc.a mod_init:"
 	otool -s __DATA __mod_init_func "$_dylddir/libc.a" 2>/dev/null | head -6
