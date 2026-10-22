@@ -373,6 +373,53 @@ if [ ! -f "$_incl/membershipPriv.h" ]; then
 #endif
 MBPEOF
 fi
+if [ ! -f "$BUILD_DIR/ioni-probe-main.c" ]; then
+	cat > "$BUILD_DIR/ioni-probe-main.c" <<'PMEOF'
+#include <signal.h>
+#include <ucontext.h>
+#include <string.h>
+#include <unistd.h>
+extern int ioni_real_main(int, const char **, const char **, const char **);
+static void ioni_hex(unsigned long v, char **pp)
+{
+	char *p = *pp;
+	int sh;
+	for (sh = 60; sh >= 0; sh -= 4) {
+		int d = (int)((v >> sh) & 0xf);
+		*p++ = (char)(d < 10 ? 48 + d : 87 + d);
+	}
+	*pp = p;
+}
+static void ioni_segv(int sig, siginfo_t *si, void *uc)
+{
+	ucontext_t *u = (ucontext_t *)uc;
+	char b[64];
+	char *p = b;
+	int j;
+	(void)sig;
+	const char *s1 = "RIP=0x";
+	const char *s2 = " FAULT=0x";
+	for (j = 0; s1[j] != 0; j++) { *p++ = s1[j]; }
+	ioni_hex((unsigned long)u->uc_mcontext->__ss.__rip, &p);
+	for (j = 0; s2[j] != 0; j++) { *p++ = s2[j]; }
+	ioni_hex((unsigned long)si->si_addr, &p);
+	*p++ = 10;
+	write(2, b, (unsigned long)(p - b));
+	_exit(3);
+}
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.__sigaction_u.__sa_sigaction = ioni_segv;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, 0);
+	sigaction(SIGBUS, &sa, 0);
+	sigaction(SIGILL, &sa, 0);
+	return ioni_real_main(argc, argv, envp, apple);
+}
+PMEOF
+fi
 if [ ! -f "$BUILD_DIR/ioni-ls-compat.h" ]; then
 	cat > "$BUILD_DIR/ioni-ls-compat.h" <<'LSEOF'
 #include <stdbool.h>
@@ -573,10 +620,10 @@ run_probe() {
 	_pname="$1"
 	cat > "$BUILD_DIR/$_pname.c"
 	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
-		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-		"$BUILD_DIR/crt0.o" "$BUILD_DIR/$_pname.c" $SYSARCHIVES -o "$_out/$_pname" \
+		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error -Dmain=ioni_real_main \
+		"$BUILD_DIR/crt0.o" "$BUILD_DIR/$_pname.c" "$BUILD_DIR/ioni-probe-main.c" $SYSARCHIVES -o "$_out/$_pname" \
 		|| { log "$_pname: build FAILED"; return 1; }
-	"$_out/$_pname" &
+	"$_out/$_pname" > "/tmp/$_pname.out" 2>&1 &
 	_p=$!
 	( sleep 15; kill -9 "$_p" 2>/dev/null ) &
 	_w=$!
@@ -584,7 +631,14 @@ run_probe() {
 	_rc=$?
 	kill "$_w" 2>/dev/null
 	wait "$_w" 2>/dev/null
-	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else log "$_pname: FAILED rc=$_rc"; fi
+	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
+		log "$_pname: FAILED rc=$_rc"
+		cat "/tmp/$_pname.out"
+		_rip=$(sed -n 's/.*RIP=0x\([0-9a-f]*\).*/\1/p' "/tmp/$_pname.out" | head -1)
+		if [ -n "$_rip" ]; then
+			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rip" 2>/dev/null | head -2
+		fi
+	fi
 }
 run_probe probe4 <<'P4EOF'
 extern long write(int, const void *, unsigned long);
