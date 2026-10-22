@@ -619,9 +619,13 @@ log "probes libc:"
 run_probe() {
 	_pname="$1"
 	cat > "$BUILD_DIR/$_pname.c"
+	if [ ! -f "$_obj/probe-main.o" ]; then
+		env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -D_XOPEN_SOURCE=600 -c "$BUILD_DIR/ioni-probe-main.c" -o "$_obj/probe-main.o" || { log "probe-main: build FAILED"; return 1; }
+	fi
+	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -Dmain=ioni_real_main -c "$BUILD_DIR/$_pname.c" -o "$_obj/$_pname.o" || { log "$_pname: compile FAILED"; return 1; }
 	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
-		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error -D_XOPEN_SOURCE=600 -Dmain=ioni_real_main \
-		"$BUILD_DIR/crt0.o" "$BUILD_DIR/$_pname.c" "$BUILD_DIR/ioni-probe-main.c" $SYSARCHIVES -o "$_out/$_pname" \
+		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
+		"$BUILD_DIR/crt0.o" "$_obj/$_pname.o" "$_obj/probe-main.o" $SYSARCHIVES -o "$_out/$_pname" \
 		|| { log "$_pname: build FAILED"; return 1; }
 	"$_out/$_pname" > "/tmp/$_pname.out" 2>&1 &
 	_p=$!
