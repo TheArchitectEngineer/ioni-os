@@ -548,6 +548,14 @@ void *reallocf(void *p, unsigned long n)
 	if (q == 0 && p != 0) { free(p); }
 	return q;
 }
+void *reallocarray$DARWIN_EXTSN(void *p, unsigned long a, unsigned long b)
+{
+	return realloc(p, a * b);
+}
+void *reallocarray(void *p, unsigned long a, unsigned long b)
+{
+	return realloc(p, a * b);
+}
 void *valloc(unsigned long n)
 {
         (void)n;
