@@ -666,6 +666,13 @@ run_probe() {
 	cat "/tmp/$_pname.out"
 	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
 		if [ "$_rc" = 137 ]; then log "$_pname: HUNG (watchdog killed)"; else log "$_pname: FAILED rc=$_rc"; fi
+		_rrip=$(sed -n 's/.*x86_rip=0x\([0-9a-f]*\).*/\1/p' "/tmp/$_pname.out" | head -1)
+		if [ -n "$_rrip" ]; then
+			log "rosetta rip: 0x$_rrip"
+			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rrip" 2>/dev/null | head -2
+			_r16=$(printf '%016x' "0x$_rrip")
+			nm -nU "$_out/$_pname" 2>/dev/null | awk -v r="$_r16" 'tolower($1) <= r {l=$0} END {if (l != "") print "nm-rip: " l}'
+		fi
 		_rip=$(sed -n 's/.*RIP=0x\([0-9a-f]*\).*/\1/p' "/tmp/$_pname.out" | head -1)
 		if [ -n "$_rip" ]; then
 			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rip" 2>/dev/null | head -2
