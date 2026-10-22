@@ -1295,10 +1295,10 @@ struct ioni_crannotations {
 	uint64_t spare[8];
 };
 struct ioni_crannotations gCRAnnotations;
-void __chkstk_darwin(void)
+void ___chkstk_darwin(void)
 {
 }
-int _platform_sigaction(int sig, const void *nsa, void *osa)
+int __platform_sigaction(int sig, const void *nsa, void *osa)
 {
 	extern int __sigaction(int, const void *, void *, int);
 	return __sigaction(sig, nsa, osa, 32);
