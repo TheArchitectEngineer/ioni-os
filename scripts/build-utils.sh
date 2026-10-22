@@ -334,13 +334,19 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 PROBEEOF
 	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
 		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
-		"$BUILD_DIR/crt0.o" "$BUILD_DIR/ioni-probe.c" -o "$_out/ioni-probe" \
-		&& { "$_out/ioni-probe"; log "probe: ok"; } || log "probe: FAILED rc=$?"
+		"$BUILD_DIR/crt0.o" "$BUILD_DIR/ioni-probe.c" -o "$_out/ioni-probe" || exit 1
+	"$_out/ioni-probe" &
+	_p=$!
+	( sleep 15; kill -9 "$_p" 2>/dev/null ) &
+	_w=$!
+	wait "$_p" 2>/dev/null
+	_rc=$?
+	kill "$_w" 2>/dev/null
+	wait "$_w" 2>/dev/null
+	if [ "$_rc" = 0 ]; then log "probe: ok"; else log "probe: FAILED rc=$_rc"; fi
 fi
-log "lldb true:"
-xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/true" 2>&1 | head -60 || true
 log "crash reports:"
-sleep 8
+sleep 12
 for _r in $(ls -t "$HOME/Library/Logs/DiagnosticReports"/true-*.ips "$HOME/Library/Logs/DiagnosticReports"/uname-*.ips 2>/dev/null | head -3); do
 	echo "--- report: $_r"
 	head -c 6000 "$_r"
