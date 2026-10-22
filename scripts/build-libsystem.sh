@@ -954,7 +954,8 @@ EOF
 		"$DEPS_DIR/libplatform"/src/simple/*.c \
 		"$DEPS_DIR/libplatform"/src/string/generic/*.c \
 		"$DEPS_DIR/libplatform"/src/timingsafe/x86_64/*.c \
-		"$DEPS_DIR/libplatform"/src/atomics/init.c; do
+		"$DEPS_DIR/libplatform"/src/atomics/init.c \
+		"$DEPS_DIR/libplatform"/src/setjmp/generic/sigaction.c; do
 		[ -f "$_f" ] || continue
 		_o="$_gap/platform-$(basename "${_f%.c}").o"
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_cflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$_f" -o "$_o" || return 1
@@ -967,8 +968,17 @@ EOF
 		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/atomics/x86_64/OSAtomic.s" -o "$_gap/platform-OSAtomic.o" || return 1
 		_pobjs="$_pobjs $_gap/platform-OSAtomic.o"
 	fi
+	if [ -f "$DEPS_DIR/libplatform/src/setjmp/x86_64/_sigtramp.s" ]; then
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$DEPS_DIR/libplatform/src/setjmp/x86_64/_sigtramp.s" -o "$_gap/platform-sigtramp.o" || return 1
+		printf '\t.text\n\t.globl _sigtramp\n_sigtramp:\n\tjmp\t__sigtramp\n' > "$BUILD_DIR/ioni-sigtramp-alias.s"
+		env CPATH="$FAKEROOT/usr/local/include" xcrun clang $_asmflags -DVARIANT_STATIC=1 -DVARIANT_NO_RESOLVERS=1 $_pincl -c "$BUILD_DIR/ioni-sigtramp-alias.s" -o "$_gap/platform-sigtramp-alias.o" || return 1
+		_pobjs="$_pobjs $_gap/platform-sigtramp.o $_gap/platform-sigtramp-alias.o"
+		log "sigtramp: ok"
+	fi
 	rm -f "$_dylddir/libioni_platform.a"
 	ar crs "$_dylddir/libioni_platform.a" $_pobjs || return 1
+	log "platform sigtramp syms: $(nm "$_dylddir/libioni_platform.a" 2>/dev/null | grep -c "T _sigtramp\|T __sigtramp")"
+	log "kernel sigreturn syms: $(nm "$_dylddir/libsystem_kernel.a" 2>/dev/null | grep -c "sigreturn")"
 	_gapcc="$BUILD_DIR/gap-cc"
 	rm -rf "$_gapcc"
 	mkdir -p "$_gapcc/corecrypto"
@@ -1297,11 +1307,6 @@ struct ioni_crannotations {
 struct ioni_crannotations gCRAnnotations;
 void ___chkstk_darwin(void)
 {
-}
-int __platform_sigaction(int sig, const void *nsa, void *osa)
-{
-	extern int __sigaction(int, const void *, void *, int);
-	return __sigaction(sig, nsa, osa, 32);
 }
 int pthread_key_init_np(int key, void (*dtor)(void *))
 {

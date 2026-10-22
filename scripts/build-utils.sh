@@ -466,6 +466,26 @@ if [ -n "$_miss" ]; then
         exit 1
 fi
 
+fix_crt_externs() {
+	cat > "$BUILD_DIR/crt_externs.c" <<'CEOF'
+#include <mach-o/loader.h>
+extern char **NXArgv;
+extern int NXArgc;
+extern char **environ;
+extern const char *__progname;
+extern struct mach_header _mh_execute_header;
+char ***_NSGetArgv(void) { return &NXArgv; }
+int *_NSGetArgc(void) { return &NXArgc; }
+char ***_NSGetEnviron(void) { return &environ; }
+char **_NSGetProgname(void) { return (char **)&__progname; }
+struct mach_header *_NSGetMachExecuteHeader(void) { return &_mh_execute_header; }
+CEOF
+	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -Wno-error -c "$BUILD_DIR/crt_externs.c" -o "$BUILD_DIR/crt_externs.o" || return 1
+	ar r "$_dylddir/libc.a" "$BUILD_DIR/crt_externs.o" || return 1
+	log "crt_externs: replaced (static _NSGetEnviron)"
+}
+fix_crt_externs || exit 1
+
 build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
