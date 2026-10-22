@@ -596,14 +596,14 @@ try df u_df
 try dd u_dd
 
 log "smoke:"
-"$_out/true" && echo "true: ok"
-"$_out/uname" -rs || true
-"$_out/pwd" || true
-"$_out/hostname" || true
-echo hello | "$_out/cat" || true
-"$_out/ls" "$REPO_ROOT" | head -5 || true
-"$_out/env" | head -3 || true
-"$_out/test" -f "$REPO_ROOT/README.md" && echo "test: ok"
+timeout 10 "$_out/true" && echo "true: ok"
+timeout 10 "$_out/uname" -rs || true
+timeout 10 "$_out/pwd" || true
+timeout 10 "$_out/hostname" || true
+echo hello | timeout 10 "$_out/cat" || true
+timeout 10 "$_out/ls" "$REPO_ROOT" | head -5 || true
+timeout 10 "$_out/env" | head -3 || true
+timeout 10 "$_out/test" -f "$REPO_ROOT/README.md" && echo "test: ok"
 
 log "probe:"
 if [ -f "$BUILD_DIR/crt0.o" ]; then
@@ -1004,6 +1004,20 @@ cat "/tmp/probe18.out"
 if [ "$_rc18" = 0 ]; then log "probe18: ok"; else
 	if [ "$_rc18" = 137 ]; then log "probe18: HUNG"; else log "probe18: FAILED rc=$_rc18"; fi
 fi
+run_probe probe21 <<'P21EOF'
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	extern void __malloc_init(const char **) __attribute__((weak));
+	write(1, "21-pre-init\n", 12);
+	if (__malloc_init != 0) { __malloc_init(apple); }
+	write(1, "21-post-init\n", 13);
+	return 0;
+}
+P21EOF
 run_probe probe20 <<'P20EOF'
 extern char *getenv(const char *);
 extern void environ_lock_np(void);
