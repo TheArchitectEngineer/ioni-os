@@ -633,10 +633,13 @@ run_probe() {
 	_p=$!
 	( sleep 15; kill -9 "$_p" 2>/dev/null ) &
 	_w=$!
+	( sleep 5; sample "$_p" 2 -file "/tmp/$_pname.sample" >/dev/null 2>&1 ) &
+	_s=$!
 	wait "$_p" 2>/dev/null
 	_rc=$?
-	kill "$_w" 2>/dev/null
+	kill "$_w" "$_s" 2>/dev/null
 	wait "$_w" 2>/dev/null
+	wait "$_s" 2>/dev/null
 	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else
 		if [ "$_rc" = 137 ]; then log "$_pname: HUNG (watchdog killed)"; else log "$_pname: FAILED rc=$_rc"; fi
 		cat "/tmp/$_pname.out"
@@ -644,6 +647,7 @@ run_probe() {
 		if [ -n "$_rip" ]; then
 			xcrun atos -o "$_out/$_pname" -l 0x100000000 "0x$_rip" 2>/dev/null | head -2
 		fi
+		if [ -f "/tmp/$_pname.sample" ]; then log "sample $_pname:"; head -40 "/tmp/$_pname.sample"; fi
 	fi
 }
 run_probe probe4 <<'P4EOF'
