@@ -77,7 +77,6 @@ if [ ! -f "$_lutil_h" ]; then
 #define HN_AUTOSCALE 0x20
 int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags);
 int expand_number(const char *buf, uint64_t *num);
-extern bool unix2003_compat;
 #endif
 LUEOF
 fi
@@ -374,6 +373,12 @@ if [ ! -f "$_incl/membershipPriv.h" ]; then
 #endif
 MBPEOF
 fi
+if [ ! -f "$BUILD_DIR/ioni-ls-compat.h" ]; then
+	cat > "$BUILD_DIR/ioni-ls-compat.h" <<'LSEOF'
+#include <stdbool.h>
+extern bool unix2003_compat;
+LSEOF
+fi
 if [ ! -f "$_incl/libxo/xo.h" ]; then
 	mkdir -p "$_incl/libxo"
 	cat > "$_incl/libxo/xo.h" <<'XOEOF'
@@ -416,7 +421,7 @@ build_crt() {
         clone Csu "$CSU_TAG" "$DEPS_DIR/Csu"
         _crt="$BUILD_DIR/crt0.o"
         if [ ! -f "$_crt" ]; then
-                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
+                printf 'extern int main(int, const char **, const char **, const char **);\nextern void exit(int);\nextern char **environ;\nextern int NXArgc;\nextern const char **NXArgv;\nextern const char *__progname;\nextern char *setlocale(int, const char *);\nstatic char ioni_tsd[4096] __attribute__((aligned(64)));\nvoid _start(int argc, const char **argv, const char **envp)\n{\n\tlong _r = 0x3000003;\n\t__asm__ volatile("syscall" : "+a"(_r) : "D"((long)ioni_tsd), "S"(0L) : "rcx", "r11", "memory");\n\tconst char **apple = envp;\n\twhile (*apple != 0) { apple++; }\n\tapple++;\n\tNXArgc = argc;\n\tNXArgv = argv;\n\tenviron = (char **)envp;\n\t__progname = (argv[0] != 0) ? argv[0] : "";\n\tsetlocale(6, "C");\n\texit(main(argc, argv, envp, apple));\n}\n' > "$BUILD_DIR/ioni-ustart.c"
                 env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" \
                         -nostdlib -Wno-error -O1 \
                         -c "$BUILD_DIR/ioni-ustart.c" -o "$_obj/crt-ustart.o" || return 1
@@ -444,7 +449,7 @@ build_util() {
         while IFS= read -r _s; do
                 _o="$_obj/$_name-$(basename "${_s%.c}").o"
                 [ -f "$_o" ] && continue
-                ( cd "$(dirname "$_s")" && env CPATH="$_incl" xcrun clang $_cflags \
+                ( cd "$(dirname "$_s")" && env CPATH="$_incl" xcrun clang $_cflags ${_EXTRA_CFLAGS:-} \
                         -c "$(basename "$_s")" -o "$_o" ) || { log "util $_name: TU $(basename "$_s") FAILED"; return 1; }
                 _oobjs="$_oobjs $_o"
         done < "$_srcs"
@@ -482,7 +487,7 @@ u_test() { build_util test "$DEPS_DIR/shell_cmds/test" test.c; }
 u_env() { build_util env "$DEPS_DIR/shell_cmds/env" env.c envopts.c; }
 u_date() { build_util date "$DEPS_DIR/shell_cmds/date" date.c vary.c; }
 u_cat() { build_util cat "$DEPS_DIR/text_cmds/cat" cat.c; }
-u_ls() { build_util ls "$DEPS_DIR/file_cmds/ls" ls.c cmp.c print.c util.c; }
+u_ls() { _EXTRA_CFLAGS="-include $BUILD_DIR/ioni-ls-compat.h"; build_util ls "$DEPS_DIR/file_cmds/ls" ls.c cmp.c print.c util.c; _EXTRA_CFLAGS=""; }
 u_mkdir() { build_util mkdir "$DEPS_DIR/file_cmds/mkdir" mkdir.c; }
 u_rmdir() { build_util rmdir "$DEPS_DIR/file_cmds/rmdir" rmdir.c; }
 u_rm() { build_util rm "$DEPS_DIR/file_cmds/rm" rm.c; }
@@ -612,6 +617,32 @@ int main(int argc, const char **argv, const char **envp, const char **apple)
 	return 0;
 }
 P5EOF
+run_probe probe6 <<'P6EOF'
+extern int printf(const char *, ...);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	printf("probe6 %d\n", 42);
+	return 0;
+}
+P6EOF
+run_probe probe7 <<'P7EOF'
+extern char *getenv(const char *);
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	char *p = getenv("PATH");
+	write(1, p != 0 ? "env-ok\n" : "env-null\n", 9);
+	return 0;
+}
+P7EOF
 log "lldb uname:"
 xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/uname" > /tmp/lldb-uname.log 2>&1 &
 _lp=$!
