@@ -77,6 +77,7 @@ if [ ! -f "$_lutil_h" ]; then
 #define HN_AUTOSCALE 0x20
 int humanize_number(char *buf, size_t len, int64_t quotient, const char *suffix, int scale, int flags);
 int expand_number(const char *buf, uint64_t *num);
+extern bool unix2003_compat;
 #endif
 LUEOF
 fi
@@ -330,6 +331,24 @@ void xo_errx(int eval, const char *fmt, ...)
 	fputc(10, stderr);
 	exit(eval);
 }
+int xo_open_instance(const char *name)
+{
+	(void)name;
+	return (0);
+}
+int xo_close_instance(const char *name)
+{
+	(void)name;
+	return (0);
+}
+void xo_error(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+}
 LUCEOF
 	env CPATH="$_incl" xcrun clang -arch $LIBARCHS -isysroot "$_sdk" -O2 -Wno-error -c "$BUILD_DIR/ioni-libutil.c" -o "$_obj/ioni-libutil.o" || exit 1
 	ar rcs "$_dylddir/libutil.a" "$_obj/ioni-libutil.o"
@@ -362,6 +381,7 @@ if [ ! -f "$_incl/libxo/xo.h" ]; then
 #define _IONI_LIBXO_XO_H
 #include <stdarg.h>
 #include <stdio.h>
+#include <errno.h>
 int xo_parse_args(int argc, char **argv);
 int xo_finish(void);
 int xo_emit(const char *fmt, ...);
@@ -374,6 +394,9 @@ void xo_warn(const char *fmt, ...);
 void xo_warnx(const char *fmt, ...);
 void xo_err(int eval, const char *fmt, ...);
 void xo_errx(int eval, const char *fmt, ...);
+int xo_open_instance(const char *name);
+int xo_close_instance(const char *name);
+void xo_error(const char *fmt, ...);
 #endif
 XOEOF
 fi
@@ -468,7 +491,7 @@ u_ln() { build_util ln "$DEPS_DIR/file_cmds/ln" ln.c; }
 u_chmod() { build_util chmod "$DEPS_DIR/file_cmds/chmod" chmod.c; }
 u_du() { build_util du "$DEPS_DIR/file_cmds/du" du.c; }
 u_df() { build_util df "$DEPS_DIR/file_cmds/df" df.c; }
-u_dd() { build_util dd "$DEPS_DIR/file_cmds/dd" dd.c args.c conv.c conv_tab.c gen.c misc.c position.c; }
+u_dd() { build_util dd "$DEPS_DIR/file_cmds/dd" dd.c args.c conv.c conv_tab.c misc.c position.c; }
 
 try crt build_crt
 clone shell_cmds "$SHELL_CMDS_TAG" "$DEPS_DIR/shell_cmds"
@@ -540,9 +563,67 @@ PROBEEOF
 	wait "$_w" 2>/dev/null
 	if [ "$_rc" = 0 ]; then log "probe: ok"; else log "probe: FAILED rc=$_rc"; fi
 fi
+log "probes libc:"
+run_probe() {
+	_pname="$1"
+	cat > "$BUILD_DIR/$_pname.c"
+	env CPATH="$_incl" xcrun clang -nostdlib -static -no-pie -Wl,-e,start -Wl,-dead_strip \
+		-arch $LIBARCHS -isysroot "$_sdk" -Wno-error \
+		"$BUILD_DIR/crt0.o" "$BUILD_DIR/$_pname.c" $SYSARCHIVES -o "$_out/$_pname" \
+		|| { log "$_pname: build FAILED"; return 1; }
+	"$_out/$_pname" &
+	_p=$!
+	( sleep 15; kill -9 "$_p" 2>/dev/null ) &
+	_w=$!
+	wait "$_p" 2>/dev/null
+	_rc=$?
+	kill "$_w" 2>/dev/null
+	wait "$_w" 2>/dev/null
+	if [ "$_rc" = 0 ]; then log "$_pname: ok"; else log "$_pname: FAILED rc=$_rc"; fi
+}
+run_probe probe4 <<'P4EOF'
+extern long write(int, const void *, unsigned long);
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	write(1, "probe4\n", 7);
+	return 0;
+}
+P4EOF
+run_probe probe5 <<'P5EOF'
+extern int sysctl(int *, unsigned int, void *, unsigned long *, void *, unsigned long);
+extern long write(int, const void *, unsigned long);
+static int p5mib[2] = { 1, 1 };
+int main(int argc, const char **argv, const char **envp, const char **apple)
+{
+	(void)argc;
+	(void)argv;
+	(void)envp;
+	(void)apple;
+	char buf[64];
+	unsigned long len = sizeof(buf);
+	if (sysctl(p5mib, 2, buf, &len, 0, 0) == 0) {
+		write(1, buf, len);
+		write(1, "\n", 1);
+	}
+	return 0;
+}
+P5EOF
+log "lldb uname:"
+xcrun lldb -b -o run -o "bt all" -o "register read rip rsp" -o quit "$_out/uname" > /tmp/lldb-uname.log 2>&1 &
+_lp=$!
+( sleep 90; kill -9 "$_lp" 2>/dev/null ) &
+_lw=$!
+wait "$_lp" 2>/dev/null
+head -80 /tmp/lldb-uname.log
+kill "$_lw" 2>/dev/null
+wait "$_lw" 2>/dev/null
 log "crash reports:"
 sleep 12
-for _r in $(ls -t "$HOME/Library/Logs/DiagnosticReports"/true-*.ips "$HOME/Library/Logs/DiagnosticReports"/uname-*.ips 2>/dev/null | head -3); do
+for _r in $(ls -t "$HOME/Library/Logs/DiagnosticReports"/uname-*.ips "$HOME/Library/Logs/DiagnosticReports"/pwd-*.ips "$HOME/Library/Logs/DiagnosticReports"/hostname-*.ips "$HOME/Library/Logs/DiagnosticReports"/cat-*.ips "$HOME/Library/Logs/DiagnosticReports"/test-*.ips 2>/dev/null | head -4); do
 	echo "--- report: $_r"
 	head -c 6000 "$_r"
 	echo
