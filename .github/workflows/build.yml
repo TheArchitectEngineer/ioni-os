@@ -126,7 +126,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: kernel-RELEASE-X86_64
-          path: BUILD/obj
+          # artifact root is the upload paths' common ancestor (RELEASE_X86_64/):
+          # download into it so the binary lands at the canonical build path
+          path: BUILD/obj/RELEASE_X86_64
 
       - name: build kernelcache
         run: ./scripts/build-kc.sh BUILD/obj/RELEASE_X86_64/kernel BUILD/ioni.kc
