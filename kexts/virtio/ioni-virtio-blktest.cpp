@@ -221,8 +221,7 @@ com_ioni_virtio_blktest::start(IOService * provider)
         thread_call_t tc = thread_call_allocate(
 	    (thread_call_func_t)&com_ioni_virtio_blktest::readThread, (thread_call_param_t)this);
 	if (tc == NULL) {
-		IOLog("com.ioni.virtio.blk: thread_call_allocate failed - read test skipped
-");
+		IOLog("com.ioni.virtio.blk: thread_call_allocate failed - read test skipped\n");
 		return true;
 	}
 	/* thread_call_enter() returns FALSE when the call was already

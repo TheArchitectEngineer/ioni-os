@@ -218,8 +218,7 @@ com_ioni_virtio_9p::start(IOService * provider)
         thread_call_t tc = thread_call_allocate(
 	    (thread_call_func_t)&com_ioni_virtio_9p::negotiationThread, (thread_call_param_t)this);
 	if (tc == NULL) {
-		IOLog("com.ioni.virtio.9p: thread_call_allocate failed - negotiation skipped
-");
+		IOLog("com.ioni.virtio.9p: thread_call_allocate failed - negotiation skipped\n");
 		return true;
 	}
 	/* thread_call_enter() returns FALSE when the call was already

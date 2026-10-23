@@ -270,8 +270,7 @@ com_ioni_virtio_net::start(IOService * provider)
 	thread_call_t tc = thread_call_allocate(
 	    (thread_call_func_t)&com_ioni_virtio_net::datapathThread, (thread_call_param_t)this);
 	if (tc == NULL) {
-		IOLog("com.ioni.virtio.net: thread_call_allocate failed - datapath test skipped
-");
+		IOLog("com.ioni.virtio.net: thread_call_allocate failed - datapath test skipped\n");
 		return true;
 	}
 	/* thread_call_enter() returns FALSE when the call was already
