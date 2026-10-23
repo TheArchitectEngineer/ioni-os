@@ -278,7 +278,9 @@ if [ -n "$HUNT_LOG" ]; then
         -d int,cpu_reset,guest_errors \
         -D "$OUT_DIR/qemu-debug.log" \
         $PFLASH_ARGS \
-        -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
+            -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
+        $IONI_QEMU_EXTRA \
+        $IONI_QEMU_EXTRA \
         $QEMU_GDB_EXTRA \
         > "$OUT_DIR/qemu-stdout.log" 2>&1 &
     QEMU_PID=$!
@@ -307,6 +309,7 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -D "$OUT_DIR/qemu-debug.log" \
     $PFLASH_ARGS \
     -drive "if=virtio,format=raw,file=$ESP_IMG,snapshot=on" \
+    $IONI_QEMU_EXTRA \
     > "$OUT_DIR/qemu-stdout.log" 2>&1
 QEMU_RC=$?
 set -e
@@ -351,13 +354,23 @@ if ! grep -Eq "$KERNEL_MARKS" "$SERIAL_LOG"; then
     fi
     exit 1
 fi
-OK_MARK="${IONI_BOOT_OK_MARK:-VM bootstrap done}"
-if ! grep -q "$OK_MARK" "$SERIAL_LOG"; then
-    echo "qemu-boot: FAIL kernel did not reach '$OK_MARK'" >&2
+# OK marks: IONI_BOOT_OK_MARKS (space-separated, all must appear) overrides
+# the single IONI_BOOT_OK_MARK which overrides the default. Round 4 boot
+# test asserts the full activation set: hello + virtio devices + ps2.
+OK_MARKS="${IONI_BOOT_OK_MARKS:-${IONI_BOOT_OK_MARK:-VM bootstrap done}}"
+FAILED_MARK=""
+for M in $OK_MARKS; do
+    if ! grep -q "$M" "$SERIAL_LOG"; then
+        FAILED_MARK="$M"
+        break
+    fi
+done
+if [ -n "$FAILED_MARK" ]; then
+    echo "qemu-boot: FAIL kernel did not reach '$FAILED_MARK'" >&2
     tail -60 "$SERIAL_LOG"
     exit 1
 fi
 
-echo "qemu-boot: PASS kernel reached '$OK_MARK' without panic"
+echo "qemu-boot: PASS kernel reached all OK marks ($OK_MARKS) without panic"
 grep -E "$KERNEL_MARKS" "$SERIAL_LOG" | head -20
 exit 0

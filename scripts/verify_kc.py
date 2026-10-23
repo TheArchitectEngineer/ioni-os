@@ -409,9 +409,72 @@ if n_kexts > 0:
               f"{bid}: {n_checked} applied relocations semantically valid "
               f"({n_bad} bad)")
 
+
+
+    # ---- 13. round 4: vendored virtio + ps2 personalities --------------------
+    # com.ioni.kext.virtio: root personality (platform nub) + the device
+    # personalities matching the pmj transport nub class by VirtioDeviceTypeID
+    # (2 blk / 1 net / 9 9p). com.ioni.kext.ps2: platform-nub personality.
+    print("13. round 4 personalities (virtio stack + ps2)")
+    r4_bundles = [e for e in (arr or [])
+                  if e.get("CFBundleIdentifier") in
+                  ("com.ioni.kext.virtio", "com.ioni.kext.ps2")]
+    if not r4_bundles:
+        print("     [ok ] round 4 kexts not staged - skipping")
+    expected = {
+        "com.ioni.kext.virtio": {
+            "IoniVirtioRoot": {
+                "IOClass": "com_ioni_virtio_root",
+                "IOProviderClass": "IOPlatformExpertDevice",
+                "IONameMatch": "ACPI",
+                "IOMatchCategory": "com.ioni.kext.virtio.root",
+            },
+            "IoniVirtioBlkTest": {
+                "IOClass": "com_ioni_virtio_blktest",
+                "IOProviderClass": "eu_dennis__jordan_driver_VirtioDevice",
+                "VirtioDeviceTypeID": 2,
+            },
+            "IoniVirtioNet": {
+                "IOClass": "com_ioni_virtio_net",
+                "IOProviderClass": "eu_dennis__jordan_driver_VirtioDevice",
+                "VirtioDeviceTypeID": 1,
+            },
+            "IoniVirtio9P": {
+                "IOClass": "com_ioni_virtio_9p",
+                "IOProviderClass": "eu_dennis__jordan_driver_VirtioDevice",
+                "VirtioDeviceTypeID": 9,
+            },
+        },
+        "com.ioni.kext.ps2": {
+            "IoniPS2Controller": {
+                "IOClass": "com_ioni_ps2",
+                "IOProviderClass": "IOPlatformExpertDevice",
+                "IONameMatch": "ACPI",
+                "IOMatchCategory": "com.ioni.kext.ps2",
+            },
+        },
+    }
+    for ent in r4_bundles:
+        bid = ent.get("CFBundleIdentifier", "?")
+        pers = ent.get("IOKitPersonalities") or {}
+        libs = ent.get("OSBundleLibraries")
+        check(isinstance(libs, dict) and "__kernel__" in libs,
+              f"{bid}: OSBundleLibraries -> __kernel__")
+        for pname, want in expected[bid].items():
+            p = pers.get(pname)
+            check(isinstance(p, dict),
+                  f"{bid}/{pname}: personality present in __PRELINK_INFO")
+            if not isinstance(p, dict):
+                continue
+            for key, val in want.items():
+                check(p.get(key) == val,
+                      f"{bid}/{pname}: {key} == {val!r} "
+                      f"(got {p.get(key)!r})")
 else:
     print("10. prelink pipeline: skipped (kernel-only KC)")
     print("11. IOKit personalities: skipped (kernel-only KC)")
+    print("12. applied kext relocations: skipped (kernel-only KC)")
+    print("13. round 4 personalities: skipped (kernel-only KC)")
 
 print()
 if FAIL:

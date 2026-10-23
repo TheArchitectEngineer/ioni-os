@@ -189,10 +189,17 @@ jobs:
         run: |
           KC=$(find BUILD/kc -type f -name '*.kc' | head -n1)
           echo "kc: $KC"
-          # OK mark = the ioni-hello driver's ::start success line: the boot
-          # test then covers the FULL activation chain (prelink -> personality
-          # -> IOCatalogue matching -> OSKext load+start -> driver runs)
-          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8 kt=2 startup_debug=1 kextlog=0x440bd" IONI_BOOT_OK_MARK="com.ioni.hello: started" IONI_QEMU_TIMEOUT=600 IONI_QEMU_SMP=1 ./scripts/qemu-boot.sh "$KC" BUILD/kc-boot
+          # OK marks = the full round-4 activation chain: hello (round 3
+          # regression), the virtio root+blk/net/9p drivers (vendored pmj
+          # VirtioFamily through the prelink pipeline) and the PS/2
+          # keyboard. disable-legacy=off turns the q35 virtio-pci devices
+          # transitional (IDs 0x1000/0x1001/0x1009) so the completed
+          # upstream legacy transport drives them; modern-only devices
+          # would be skipped (upstream modern transport is unfinished).
+          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8 kt=2 startup_debug=1 kextlog=0x440bd" \
+            IONI_QEMU_EXTRA="-global virtio-pci.disable-legacy=off -device virtio-net-pci,netdev=ioni0 -netdev user,id=ioni0 -device virtio-9p-pci,fsdev=ioni9p,mount_tag=ionishare -fsdev local,id=ioni9p,path=/tmp,security_model=none" \
+            IONI_BOOT_OK_MARKS="com.ioni.hello: started com.ioni.virtio: root started virtio-blk: sector 0 read ok 9P2000.L negotiation with QEMU CONFIRMED com.ioni.virtio.net: device MAC com.ioni.ps2: keyboard ready" \
+            IONI_QEMU_TIMEOUT=600 IONI_QEMU_SMP=1 ./scripts/qemu-boot.sh "$KC" BUILD/kc-boot
 
       - name: upload KC boot logs
         if: always()

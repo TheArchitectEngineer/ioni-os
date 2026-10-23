@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>CFBundleIdentifier</key>
+        <string>com.ioni.kext.virtio</string>
+        <key>CFBundleName</key>
+        <string>ioni virtio (vendored pmj VirtioFamily)</string>
+        <key>CFBundleVersion</key>
+        <string>1.0</string>
+        <key>CFBundleExecutable</key>
+        <string>virtio</string>
+        <key>CFBundlePackageType</key>
+        <string>KEXT</string>
+        <key>OSBundleRequired</key>
+        <string>Root</string>
+        <key>OSBundleLibraries</key>
+        <dict>
+                <!-- The kernel itself is the only library kext in our
+                     collection (see com.ioni.hello round-3 notes). -->
+                <key>__kernel__</key>
+                <string>1.0</string>
+        </dict>
+        <key>IOKitPersonalities</key>
+        <dict>
+                <key>IoniVirtioRoot</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.kext.virtio</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_virtio_root</string>
+                        <!-- Same platform nub as com.ioni.hello ("ACPI",
+                             IoniACPIPlatform); own match category so both
+                             drivers start. The root performs the raw CF8/CFC
+                             PCI scan and instantiates one VirtioLegacyPCIDevice
+                             transport per transitional virtio device. -->
+                        <key>IOProviderClass</key>
+                        <string>IOPlatformExpertDevice</string>
+                        <key>IONameMatch</key>
+                        <string>ACPI</string>
+                        <key>IOProbeScore</key>
+                        <integer>1</integer>
+                        <key>IOMatchCategory</key>
+                        <string>com.ioni.kext.virtio.root</string>
+                </dict>
+                <key>IoniVirtioBlkTest</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.kext.virtio</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_virtio_blktest</string>
+                        <key>IOProviderClass</key>
+                        <string>eu_dennis__jordan_driver_VirtioDevice</string>
+                        <key>VirtioDeviceTypeID</key>
+                        <integer>2</integer>
+                        <key>IOProbeScore</key>
+                        <integer>100</integer>
+                </dict>
+                <key>IoniVirtioNet</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.kext.virtio</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_virtio_net</string>
+                        <key>IOProviderClass</key>
+                        <string>eu_dennis__jordan_driver_VirtioDevice</string>
+                        <key>VirtioDeviceTypeID</key>
+                        <integer>1</integer>
+                        <key>IOProbeScore</key>
+                        <integer>100</integer>
+                </dict>
+                <key>IoniVirtio9P</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.kext.virtio</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_virtio_9p</string>
+                        <key>IOProviderClass</key>
+                        <string>eu_dennis__jordan_driver_VirtioDevice</string>
+                        <key>VirtioDeviceTypeID</key>
+                        <integer>9</integer>
+                        <key>IOProbeScore</key>
+                        <integer>100</integer>
+                </dict>
+        </dict>
+</dict>
+</plist>

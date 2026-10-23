@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>CFBundleIdentifier</key>
+        <string>com.ioni.kext.ps2</string>
+        <key>CFBundleName</key>
+        <string>ioni ps2 (i8042 keyboard)</string>
+        <key>CFBundleVersion</key>
+        <string>1.0</string>
+        <key>CFBundleExecutable</key>
+        <string>ps2</string>
+        <key>CFBundlePackageType</key>
+        <string>KEXT</string>
+        <key>OSBundleRequired</key>
+        <string>Root</string>
+        <key>OSBundleLibraries</key>
+        <dict>
+                <key>__kernel__</key>
+                <string>1.0</string>
+        </dict>
+        <key>IOKitPersonalities</key>
+        <dict>
+                <key>IoniPS2Controller</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.kext.ps2</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_ps2</string>
+                        <!-- i8042 sits at the fixed ISA ports 0x60/0x64 on
+                             QEMU q35; matching the platform nub the same way
+                             as com.ioni.hello/com.ioni.kext.virtio. Own match
+                             category. -->
+                        <key>IOProviderClass</key>
+                        <string>IOPlatformExpertDevice</string>
+                        <key>IONameMatch</key>
+                        <string>ACPI</string>
+                        <key>IOProbeScore</key>
+                        <integer>1</integer>
+                        <key>IOMatchCategory</key>
+                        <string>com.ioni.kext.ps2</string>
+                </dict>
+        </dict>
+</dict>
+</plist>

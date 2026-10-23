@@ -127,6 +127,71 @@ auto)
         [ -f "$HELLO_STAGE/Contents/Info.plist" ] \
             || { echo "build-kc: ioni-hello staging incomplete (no Info.plist)" >&2; exit 1; }
         KEXT_ARGS="$KEXT_ARGS -kext $HELLO_STAGE"
+
+        # --- round 4: vendored pmj VirtioFamily + PS2 ------------------------
+        # Same kernel C++ ABI flags as ioni-hello. The vendored/include dir
+        # MUST precede EXP_HDRS in the include path: it overrides
+        # <IOKit/pci/IOPCIDevice.h> and <IOKit/storage/IOBlockStorage{,Driver}.h>
+        # with IONI shims (IOPCIFamily/IOStorageFamily are not in the
+        # collection yet) while every other IOKit header resolves against the
+        # exported kernel headers. The unity TU compiles the pmj transport
+        # (VirtioDevice/VirtioLegacyPCIDevice), the dormant block driver, the
+        # SSDC multi-subrange descriptor, genccont and the IONI drivers into
+        # ONE MH_OBJECT (one object = one kext binary; see round-2 notes).
+        VIRTIO_STAGE="BUILD/kexts/virtio.kext"
+        echo "build-kc: staging virtio kext (pmj VirtioFamily + IONI drivers)"
+        mkdir -p "$VIRTIO_STAGE/Contents/MacOS"
+        cp kexts/virtio/Info.plist "$VIRTIO_STAGE/Contents/Info.plist"
+        # shellcheck disable=SC2086
+        clang++ -c -arch x86_64 -O2 \
+            -std=gnu++2b -fsized-deallocation -fapple-kext \
+            -fno-exceptions -fno-c++-static-destructors \
+            -fno-builtin -fno-common -fsigned-bitfields \
+            -fno-zero-initialized-in-bss \
+            -nostdlibinc -mkernel -msoft-float \
+            -fno-pic -fno-stack-protector \
+            -fno-asynchronous-unwind-tables \
+            -DAPPLE -DKERNEL -DKERNEL_PRIVATE -DPRIVATE -D__MACHO__=1 \
+            -Dx86_64 -DX86_64 -D__X86_64__ -DLP64 -DPAGE_SIZE_FIXED \
+            -Wno-unused-parameter \
+            -I"kexts/virtio/vendored/include" \
+            -I"$EXP_HDRS/iokit" -I"$EXP_HDRS/libkern" -I"$EXP_HDRS/osfmk" \
+            -I"$EXP_HDRS/bsd" -I"$EXP_HDRS/pexpert" \
+            -IEXTERNAL_HEADERS \
+            kexts/virtio/ioni-virtio-all.cpp \
+            -o "$VIRTIO_STAGE/Contents/MacOS/virtio"
+        python3 scripts/kext_normalize_object.py \
+            "$VIRTIO_STAGE/Contents/MacOS/virtio"
+        [ -f "$VIRTIO_STAGE/Contents/Info.plist" ] \
+            || { echo "build-kc: virtio staging incomplete (no Info.plist)" >&2; exit 1; }
+        KEXT_ARGS="$KEXT_ARGS -kext $VIRTIO_STAGE"
+
+        PS2_STAGE="BUILD/kexts/ps2.kext"
+        echo "build-kc: staging ps2 kext (i8042)"
+        mkdir -p "$PS2_STAGE/Contents/MacOS"
+        cp kexts/ps2/Info.plist "$PS2_STAGE/Contents/Info.plist"
+        # shellcheck disable=SC2086
+        clang++ -c -arch x86_64 -O2 \
+            -std=gnu++2b -fsized-deallocation -fapple-kext \
+            -fno-exceptions -fno-c++-static-destructors \
+            -fno-builtin -fno-common -fsigned-bitfields \
+            -fno-zero-initialized-in-bss \
+            -nostdlibinc -mkernel -msoft-float \
+            -fno-pic -fno-stack-protector \
+            -fno-asynchronous-unwind-tables \
+            -DAPPLE -DKERNEL -DKERNEL_PRIVATE -DPRIVATE -D__MACHO__=1 \
+            -Dx86_64 -DX86_64 -D__X86_64__ -DLP64 -DPAGE_SIZE_FIXED \
+            -Wno-unused-parameter \
+            -I"$EXP_HDRS/iokit" -I"$EXP_HDRS/libkern" -I"$EXP_HDRS/osfmk" \
+            -I"$EXP_HDRS/bsd" -I"$EXP_HDRS/pexpert" \
+            -IEXTERNAL_HEADERS \
+            kexts/ps2/ioni-ps2.cpp \
+            -o "$PS2_STAGE/Contents/MacOS/ps2"
+        python3 scripts/kext_normalize_object.py \
+            "$PS2_STAGE/Contents/MacOS/ps2"
+        [ -f "$PS2_STAGE/Contents/Info.plist" ] \
+            || { echo "build-kc: ps2 staging incomplete (no Info.plist)" >&2; exit 1; }
+        KEXT_ARGS="$KEXT_ARGS -kext $PS2_STAGE"
     else
         echo "build-kc: WARNING - $EXP_HDRS missing, skipping ioni-hello kext"
     fi

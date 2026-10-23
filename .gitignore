@@ -6,3 +6,4 @@ userland/ionish
 boot/xnu-loader/build/
 boot/kc-tools/build/
 boot/kc-tools/build-local/
+__pycache__/
