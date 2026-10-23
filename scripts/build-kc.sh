@@ -97,6 +97,7 @@ auto)
         HELLO_STAGE="BUILD/kexts/ioni-hello.kext"
         echo "build-kc: staging IOKit driver kext -> $HELLO_STAGE"
         mkdir -p "$HELLO_STAGE/Contents/MacOS"
+        cp kexts/ioni-hello/Info.plist "$HELLO_STAGE/Contents/Info.plist"
         # shellcheck disable=SC2086
         clang++ -c -arch x86_64 -O2 \
             -std=gnu++2b -fsized-deallocation -fapple-kext \
@@ -115,6 +116,10 @@ auto)
             -o "$HELLO_STAGE/Contents/MacOS/ioni-hello"
         python3 scripts/kext_normalize_object.py \
             "$HELLO_STAGE/Contents/MacOS/ioni-hello"
+        # kc-builder silently skips a kext bundle without Info.plist - fail
+        # hard instead so a lost plist cannot degrade the KC quietly
+        [ -f "$HELLO_STAGE/Contents/Info.plist" ] \
+            || { echo "build-kc: ioni-hello staging incomplete (no Info.plist)" >&2; exit 1; }
         KEXT_ARGS="$KEXT_ARGS -kext $HELLO_STAGE"
     else
         echo "build-kc: WARNING - $EXP_HDRS missing, skipping ioni-hello kext"
