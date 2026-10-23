@@ -1078,7 +1078,22 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     }
   }
 
-  typedef struct { uint32_t foff; uint64_t vmaddr; uint32_t size; } SecRef;
+  /*
+   * Section shift bookkeeping: kc-tools patches MH_OBJECT section bases to
+   * file-space (offset + load) while the object's own VM space keeps the
+   * original (packed) addresses. clang's section-based relocation contents
+   * are expressed in that ORIGINAL VM space (full address for absolute,
+   * full displacement for pc-relative), so applying them requires rebasing
+   * by (patched base - original VM base) of the involved sections.
+   * For the normalized identity objects (addr == offset - const) the shift
+   * is uniform and pc-relative entries are a no-op.
+   */
+  typedef struct {
+    uint32_t foff;
+    uint64_t vmaddr;    /* patched (file-space + load) base */
+    uint64_t orig_vm;   /* original object-space VM base */
+    uint32_t size;
+  } SecRef;
   SecRef *sec_refs = NULL;
   uint32_t total_sects = 0;
   {
@@ -1102,6 +1117,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
         macho_sect_get(&mv, secs + (size_t)j * macho_sect_size(&mv), &sec);
         sec_refs[si].foff   = sec.offset;
         sec_refs[si].vmaddr = sec.addr;
+        sec_refs[si].orig_vm = (si < nsect_va) ? sect_vm_addr[si] : sec.addr;
         sec_refs[si].size   = (uint32_t)sec.size;
         si++;
       }
@@ -1109,6 +1125,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   }
 
   uint32_t nerrs = 0;
+  uint32_t sect_run = 0;  /* global running section index, aligns with sect_vm_addr */
   {
     for (MACHO_EACH_LC(&mv, p)) {
       if (!macho_is_segment(&mv, p))
@@ -1119,6 +1136,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
       for (uint32_t j = 0; j < sg.nsects; j++) {
         MachoSect sec;
         macho_sect_get(&mv, secs + (size_t)j * macho_sect_size(&mv), &sec);
+        sect_run++;
         if (!sec.nreloc || !sec.reloff)
           continue;
 
@@ -1230,21 +1248,76 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint8_t *loc = buf + sec.offset + r.r_address;
           uint64_t pc  = sec.addr + (uint32_t)r.r_address;
 
+          /* Shift of the instruction's own section (patched - original VM). */
+          int64_t d_insn = (sect_run >= 1 && sect_run <= nsect_va)
+              ? (int64_t)(sec.addr - sect_vm_addr[sect_run - 1]) : 0;
+
+          /*
+           * X86_64_RELOC_GOT(_LOAD): clang emits `mov rXX,[rip+disp]`
+           * (opcode 8B) for @GOTPCREL references. A static prelinked image
+           * has no dyld to fill a GOT slot - and kc-tools does not build
+           * one. The load was meant to yield the symbol's ADDRESS, so
+           * convert the instruction into `lea rXX,[rip+disp]` (opcode 8D:
+           * identical REX/ModRM/displacement encoding, same length) and
+           * fall through to the plain pcrel fixup. Run 39957448144: the
+           * un-converted mov loaded *(&IOService::gMetaClass) (its vtable
+           * pointer) into OSMetaClass::superClassLink, and postModLoad's
+           * superclass walk jumped through vtable/code bytes - GP fault.
+           */
+          if (r.r_type == X86_64_RELOC_GOT_LOAD || r.r_type == X86_64_RELOC_GOT) {
+            if ((uint32_t)r.r_address >= 3 &&
+                (uint32_t)r.r_address + 4 <= sec.size) {
+              uint8_t *op = buf + sec.offset + r.r_address;
+              if (op[-2] == 0x8B && (op[-3] & 0xF0) == 0x40 &&
+                  (op[-1] & 0xC7) == 0x05) {
+                op[-2] = 0x8D;
+                r.r_type = X86_64_RELOC_SIGNED;
+              } else {
+                fprintf(stderr,
+                    "  WARN: x86_64 GOT reloc at section+0x%x without "
+                    "mov rip-rel encoding (REX 8B modrm=00/101)\n",
+                    r.r_address);
+              }
+            }
+          }
+
           uint64_t target = 0;
+          int64_t  d_target = 0;  /* shift of the target section */
           if (r.r_extern) {
             if (r.r_symbolnum < nsyms)
               target = sym_addrs[r.r_symbolnum];
             if (!target) nerrs++;
           } else {
             uint32_t si2 = r.r_symbolnum;
-            if (si2 >= 1 && si2 <= total_sects)
+            if (si2 >= 1 && si2 <= total_sects) {
               target = sec_refs[si2 - 1].vmaddr;
+              d_target = (int64_t)(sec_refs[si2 - 1].vmaddr -
+                                   sec_refs[si2 - 1].orig_vm);
+            }
           }
 
           switch (r.r_type) {
           case X86_64_RELOC_UNSIGNED: {
-            uint64_t addend = r64(loc);
-            w64(loc, target + addend);
+            if (r.r_extern) {
+              /* content is a symbol-relative addend (0 for plain refs) */
+              if (r.r_length == RL_QUAD)
+                w64(loc, target + r64(loc));
+              else if (r.r_length == RL_LONG)
+                w32(loc, (uint32_t)(target + (uint64_t)(uint32_t)r32(loc)));
+              else
+                fprintf(stderr, "  WARN: UNSIGNED extern length %u\n",
+                        r.r_length);
+            } else {
+              /* content is the target's full object-space VM address:
+               * rebase by the target section's shift only */
+              if (r.r_length == RL_QUAD)
+                w64(loc, r64(loc) + (uint64_t)d_target);
+              else if (r.r_length == RL_LONG)
+                w32(loc, (uint32_t)(r32(loc) + (int32_t)d_target));
+              else
+                fprintf(stderr, "  WARN: UNSIGNED section length %u\n",
+                        r.r_length);
+            }
             break;
           }
           case X86_64_RELOC_BRANCH:
@@ -1256,16 +1329,24 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
                         (r.r_type == X86_64_RELOC_SIGNED_2) ? 2 :
                         (r.r_type == X86_64_RELOC_SIGNED_4) ? 4 : 0;
             int32_t addend = (int32_t)r32(loc);
-            int64_t rel = (int64_t)target - (int64_t)(pc + 4 + extra) + addend;
-            w32(loc, (uint32_t)(int32_t)rel);
-            break;
-          }
-          case X86_64_RELOC_GOT_LOAD:
-          case X86_64_RELOC_GOT: {
-            int32_t addend = (int32_t)r32(loc);
-            int64_t rel = (int64_t)target - (int64_t)(pc + 4) + addend;
+            int64_t rel;
+            if (r.r_extern) {
+              /* content is a symbol-relative addend */
+              rel = (int64_t)target - (int64_t)(pc + 4 + extra) + addend;
+            } else {
+              /* content is the full object-space displacement
+               * (target - pcrel base, shift-invariant): rebase both ends
+               * by their sections' shifts. For identity-normalized objects
+               * d_target == d_insn and this is a no-op. The old code
+               * computed target + addend - (pc + 4), which re-added the
+               * target section base and DOUBLED every string-literal
+               * displacement (run 39957448144: className pointed into the
+               * symtab region). */
+              rel = (int64_t)addend + d_target - d_insn;
+            }
             if (rel < -2147483648LL || rel > 2147483647LL)
-              fprintf(stderr, "  WARN: GOT ref out of 32-bit range (rel=%lld)\n", (long long)rel);
+              fprintf(stderr, "  WARN: pcrel out of 32-bit range (rel=%lld)\n",
+                      (long long)rel);
             w32(loc, (uint32_t)(int32_t)rel);
             break;
           }

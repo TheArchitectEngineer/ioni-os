@@ -3,6 +3,12 @@
 #include <libkern/section_keywords.h>
 #include <kern/startup.h>
 #include <machine/machine_routines.h>
+#ifdef __arm64__
+/* arm64's machine/machine_routines.h does not carry the ml_get_timebase
+ * prototype - it lives in arm/machine_routines.h (x86_64 gets it from
+ * i386/machine_routines.h via the machine/ indirection). */
+#include <arm/machine_routines.h>
+#endif
 #include <prng/random.h>
 #include <sys/random.h>
 #include <corecrypto/ccdrbg.h>

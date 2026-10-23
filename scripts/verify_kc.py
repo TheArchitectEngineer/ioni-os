@@ -276,6 +276,139 @@ if n_kexts > 0:
                       p.get("IOMatchCategory") == "com.ioni.hello",
                       f"{bid}/{pname}: IOMatchCategory own (default category "
                       f"would lose to IOProbeScore-10000 platform expert)")
+    # ---- 12. applied relocation semantics (run 39957448144 regressions) ------
+    # The prelinker's relocations are semantic, not structural: three bug
+    # classes shipped green structurally and only exploded at boot:
+    #   a) X86_64_RELOC_GOT_LOAD left as `mov rXX,[rip+disp]` pointing at the
+    #      symbol itself -> the code loaded the symbol's CONTENT (vtable ptr)
+    #      instead of its address -> postModLoad GP fault.
+    #   b) section-based pcrel disp32 doubled (target base re-added) ->
+    #      string leas pointed into the symtab region.
+    #   c) section-based UNSIGNED quads got the target section base added on
+    #      top of the object-space address already stored in the content.
+    # Validate every applied reloc against the target range it must land in.
+    print("12. applied kext relocations (prelink semantics)")
+    RT_UNSIGNED, RT_GOT_LOAD, RT_GOT, RT_SUBTRACTOR = 0, 3, 4, 5
+
+    for ent in (arr or []):
+        bid = ent.get("CFBundleIdentifier", "?")
+        load_va = ent.get("_PrelinkExecutableLoadAddr")
+        foff = ent.get("_PrelinkExecutableFileOffset")
+        if load_va is None or foff is None:
+            continue
+        magic, _, _, kft, kncmds, _, _, _ = \
+            struct.unpack_from("<IiiIIIII", kc["data"], foff)
+        if kft != 1:
+            continue  # semantics below are for the MH_OBJECT pipeline
+        # parse the embedded object: sections, symtab, relocations
+        off = foff + 32
+        ksects = []
+        ksymtab = None
+        for _ in range(kncmds):
+            cmd, cmdsize = struct.unpack_from("<II", kc["data"], off)
+            if cmd == LC_SEGMENT_64:
+                nsects = struct.unpack_from("<I", kc["data"], off + 64)[0]
+                so = off + 72
+                for _i in range(nsects):
+                    sname = kc["data"][so:so+16].split(b"\0")[0].decode()
+                    seg = kc["data"][so+16:so+32].split(b"\0")[0].decode()
+                    addr, size, secoff, _align, reloff, nreloc, _sfl = \
+                        struct.unpack_from("<QQIIIII", kc["data"], so + 32)
+                    ksects.append(dict(seg=seg, name=sname, addr=addr, size=size,
+                                       off=secoff, reloff=reloff, nreloc=nreloc))
+                    so += 80
+            elif cmd == LC_SYMTAB:
+                ksymtab = struct.unpack_from("<IIII", kc["data"], off + 8)
+            off += cmdsize
+        check(ksymtab is not None, f"{bid}: embedded symtab present")
+        if ksymtab is None:
+            continue
+        ksymoff, knsyms, kstroff, _ = ksymtab
+
+        n_bad = 0
+        n_checked = 0
+        IMG_BASE = foff  # embedded object offsets are relative to the image
+        for s in ksects:
+            for ri in range(s["nreloc"]):
+                r_address, bits = struct.unpack_from(
+                    "<iI", kc["data"], IMG_BASE + s["reloff"] + ri*8)
+                r_symbolnum = bits & 0xFFFFFF
+                r_pcrel = (bits >> 24) & 1
+                r_length = (bits >> 25) & 3
+                r_extern = (bits >> 27) & 1
+                r_type = (bits >> 28) & 0xF
+                if r_length == 3 and r_type == RT_SUBTRACTOR:
+                    # consume the paired UNSIGNED too
+                    skip_next = True
+                    continue
+                if r_length != 2:
+                    continue
+                loc = IMG_BASE + s["off"] + r_address
+                disp = struct.unpack_from("<i", kc["data"], loc)[0]
+                nxt = s["addr"] + r_address + 4  # patched runtime next-insn
+                if r_type in (RT_GOT_LOAD, RT_GOT):
+                    # must have been converted mov->lea: opcode 8B -> 8D
+                    op = kc["data"][loc - 2]
+                    rex = kc["data"][loc - 3]
+                    modrm = kc["data"][loc - 1]
+                    is_lea = (op == 0x8D and (rex & 0xF0) == 0x40
+                              and (modrm & 0xC7) == 0x05)
+                    n_checked += 1
+                    if not is_lea:
+                        n_bad += 1
+                        print(f"       {bid}: GOT site {s['name']}+0x{r_address:x} "
+                              f"still mov (op={op:#x}) - postModLoad GP fault bug")
+                    continue
+                if r_extern:
+                    # pcrel extern: target must be a canonical kernel/kext VA
+                    tgt = nxt + disp
+                    n_checked += 1
+                    if not (0xFFFFFF8000000000 <= tgt < 0xFFFFFF8040000000):
+                        n_bad += 1
+                        print(f"       {bid}: extern pcrel {s['name']}+0x{r_address:x} "
+                              f"-> non-canonical {tgt:#x}")
+                    continue
+                # section-based: target must land inside the target section
+                if r_symbolnum < 1 or r_symbolnum > len(ksects):
+                    n_bad += 1
+                    continue
+                t = ksects[r_symbolnum - 1]
+                if r_pcrel:
+                    tgt = nxt + disp
+                else:
+                    continue  # absolute section refs validated below (quad)
+                n_checked += 1
+                if not (t["addr"] <= tgt < t["addr"] + t["size"]):
+                    n_bad += 1
+                    print(f"       {bid}: section pcrel {s['name']}+0x{r_address:x} "
+                          f"-> {tgt:#x} outside {t['name']} "
+                          f"[{t['addr']:#x},{t['addr']+t['size']:#x})")
+            # second pass for quad section-absolute entries
+            for ri in range(s["nreloc"]):
+                r_address, bits = struct.unpack_from(
+                    "<iI", kc["data"], IMG_BASE + s["reloff"] + ri*8)
+                r_symbolnum = bits & 0xFFFFFF
+                r_length = (bits >> 25) & 3
+                r_extern = (bits >> 27) & 1
+                r_type = (bits >> 28) & 0xF
+                if r_extern or r_length != 3 or r_type != RT_UNSIGNED:
+                    continue
+                if r_symbolnum < 1 or r_symbolnum > len(ksects):
+                    n_bad += 1
+                    continue
+                t = ksects[r_symbolnum - 1]
+                loc = IMG_BASE + s["off"] + r_address
+                val = struct.unpack_from("<Q", kc["data"], loc)[0]
+                n_checked += 1
+                if not (t["addr"] <= val < t["addr"] + t["size"]):
+                    n_bad += 1
+                    print(f"       {bid}: section abs {s['name']}+0x{r_address:x} "
+                          f"-> {val:#x} outside {t['name']} "
+                          f"[{t['addr']:#x},{t['addr']+t['size']:#x})")
+        check(n_bad == 0,
+              f"{bid}: {n_checked} applied relocations semantically valid "
+              f"({n_bad} bad)")
+
 else:
     print("10. prelink pipeline: skipped (kernel-only KC)")
     print("11. IOKit personalities: skipped (kernel-only KC)")
