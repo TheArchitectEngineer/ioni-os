@@ -216,13 +216,18 @@ com_ioni_virtio_9p::start(IOService * provider)
          * full-stack callout threads where blocking is safe. The call
          * object is intentionally not freed for this bringup stage. */
         thread_call_t tc = thread_call_allocate(
-            (thread_call_func_t)&com_ioni_virtio_9p::negotiationThread, (thread_call_param_t)this);
-        if (tc != NULL && thread_call_enter(tc)) {
-        	IOLog("com.ioni.virtio.9p: negotiation thread scheduled on callout thread\n");
-        } else {
-        	IOLog("com.ioni.virtio.9p: thread_call failed, running inline\n");
-        	this->runNegotiation();
-        }
+	    (thread_call_func_t)&com_ioni_virtio_9p::negotiationThread, (thread_call_param_t)this);
+	if (tc == NULL) {
+		IOLog("com.ioni.virtio.9p: thread_call_allocate failed - negotiation skipped
+");
+		return true;
+	}
+	/* thread_call_enter() returns FALSE when the call was already
+	 * scheduled - and on a 1-CPU TCG guest the callout thread can pick
+	 * the work up immediately; DO NOT fall back to an inline run, a
+	 * second execution re-posts buffers and corrupts the virtqueue
+	 * (boot 40029052724). */
+	(void)thread_call_enter(tc);
         return true;
 }
 
