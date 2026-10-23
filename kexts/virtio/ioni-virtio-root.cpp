@@ -178,6 +178,16 @@ com_ioni_virtio_root::bringUpVirtioDevice(uint8_t bus, uint8_t dev,
                 shim->release();
                 return false;
         }
+        /* IOService::open() refuses inactive services (kIOReturnNotActive)
+         * and the upstream transport opens its PCI provider from ::start -
+         * run the standard start path on the shim nub so it becomes active
+         * (manual attach+start is the normal IOKit pattern for nubs created
+         * outside the catalogue; no personalities match IOPCIDevice yet). */
+        if (!shim->start(this)) {
+                IOLog("com.ioni.virtio: shim start failed for 0/%u/0\n", dev);
+                shim->release();
+                return false;
+        }
 
         uint16_t virtio_type = shim->configRead16(kIOPCIConfigSubSystemID);
         bool type_we_drive = false;
