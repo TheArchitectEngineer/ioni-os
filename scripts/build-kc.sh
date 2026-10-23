@@ -85,6 +85,11 @@ auto)
     # against the exported kernel headers (hdrs CI job). Its OSMetaClass
     # registration runs from __mod_init_func when the kernel starts the
     # prelinked kext on personality match (IOCatalogue::isModuleLoaded).
+    # -fno-zero-initialized-in-bss: the MH_OBJECT-as-binary pipeline has no
+    # zero-fill representation - __common/__bss sections carry no file bytes,
+    # so link_kext translates their symbols to the image start (offset 0) and
+    # e.g. com_ioni_hello::gMetaClass lands ON the mach header (run
+    # 39952354928: postModLoad GP fault, ctor overwrote the header).
     # Undefined externals (IOService/OSMetaClass/IOLog) resolve against the
     # kernel symbol table at prelink time, same MH_OBJECT pipeline as
     # ioni-bringup.
@@ -103,6 +108,7 @@ auto)
             -std=gnu++2b -fsized-deallocation -fapple-kext \
             -fno-exceptions -fno-c++-static-destructors \
             -fno-builtin -fno-common -fsigned-bitfields \
+            -fno-zero-initialized-in-bss \
             -nostdlibinc -mkernel -msoft-float \
             -fno-pic -fno-stack-protector \
             -fno-asynchronous-unwind-tables \

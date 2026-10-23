@@ -18,6 +18,10 @@ Usage: kext_normalize_object.py <mach-o-object-path>
 import struct
 import sys
 
+S_ZEROFILL = 0x1          # section flag: zero fill on demand (__bss/__common)
+S_GB_ZEROFILL = 0xC       # -segprot style GB zerofill
+S_THREAD_LOCAL_ZEROFILL = 0x12
+
 path = sys.argv[1]
 data = bytearray(open(path, "rb").read())
 ncmds = struct.unpack_from("<I", data, 16)[0]
@@ -26,7 +30,21 @@ patched = 0
 for _ in range(ncmds):
     cmd, cmdsize = struct.unpack_from("<II", data, off)
     if cmd == 0x19:  # LC_SEGMENT_64: vmaddr@24, vmsize@32, fileoff@40,
-                     # filesize@48
+                     # filesize@48; nsects@64; section_64 @72, 80 bytes each
+        nsects = struct.unpack_from("<I", data, off + 64)[0]
+        for i in range(nsects):
+            so = off + 72 + i * 80
+            sectname = bytes(data[so:so+16]).rstrip(b"\0").decode(errors="replace")
+            segname = bytes(data[so+16:so+32]).rstrip(b"\0").decode(errors="replace")
+            flags = struct.unpack_from("<I", data, so + 64)[0]
+            if flags & 0x1 or flags in (S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL):
+                sys.exit(
+                    f"kext_normalize_object: {path}: section {segname},{sectname} "
+                    f"is zero-fill (flags {flags:#x}) - the MH_OBJECT-as-binary "
+                    f"pipeline has no BSS representation; compile the kext with "
+                    f"-fno-zero-initialized-in-bss (run 39952354928: __common "
+                    f"symbol translated to the image start, ctor overwrote the "
+                    f"mach header, postModLoad GP fault)")
         fileoff, filesize = struct.unpack_from("<QQ", data, off + 40)
         struct.pack_into("<Q", data, off + 24, 0)          # vmaddr
         struct.pack_into("<Q", data, off + 32, len(data))  # vmsize
