@@ -18,6 +18,7 @@
 #define IONI_SHIM_IOPCIDEVICE_H
 
 #include <IOKit/IOService.h>
+#include <IOKit/IOInterrupts.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -80,10 +81,10 @@ public:
 
         virtual bool handleOpen(IOService* forClient, IOOptionBits options,
             void* arg) APPLE_KEXT_OVERRIDE;
-        virtual void handleClose(IOService* forClient, IOOptionBits options,
-            void* arg) APPLE_KEXT_OVERRIDE;
-        virtual bool isOpen(IOService* forClient = NULL,
-            IOOptionBits options = 0) const APPLE_KEXT_OVERRIDE;
+virtual void handleClose(IOService* forClient,
+	    IOOptionBits options) APPLE_KEXT_OVERRIDE;
+virtual bool isOpen(const IOService* forClient = NULL) const
+	    APPLE_KEXT_OVERRIDE;
 
         /* Config space. */
         uint8_t  configRead8(uint32_t offset);
