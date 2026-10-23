@@ -42,10 +42,43 @@ $CC_BIN $KCFLAGS \
 # --- 2. assemble the kernel collection --------------------------------------
 # Kernel-only KC is explicitly supported by kc-builder for bring-up
 # validation ("A kernel-only KC (nlinked == 0) is allowed").
+# Round 2: default pipeline is kernel + the synthetic bring-up kext, which
+# exercises the full prelink path (relocs, __PRELINK_TEXT, kmod_info).
+# IONI_KC_KEXTS: unset/"auto" = stage kexts/ioni-bringup; "" = kernel-only;
+# anything else = explicit .kext dirs used as-is.
 KEXT_ARGS=""
-for k in ${IONI_KC_KEXTS:-}; do
-    KEXT_ARGS="$KEXT_ARGS -kext $k"
-done
+# ${VAR-auto} (no colon): empty-but-set means kernel-only, unset means auto
+case "${IONI_KC_KEXTS-auto}" in
+auto)
+    KEXT_STAGE="BUILD/kexts/ioni-bringup.kext"
+    echo "build-kc: staging bring-up kext -> $KEXT_STAGE"
+    mkdir -p "$KEXT_STAGE/Contents/MacOS"
+    cp kexts/ioni-bringup/Info.plist "$KEXT_STAGE/Contents/Info.plist"
+    # -fno-pic: kexts are linked at a fixed prelink address, not position
+    # independent. -fno-asynchronous-unwind-tables keeps the image lean.
+    clang -c -arch x86_64 -O2 -ffreestanding -fno-pic -fno-stack-protector \
+        -fno-asynchronous-unwind-tables -Wno-unused-parameter \
+        kexts/ioni-bringup/ioni-bringup.c -o "$KEXT_STAGE/ioni-bringup.o"
+    # ld -bundle -static: MH_BUNDLE with real segments (vmsize > 0), which
+    # patch_kmod_info requires; kc-tools converts MH_BUNDLE -> MH_KEXT_BUNDLE.
+    # -U keeps the kernel externs undefined in the binary so link_kext
+    # resolves them against the kernel symtab.
+    ld -arch x86_64 -bundle -static \
+        -U _panic -U _kernel_debug_string -U _current_thread \
+        -o "$KEXT_STAGE/Contents/MacOS/ioni-bringup" \
+        "$KEXT_STAGE/ioni-bringup.o"
+    rm -f "$KEXT_STAGE/ioni-bringup.o"
+    KEXT_ARGS="-kext $KEXT_STAGE"
+    ;;
+"")
+    echo "build-kc: IONI_KC_KEXTS empty - kernel-only KC"
+    ;;
+*)
+    for k in $IONI_KC_KEXTS; do
+        KEXT_ARGS="$KEXT_ARGS -kext $k"
+    done
+    ;;
+esac
 [ -n "$KEXT_ARGS" ] && echo "build-kc: kexts:$KEXT_ARGS"
 echo "build-kc: kc-builder -kernel $KERNEL -> $OUT"
 KC_LOG="$OUT.log"
