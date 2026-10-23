@@ -103,16 +103,15 @@ bool IOPCIDevice::handleOpen(IOService* forClient, IOOptionBits options,
         return true;
 }
 
-void IOPCIDevice::handleClose(IOService* forClient, IOOptionBits options,
-    void* arg)
+void IOPCIDevice::handleClose(IOService* forClient, IOOptionBits options)
 {
-        (void)forClient; (void)options; (void)arg;
+	(void)forClient; (void)options;
 }
 
-bool IOPCIDevice::isOpen(IOService* forClient, IOOptionBits options) const
+bool IOPCIDevice::isOpen(const IOService* forClient) const
 {
-        (void)forClient; (void)options;
-        return true;
+	(void)forClient;
+	return true;
 }
 
 uint8_t IOPCIDevice::configRead8(uint32_t offset)
