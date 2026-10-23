@@ -3,11 +3,12 @@
 #include <libkern/section_keywords.h>
 #include <kern/startup.h>
 #include <machine/machine_routines.h>
-#ifdef __arm64__
-/* arm64's machine/machine_routines.h does not carry the ml_get_timebase
- * prototype - it lives in arm/machine_routines.h (x86_64 gets it from
- * i386/machine_routines.h via the machine/ indirection). */
-#include <arm/machine_routines.h>
+#if defined(__arm64__) || defined(__aarch64__)
+/* The EXPORTED arm/machine_routines.h carries only the KPI subset and does
+ * not declare ml_get_timebase (x86_64 gets it from i386/machine_routines.h
+ * via the machine/ indirection). The symbol is a kernel-internal export on
+ * both architectures - declare the prototype directly. */
+uint64_t ml_get_timebase(void);
 #endif
 #include <prng/random.h>
 #include <sys/random.h>
