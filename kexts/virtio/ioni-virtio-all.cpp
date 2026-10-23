@@ -36,6 +36,7 @@ extern "C" int snprintf(char *str, size_t size, const char *fmt, ...);
 
 #include "vendored/genccont/slist_queue.h"
 #include "vendored/genccont/slist_queue.c"
+#include "vendored/genccont/slist.c"
 
 #include "vendored/SSDCMultiSubrangeMemoryDescriptor.h"
 
