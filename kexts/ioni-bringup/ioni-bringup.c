@@ -28,18 +28,18 @@
 #pragma pack(push, 4)
 struct kmod_reference;
 struct kmod_info {
-	struct kmod_info      *next;
-	int32_t                info_version;
-	uint32_t               id;
-	char                   name[64];
-	char                   version[64];
-	int32_t                reference_count;
-	struct kmod_reference *reference_list;
-	uint64_t               address;   /* vm_address_t */
-	uint64_t               size;      /* vm_size_t    */
-	uint64_t               hdr_size;
-	int                  (*start)(struct kmod_info *ki, void *data);
-	int                  (*stop)(struct kmod_info *ki, void *data);
+        struct kmod_info      *next;
+        int32_t                info_version;
+        uint32_t               id;
+        char                   name[64];
+        char                   version[64];
+        int32_t                reference_count;
+        struct kmod_reference *reference_list;
+        uint64_t               address;   /* vm_address_t */
+        uint64_t               size;      /* vm_size_t    */
+        uint64_t               hdr_size;
+        int                  (*start)(struct kmod_info *ki, void *data);
+        int                  (*stop)(struct kmod_info *ki, void *data);
 };
 #pragma pack(pop)
 
@@ -63,23 +63,23 @@ extern void *_current_thread(void);
 static int
 ioni_bringup_start(struct kmod_info *ki, void *data)
 {
-	(void)ki;
-	(void)data;
-	return KERN_SUCCESS;
+        (void)ki;
+        (void)data;
+        return KERN_SUCCESS;
 }
 
 static int
 ioni_bringup_stop(struct kmod_info *ki, void *data)
 {
-	(void)ki;
-	(void)data;
-	return KERN_SUCCESS;
+        (void)ki;
+        (void)data;
+        return KERN_SUCCESS;
 }
 
 /* X86_64_RELOC_UNSIGNED against undefined kernel symbols. */
 void *ioni_bringup_kernel_addrs[] = {
-	(void *)&_panic,
-	(void *)&_current_thread,
+        (void *)&_panic,
+        (void *)&_current_thread,
 };
 
 /* X86_64_RELOC_BRANCH against an undefined kernel symbol. Never executed. */
@@ -87,37 +87,42 @@ __attribute__((used))
 void
 ioni_bringup_probe(void)
 {
-	_kernel_debug_string("com.ioni.bringup probe");
+        _kernel_debug_string("com.ioni.bringup probe");
 }
 
 /* X86_64_RELOC_UNSIGNED against local defined symbols. */
 int (*ioni_bringup_hooks[2])(struct kmod_info *, void *) = {
-	ioni_bringup_start,
-	ioni_bringup_stop,
+        ioni_bringup_start,
+        ioni_bringup_stop,
 };
 
 /* Markers in distinct sections force a SUBTRACTOR/UNSIGNED reloc pair for
- * the address difference (clang cannot constant-fold across sections). */
+ * the address difference: a C static initializer cannot express it (not a
+ * compile-time constant), but the mach-o assembler emits the reloc pair
+ * for a symbol-difference .quad directly. */
 __attribute__((used, section("__TEXT,__span_a")))
 char ioni_bringup_span_a;
 __attribute__((used, section("__DATA,__span_b")))
 char ioni_bringup_span_b;
-__attribute__((used))
-unsigned long ioni_bringup_span =
-    (unsigned long)(&ioni_bringup_span_b - &ioni_bringup_span_a);
+__asm__(
+        ".section __DATA,__spanq\n"
+        ".globl _ioni_bringup_spanq\n"
+        "_ioni_bringup_spanq:\n"
+        ".quad _ioni_bringup_span_b - _ioni_bringup_span_a\n"
+);
 
 /* The symbol the whole pipeline keys on: must be DEFINED here. */
 struct kmod_info ioni_bringup_kmod_info = {
-	.next = NULL,
-	.info_version = 1,
-	.id = 0,
-	.name = "com.ioni.bringup",
-	.version = "1.0",
-	.reference_count = 0,
-	.reference_list = NULL,
-	.address = 0,
-	.size = 0,
-	.hdr_size = 0,
-	.start = ioni_bringup_start,
-	.stop = ioni_bringup_stop,
+        .next = NULL,
+        .info_version = 1,
+        .id = 0,
+        .name = "com.ioni.bringup",
+        .version = "1.0",
+        .reference_count = 0,
+        .reference_list = NULL,
+        .address = 0,
+        .size = 0,
+        .hdr_size = 0,
+        .start = ioni_bringup_start,
+        .stop = ioni_bringup_stop,
 };
