@@ -59,18 +59,32 @@ auto)
     clang -c -arch x86_64 -O2 -ffreestanding -fno-pic -fno-stack-protector \
         -fno-asynchronous-unwind-tables -Wno-unused-parameter \
         kexts/ioni-bringup/ioni-bringup.c -o "$KEXT_STAGE/ioni-bringup.o"
-    # ld -bundle -static: MH_BUNDLE with real segments (vmsize > 0), which
-    # patch_kmod_info requires; kc-tools converts MH_BUNDLE -> MH_KEXT_BUNDLE.
-    # -U keeps the kernel externs (macho names!) undefined in the binary so
-    # link_kext resolves them against the kernel symtab. -static -bundle
-    # requires an entry symbol: point it at the module's own start routine
-    # ("start" is implicit otherwise and can't be -U'd).
-    ld -arch x86_64 -bundle -static -e _ioni_bringup_start \
-        -U _panic -U _current_thread -U _kernel_debug_string \
-        -o "$KEXT_STAGE/Contents/MacOS/ioni-bringup" \
-        "$KEXT_STAGE/ioni-bringup.o"
-    rm -f "$KEXT_STAGE/ioni-bringup.o"
+    # Use the relocatable object DIRECTLY - no ld. link_kext needs the
+    # classic relocations referencing undefined kernel symbols, which
+    # macos-26's dyld ld does not preserve in static bundles (-U/-e flag
+    # roulette proved it). MH_OBJECT has a single prototype segment with
+    # vmsize=0; patch_kmod_info requires a nonzero image extent, so set
+    # vmsize = filesize on that one segment (same layout the byte-exact
+    # local test vector validates).
+    python3 - "$KEXT_STAGE/Contents/MacOS/ioni-bringup" << 'PYEOF'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+ncmds = struct.unpack_from("<I", data, 16)[0]
+off = 32
+patched = 0
+for _ in range(ncmds):
+    cmd, cmdsize = struct.unpack_from("<II", data, off)
+    if cmd == 0x19:  # LC_SEGMENT_64: vmaddr@24, vmsize@32
+        struct.pack_into("<Q", data, off + 32, len(data))
+        patched += 1
+    off += cmdsize
+assert patched == 1, f"expected 1 segment, patched {patched}"
+open(path, "wb").write(data)
+print(f"kext: prototype segment vmsize -> {len(data):#x}")
+PYEOF
     KEXT_ARGS="-kext $KEXT_STAGE"
+    rm -f "$KEXT_STAGE/ioni-bringup.o"
     ;;
 "")
     echo "build-kc: IONI_KC_KEXTS empty - kernel-only KC"
