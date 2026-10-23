@@ -51,6 +51,8 @@ enum {
 #define kIOPCIVendorSpecificCapability 0x09
 #define kIOPCIMSIXCapability           0x11
 #define kIOPCIMSICapability            0x05
+/* IOPCIFamily: interrupt-type flag for message-signaled interrupts. */
+#define kIOInterruptTypePCIMessaged    0x00000004
 
 class IOPCIDevice : public IOService {
         OSDeclareDefaultStructors(IOPCIDevice);
