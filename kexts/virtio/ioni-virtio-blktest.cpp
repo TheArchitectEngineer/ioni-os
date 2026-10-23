@@ -154,6 +154,7 @@ com_ioni_virtio_blktest::runReadTest(void)
         IOLog("com.ioni.virtio.blk: VIRTIO_BLK_T_IN sector 0 submitted\n");
 
         for (unsigned ms = 0; ms < POLL_MS; ms += 10) {
+                IOLog("com.ioni.virtio.blk: poll iter ms=%u\n", ms);
                 if (virtio->pollCompletedRequestsInVirtqueue(BLK_QUEUE, 1) > 0)
                         break;
                 IOSleep(10);
@@ -165,9 +166,10 @@ void
 com_ioni_virtio_blktest::readThread(void* param0, void* param1)
 {
 	com_ioni_virtio_blktest* self = (com_ioni_virtio_blktest*)param0;
+        IOLog("com.ioni.virtio.blk: callout enter\n");
         self->runReadTest();
         /* thread_call callouts just return; the callout thread keeps going. */
-        IOLog("com.ioni.virtio.blk: read thread exiting\n");
+        IOLog("com.ioni.virtio.blk: callout exit (read test done)\n");
 }
 
 bool

@@ -154,6 +154,7 @@ com_ioni_virtio_9p::runNegotiation(void)
             NINEP_MSIZE);
 
         for (unsigned ms = 0; ms < POLL_MS; ms += 10) {
+                IOLog("com.ioni.virtio.9p: poll iter ms=%u\n", ms);
                 if (virtio->pollCompletedRequestsInVirtqueue(NINEP_QUEUE, 4) > 0)
                         break;
                 IOSleep(10);
@@ -165,9 +166,10 @@ void
 com_ioni_virtio_9p::negotiationThread(void* param0, void* param1)
 {
 	com_ioni_virtio_9p* self = (com_ioni_virtio_9p*)param0;
+        IOLog("com.ioni.virtio.9p: callout enter\n");
         self->runNegotiation();
         /* thread_call callouts just return; the callout thread keeps going. */
-        IOLog("com.ioni.virtio.9p: negotiation thread exiting\n");
+        IOLog("com.ioni.virtio.9p: callout exit (negotiation done)\n");
 }
 
 bool
