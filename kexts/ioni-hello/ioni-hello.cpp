@@ -28,40 +28,23 @@
  */
 
 #include <stdint.h>
+#include <mach/kmod.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 
 /*
- * kmod_info_t ABI (osfmk/mach/kmod.h is #pragma pack(4)). The prelink
- * pipeline keys on the literal _kmod_info symbol: kc-tools' patch_kmod_info
- * writes address/size at the pack(4) offsets and the kernel's register_kmod
- * stamps id/reference_count/name on load.
+ * kmod_info_t comes from <mach/kmod.h> (pack(4) ABI). The prelink pipeline
+ * keys on the literal _kmod_info symbol: kc-tools' patch_kmod_info writes
+ * address/size at the pack(4) offsets and the kernel's register_kmod stamps
+ * id/reference_count/name on load.
  */
-#pragma pack(push, 4)
-struct kmod_reference;
-struct kmod_info {
-        struct kmod_info      *next;
-        int32_t                info_version;
-        uint32_t               id;
-        char                   name[64];
-        char                   version[64];
-        int32_t                reference_count;
-        struct kmod_reference *reference_list;
-        uint64_t               address;   /* vm_address_t */
-        uint64_t               size;      /* vm_size_t    */
-        uint64_t               hdr_size;
-        int                  (*start)(struct kmod_info *ki, void *data);
-        int                  (*stop)(struct kmod_info *ki, void *data);
-};
-#pragma pack(pop)
-
-_Static_assert(__builtin_offsetof(struct kmod_info, address) == 156,
+_Static_assert(__builtin_offsetof(kmod_info_t, address) == 156,
     "kmod_info pack(4) ABI");
-_Static_assert(__builtin_offsetof(struct kmod_info, start) == 180,
+_Static_assert(__builtin_offsetof(kmod_info_t, start) == 180,
     "kmod_info pack(4) ABI");
 
-static int ioni_hello_kmod_start(struct kmod_info *ki, void *data);
-static int ioni_hello_kmod_stop(struct kmod_info *ki, void *data);
+static kern_return_t ioni_hello_kmod_start(kmod_info_t *ki, void *data);
+static kern_return_t ioni_hello_kmod_stop(kmod_info_t *ki, void *data);
 
 struct kmod_info kmod_info = {
         .next = NULL,

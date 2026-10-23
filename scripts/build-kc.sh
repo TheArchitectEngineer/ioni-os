@@ -88,6 +88,10 @@ auto)
     # Undefined externals (IOService/OSMetaClass/IOLog) resolve against the
     # kernel symbol table at prelink time, same MH_OBJECT pipeline as
     # ioni-bringup.
+    # -DKERNEL_PRIVATE mirrors the kernel's own DEFINES: the exported
+    # kern/thread.h -> mach_types.h -> memory_object_types.h chain declares
+    # vm_object_t only under KERNEL_PRIVATE, so a kext built with plain
+    # -DKERNEL cannot reach IOService.h.
     EXP_HDRS="${IONI_EXP_HDRS-BUILD/obj/EXPORT_HDRS}"
     if [ -d "$EXP_HDRS/iokit" ]; then
         HELLO_STAGE="BUILD/kexts/ioni-hello.kext"
@@ -101,7 +105,7 @@ auto)
             -nostdlibinc -mkernel -msoft-float \
             -fno-pic -fno-stack-protector \
             -fno-asynchronous-unwind-tables \
-            -DAPPLE -DKERNEL -DPRIVATE -D__MACHO__=1 \
+            -DAPPLE -DKERNEL -DKERNEL_PRIVATE -DPRIVATE -D__MACHO__=1 \
             -Dx86_64 -DX86_64 -D__X86_64__ -DLP64 -DPAGE_SIZE_FIXED \
             -Wno-unused-parameter \
             -I"$EXP_HDRS/iokit" -I"$EXP_HDRS/libkern" -I"$EXP_HDRS/osfmk" \
