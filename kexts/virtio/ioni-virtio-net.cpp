@@ -191,6 +191,7 @@ com_ioni_virtio_net::runDatapathTest(void)
 	 * in an RX buffer and is logged from completionAction. */
 	unsigned rx_done = 0, tx_done = 0;
 	for (unsigned ms = 0; ms < RX_POLL_MS; ms += 10) {
+		IOLog("com.ioni.virtio.net: poll iter ms=%u tx=%u rx=%u\n", ms, tx_done, rx_done);
 		if (tx_done == 0)
 			tx_done += virtio->pollCompletedRequestsInVirtqueue(NET_TX_QUEUE, 1);
 		unsigned got = virtio->pollCompletedRequestsInVirtqueue(NET_RX_QUEUE, RX_BUFFERS);
@@ -212,9 +213,10 @@ void
 com_ioni_virtio_net::datapathThread(void* param0, void* param1)
 {
 	com_ioni_virtio_net* self = (com_ioni_virtio_net*)param0;
+	IOLog("com.ioni.virtio.net: callout enter\n");
 	self->runDatapathTest();
 	/* thread_call callouts just return; the callout thread keeps going. */
-	IOLog("com.ioni.virtio.net: datapath thread exiting\n");
+	IOLog("com.ioni.virtio.net: callout exit (datapath test done)\n");
 }
 
 bool
