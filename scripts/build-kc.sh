@@ -56,9 +56,11 @@ auto)
     cp kexts/ioni-bringup/Info.plist "$KEXT_STAGE/Contents/Info.plist"
     # -fno-pic: kexts are linked at a fixed prelink address, not position
     # independent. -fno-asynchronous-unwind-tables keeps the image lean.
+    # The object file IS the final kext binary (see below).
     clang -c -arch x86_64 -O2 -ffreestanding -fno-pic -fno-stack-protector \
         -fno-asynchronous-unwind-tables -Wno-unused-parameter \
-        kexts/ioni-bringup/ioni-bringup.c -o "$KEXT_STAGE/ioni-bringup.o"
+        kexts/ioni-bringup/ioni-bringup.c \
+        -o "$KEXT_STAGE/Contents/MacOS/ioni-bringup"
     # Use the relocatable object DIRECTLY - no ld. link_kext needs the
     # classic relocations referencing undefined kernel symbols, which
     # macos-26's dyld ld does not preserve in static bundles (-U/-e flag
@@ -84,7 +86,6 @@ open(path, "wb").write(data)
 print(f"kext: prototype segment vmsize -> {len(data):#x}")
 PYEOF
     KEXT_ARGS="-kext $KEXT_STAGE"
-    rm -f "$KEXT_STAGE/ioni-bringup.o"
     ;;
 "")
     echo "build-kc: IONI_KC_KEXTS empty - kernel-only KC"
