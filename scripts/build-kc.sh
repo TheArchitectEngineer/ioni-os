@@ -64,10 +64,15 @@ auto)
     # Use the relocatable object DIRECTLY - no ld. link_kext needs the
     # classic relocations referencing undefined kernel symbols, which
     # macos-26's dyld ld does not preserve in static bundles (-U/-e flag
-    # roulette proved it). MH_OBJECT has a single prototype segment with
-    # vmsize=0; patch_kmod_info requires a nonzero image extent, so set
-    # vmsize = filesize on that one segment (same layout the byte-exact
-    # local test vector validates).
+    # roulette proved it).
+    # MH_OBJECT normalization for kc-tools: modern clang puts the prototype
+    # segment's fileoff at the content base (e.g. 0x2c8) with vmaddr=0.
+    # relayout_va_consistent requires fileoff == vmaddr - image_start, which
+    # for a single-segment image means fileoff == 0 - otherwise it moves the
+    # segment data over the mach header and the re-view fails. Normalizing
+    # fileoff/vmaddr to 0 is safe: section offsets are absolute file offsets
+    # and stay valid, symbol n_values share the same space, and the segment
+    # data is not actually moved.
     python3 - "$KEXT_STAGE/Contents/MacOS/ioni-bringup" << 'PYEOF'
 import struct, sys
 path = sys.argv[1]
@@ -77,13 +82,19 @@ off = 32
 patched = 0
 for _ in range(ncmds):
     cmd, cmdsize = struct.unpack_from("<II", data, off)
-    if cmd == 0x19:  # LC_SEGMENT_64: vmaddr@24, vmsize@32
-        struct.pack_into("<Q", data, off + 32, len(data))
+    if cmd == 0x19:  # LC_SEGMENT_64: vmaddr@24, vmsize@32, fileoff@40,
+                     # filesize@48
+        fileoff, filesize = struct.unpack_from("<QQ", data, off + 40)
+        struct.pack_into("<Q", data, off + 24, 0)          # vmaddr
+        struct.pack_into("<Q", data, off + 32, len(data))  # vmsize
+        struct.pack_into("<Q", data, off + 40, 0)          # fileoff
+        struct.pack_into("<Q", data, off + 48, len(data))  # filesize
+        print(f"kext: prototype segment normalized: fileoff {fileoff:#x} -> 0, "
+              f"vmsize {filesize:#x} -> {len(data):#x}")
         patched += 1
     off += cmdsize
 assert patched == 1, f"expected 1 segment, patched {patched}"
 open(path, "wb").write(data)
-print(f"kext: prototype segment vmsize -> {len(data):#x}")
 PYEOF
     KEXT_ARGS="-kext $KEXT_STAGE"
     ;;

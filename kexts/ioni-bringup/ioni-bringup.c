@@ -113,8 +113,9 @@ __asm__(
         ".quad _ioni_bringup_span_b - _ioni_bringup_span_a\n"
 );
 
-/* The symbol the whole pipeline keys on: must be DEFINED here. */
-struct kmod_info ioni_bringup_kmod_info = {
+/* The symbol the whole pipeline keys on: kc-tools requires the
+ * literal symbol _kmod_info (C name kmod_info), as in real kexts. */
+struct kmod_info kmod_info = {
         .next = NULL,
         .info_version = 1,
         .id = 0,
