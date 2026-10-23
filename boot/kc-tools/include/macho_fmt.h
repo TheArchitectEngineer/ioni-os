@@ -9,6 +9,7 @@
 #define FAT_CIGAM       0xbebafeca
 
 // File types
+#define MH_OBJECT       0x1
 #define MH_EXECUTE      0x2
 #define MH_DYLIB        0x6
 #define MH_BUNDLE       0x8

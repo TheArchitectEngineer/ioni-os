@@ -953,6 +953,20 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   SegInfo seginfo[32];
   uint32_t nseginfo = 0;
 
+  /* MH_OBJECT section translation. Modern clang objects keep section.addr
+   * in a packed VM space (consecutive from 0) while section.offset is the
+   * real file position of the data - the two differ by a per-section delta.
+   * A symbol's n_value is VM-absolute, but the flat image kc-tools maps
+   * (and the KC copy prelink_assemble writes) is FILE space. So every
+   * MH_OBJECT VA must be translated: file = offset + (n_value - addr).
+   * sect_va[] records the patched (final VA) section base and
+   * sect_vm_addr[] the original VM addr the symbol table still refers to.
+   * For identity-mapped objects (addr == offset) the delta is 0 and this
+   * reduces to load_vmaddr + n_value. */
+  uint64_t sect_va[256];
+  uint64_t sect_vm_addr[256];
+  uint32_t nsect_va = 0;
+
   for (MACHO_EACH_LC(&mv, lcc)) {
     uint8_t *lcp = (uint8_t *)lcc;
     uint32_t cmd = ((const struct load_command *)lcp)->cmd;
@@ -966,7 +980,17 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
         uint8_t *sp = secs + (size_t)j * macho_sect_size(&mv);
         MachoSect sec;
         macho_sect_get(&mv, sp, &sec);
-        macho_sect_set(&mv, sp, sec.addr + load_vmaddr, sec.offset, sec.reloff);
+        /* MH_OBJECT: base sections at their FILE offsets so pc-relative
+         * math and section-reloc targets work in the flat image's space. */
+        uint64_t patched = (mv.filetype == MH_OBJECT)
+                               ? (uint64_t)sec.offset + load_vmaddr
+                               : sec.addr + load_vmaddr;
+        macho_sect_set(&mv, sp, patched, sec.offset, sec.reloff);
+        if (nsect_va < sizeof(sect_va) / sizeof(sect_va[0])) {
+          sect_va[nsect_va] = patched;
+          sect_vm_addr[nsect_va] = sec.addr;
+          nsect_va++;
+        }
       }
       if (nseginfo < 32) {
         seginfo[nseginfo].fileoff = sg.fileoff;
@@ -999,14 +1023,41 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     const MachoSym *n = &sym;
     uint8_t type = n->n_type & 0x0e;
     if (type == N_SECT) {
-      // n_value is the symbol's vmaddr in the *original* (pre-slide) address space.
-      // After the segment patch loop above, section.addr = original + load_vmaddr.
+      // Linked bundles (MH_KEXT_BUNDLE, MH_DYLIB): n_value is the symbol's
+      // vmaddr in the *original* (pre-slide) address space, so the final VA
+      // is load_vmaddr + n_value.
       //
-      // So the symbol's final VA = (n_value - original_seg_vmaddr) + final_seg_vmaddr.
-      // For kexts compiled at vmbase 0 this reduces to load_vmaddr + n_value, which is fine.
-      // But store it as-is and let the write-back be the canonical source
-      macho_sym_set_value(&mv, nl, i, load_vmaddr + n->n_value);
-      sym_addrs[i] = load_vmaddr + n->n_value;
+      // Raw relocatable objects (MH_OBJECT) are different: n_value is
+      // VM-absolute in the object's packed section space, while the flat
+      // image (and everything downstream: relocs, kmod_info, the KC copy)
+      // works in FILE space. Translate through the defining section:
+      //   file = section.offset + (n_value - section.addr)
+      // The section bases above were patched to file-space (load + offset),
+      // so pc-relative and section-target reloc math is uniform here too.
+      if (mv.filetype == MH_OBJECT) {
+        uint64_t base = (n->n_sect >= 1 && n->n_sect <= nsect_va)
+                            ? sect_va[n->n_sect - 1]
+                            : 0;
+        uint64_t orig = (n->n_sect >= 1 && n->n_sect <= nsect_va)
+                            ? sect_vm_addr[n->n_sect - 1]
+                            : 0;
+        if (base && n->n_value >= orig) {
+          sym_addrs[i] = base + (n->n_value - orig);
+        } else {
+          fprintf(stderr,
+              "  link_kext: WARN symbol %u n_sect %u untranslatable "
+              "(n_value 0x%llx < section addr 0x%llx), using load + n_value\n",
+              i, n->n_sect,
+              (unsigned long long)n->n_value,
+              (unsigned long long)orig);
+          sym_addrs[i] = load_vmaddr + n->n_value;
+        }
+      } else {
+        sym_addrs[i] = load_vmaddr + n->n_value;
+      }
+      // write-back: the patched symbol table is the canonical source for
+      // symtab_merge_from_linked and any later consumer
+      macho_sym_set_value(&mv, nl, i, sym_addrs[i]);
     } else if (type == N_ABS) {
       sym_addrs[i] = n->n_value;
     } else if (type == N_UNDF && !(n->n_type & N_STAB)) {

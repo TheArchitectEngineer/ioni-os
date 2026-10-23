@@ -70,9 +70,10 @@ auto)
     # relayout_va_consistent requires fileoff == vmaddr - image_start, which
     # for a single-segment image means fileoff == 0 - otherwise it moves the
     # segment data over the mach header and the re-view fails. Normalizing
-    # fileoff/vmaddr to 0 is safe: section offsets are absolute file offsets
-    # and stay valid, symbol n_values share the same space, and the segment
-    # data is not actually moved.
+    # fileoff/vmaddr to 0 is safe and moves no data: section offset fields
+    # stay absolute and valid. Symbol n_values live in the object's packed
+    # VM space (section.addr, not section.offset) - link_kext translates
+    # them to file space via the defining section when linking MH_OBJECTs.
     python3 - "$KEXT_STAGE/Contents/MacOS/ioni-bringup" << 'PYEOF'
 import struct, sys
 path = sys.argv[1]
