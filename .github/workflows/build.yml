@@ -133,6 +133,14 @@ jobs:
       - name: build kernelcache
         run: ./scripts/build-kc.sh BUILD/obj/RELEASE_X86_64/kernel BUILD/ioni.kc
 
+      - name: upload staged kext (diagnostics)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kc-kext-diagnostics
+          path: BUILD/kexts/
+          if-no-files-found: ignore
+
       - name: upload kernelcache
         uses: actions/upload-artifact@v4
         with:

@@ -406,8 +406,12 @@ static int relayout_va_consistent(uint8_t **bufp, size_t *sizep) {
       image_start = sg.vmaddr;
     if (sg.vmaddr + sg.vmsize > image_end)
       image_end = sg.vmaddr + sg.vmsize;
-    if (sg.filesize > sg.vmsize)
+    if (sg.filesize > sg.vmsize) {
+      fprintf(stderr, "  relayout: seg '%.16s' filesize 0x%llx > vmsize 0x%llx\n",
+          sg.segname, (unsigned long long)sg.filesize,
+          (unsigned long long)sg.vmsize);
       return -1;   /* more file than address space: not something to rewrite */
+    }
   }
 
   if (image_start == UINT64_MAX || image_end <= image_start)
@@ -423,6 +427,10 @@ static int relayout_va_consistent(uint8_t **bufp, size_t *sizep) {
     if (sg.vmsize == 0)
       continue;
     if (sg.fileoff != sg.vmaddr - image_start) {
+      fprintf(stderr,
+          "  relayout: seg '%.16s' fileoff 0x%llx != vmaddr-image_start 0x%llx, relayouting\n",
+          sg.segname, (unsigned long long)sg.fileoff,
+          (unsigned long long)(sg.vmaddr - image_start));
       needs_relayout = true;
       break;
     }
@@ -455,6 +463,7 @@ static int relayout_va_consistent(uint8_t **bufp, size_t *sizep) {
 
     if (sg.filesize != 0) {
       if (sg.fileoff + sg.filesize > *sizep || noff + sg.filesize > new_size) {
+        fprintf(stderr, "  relayout: seg '%.16s' out of bounds\n", sg.segname);
         free(nbuf);
         return -1;
       }
@@ -472,6 +481,7 @@ static int relayout_va_consistent(uint8_t **bufp, size_t *sizep) {
   /* Header and load commands came across with __TEXT; edit them in place. */
   MachoView nv;
   if (macho_view(nbuf, new_size, &nv) != 0) {
+    fprintf(stderr, "  relayout: re-view of relaid image failed\n");
     free(nbuf);
     return -1;
   }
@@ -1407,6 +1417,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   free(sec_refs);
 
   if (relayout_va_consistent(&buf, &sl) != 0) {
+    fprintf(stderr, "  link_kext: relayout_va_consistent failed\n");
     free(buf);
     return -1;
   }
