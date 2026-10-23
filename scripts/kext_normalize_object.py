@@ -18,9 +18,10 @@ Usage: kext_normalize_object.py <mach-o-object-path>
 import struct
 import sys
 
-S_ZEROFILL = 0x1          # section flag: zero fill on demand (__bss/__common)
-S_GB_ZEROFILL = 0xC       # -segprot style GB zerofill
+S_ZEROFILL = 0x1          # section TYPE: zero fill on demand (__bss/__common)
+S_GB_ZEROFILL = 0xC       # GB zerofill type
 S_THREAD_LOCAL_ZEROFILL = 0x12
+SECTION_TYPE_MASK = 0xFF  # flags & SECTION_TYPE yields one of the S_* types
 
 path = sys.argv[1]
 data = bytearray(open(path, "rb").read())
@@ -37,7 +38,8 @@ for _ in range(ncmds):
             sectname = bytes(data[so:so+16]).rstrip(b"\0").decode(errors="replace")
             segname = bytes(data[so+16:so+32]).rstrip(b"\0").decode(errors="replace")
             flags = struct.unpack_from("<I", data, so + 64)[0]
-            if flags & 0x1 or flags in (S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL):
+            stype = flags & SECTION_TYPE_MASK
+            if stype in (S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL):
                 sys.exit(
                     f"kext_normalize_object: {path}: section {segname},{sectname} "
                     f"is zero-fill (flags {flags:#x}) - the MH_OBJECT-as-binary "
