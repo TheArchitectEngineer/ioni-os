@@ -273,7 +273,7 @@ com_ioni_virtio_net::start(IOService * provider)
 		IOLog("com.ioni.virtio.net: datapath thread scheduled on callout thread\n");
 	} else {
 		IOLog("com.ioni.virtio.net: thread_call failed, running inline\n");
-		self->runDatapathTest();
+		this->runDatapathTest();
 	}
 	return true;
 }
