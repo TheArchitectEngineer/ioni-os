@@ -74,30 +74,47 @@ auto)
     # stay absolute and valid. Symbol n_values live in the object's packed
     # VM space (section.addr, not section.offset) - link_kext translates
     # them to file space via the defining section when linking MH_OBJECTs.
-    python3 - "$KEXT_STAGE/Contents/MacOS/ioni-bringup" << 'PYEOF'
-import struct, sys
-path = sys.argv[1]
-data = bytearray(open(path, "rb").read())
-ncmds = struct.unpack_from("<I", data, 16)[0]
-off = 32
-patched = 0
-for _ in range(ncmds):
-    cmd, cmdsize = struct.unpack_from("<II", data, off)
-    if cmd == 0x19:  # LC_SEGMENT_64: vmaddr@24, vmsize@32, fileoff@40,
-                     # filesize@48
-        fileoff, filesize = struct.unpack_from("<QQ", data, off + 40)
-        struct.pack_into("<Q", data, off + 24, 0)          # vmaddr
-        struct.pack_into("<Q", data, off + 32, len(data))  # vmsize
-        struct.pack_into("<Q", data, off + 40, 0)          # fileoff
-        struct.pack_into("<Q", data, off + 48, len(data))  # filesize
-        print(f"kext: prototype segment normalized: fileoff {fileoff:#x} -> 0, "
-              f"vmsize {filesize:#x} -> {len(data):#x}")
-        patched += 1
-    off += cmdsize
-assert patched == 1, f"expected 1 segment, patched {patched}"
-open(path, "wb").write(data)
-PYEOF
+    python3 scripts/kext_normalize_object.py "$KEXT_STAGE/Contents/MacOS/ioni-bringup"
     KEXT_ARGS="-kext $KEXT_STAGE"
+
+    # --- round 3: com.ioni.hello, first real IOKit driver --------------------
+    # Compiled with the kernel's own C++ ABI flags (makedefs MakeInc.def:
+    # CXXFLAGS_GEN -std=gnu++2b -fsized-deallocation + CXXFLAGS_KERNEL
+    # -fapple-kext; CFLAGS_GEN -nostdlibinc -fno-builtin -fno-common
+    # -fno-c++-static-destructors; CFLAGS_X86_64 -mkernel -msoft-float)
+    # against the exported kernel headers (hdrs CI job). Its OSMetaClass
+    # registration runs from __mod_init_func when the kernel starts the
+    # prelinked kext on personality match (IOCatalogue::isModuleLoaded).
+    # Undefined externals (IOService/OSMetaClass/IOLog) resolve against the
+    # kernel symbol table at prelink time, same MH_OBJECT pipeline as
+    # ioni-bringup.
+    EXP_HDRS="${IONI_EXP_HDRS-BUILD/obj/EXPORT_HDRS}"
+    if [ -d "$EXP_HDRS/iokit" ]; then
+        HELLO_STAGE="BUILD/kexts/ioni-hello.kext"
+        echo "build-kc: staging IOKit driver kext -> $HELLO_STAGE"
+        mkdir -p "$HELLO_STAGE/Contents/MacOS"
+        # shellcheck disable=SC2086
+        clang++ -c -arch x86_64 -O2 \
+            -std=gnu++2b -fsized-deallocation -fapple-kext \
+            -fno-exceptions -fno-c++-static-destructors \
+            -fno-builtin -fno-common -fsigned-bitfields \
+            -nostdlibinc -mkernel -msoft-float \
+            -fno-pic -fno-stack-protector \
+            -fno-asynchronous-unwind-tables \
+            -DAPPLE -DKERNEL -DPRIVATE -D__MACHO__=1 \
+            -Dx86_64 -DX86_64 -D__X86_64__ -DLP64 -DPAGE_SIZE_FIXED \
+            -Wno-unused-parameter \
+            -I"$EXP_HDRS/iokit" -I"$EXP_HDRS/libkern" -I"$EXP_HDRS/osfmk" \
+            -I"$EXP_HDRS/bsd" -I"$EXP_HDRS/pexpert" \
+            -IEXTERNAL_HEADERS \
+            kexts/ioni-hello/ioni-hello.cpp \
+            -o "$HELLO_STAGE/Contents/MacOS/ioni-hello"
+        python3 scripts/kext_normalize_object.py \
+            "$HELLO_STAGE/Contents/MacOS/ioni-hello"
+        KEXT_ARGS="$KEXT_ARGS -kext $HELLO_STAGE"
+    else
+        echo "build-kc: WARNING - $EXP_HDRS missing, skipping ioni-hello kext"
+    fi
     ;;
 "")
     echo "build-kc: IONI_KC_KEXTS empty - kernel-only KC"

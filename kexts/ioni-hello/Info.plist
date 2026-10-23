@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>CFBundleIdentifier</key>
+        <string>com.ioni.hello</string>
+        <key>CFBundleName</key>
+        <string>ioni hello</string>
+        <key>CFBundleVersion</key>
+        <string>1.0</string>
+        <key>CFBundleExecutable</key>
+        <string>ioni-hello</string>
+        <key>CFBundlePackageType</key>
+        <string>KEXT</string>
+        <key>OSBundleRequired</key>
+        <string>Root</string>
+        <key>OSBundleLibraries</key>
+        <dict>
+                <!-- The modern kernel registers itself as "__kernel__" (kOSKextKernelIdentifier)
+                     with version = osrelease; the com.apple.kpi.* interface kexts do not exist
+                     in our kc-tools collection, so the kernel itself is the dependency. -->
+                <key>__kernel__</key>
+                <string>1.0</string>
+        </dict>
+        <key>IOKitPersonalities</key>
+        <dict>
+                <key>IoniHello</key>
+                <dict>
+                        <key>CFBundleIdentifier</key>
+                        <string>com.ioni.hello</string>
+                        <key>IOClass</key>
+                        <string>com_ioni_hello</string>
+                        <!-- The platform device nub is named "ACPI" (see IoniACPIPlatform:
+                             "claiming platform \"ACPI\"); same provider class + name match
+                             as the kernel's own platform expert personalities. -->
+                        <key>IOProviderClass</key>
+                        <string>IOPlatformExpertDevice</string>
+                        <key>IONameMatch</key>
+                        <string>ACPI</string>
+                        <key>IOProbeScore</key>
+                        <integer>1</integer>
+                        <!-- Required: without an explicit category the personality joins
+                             "IODefaultMatchCategory", where the platform expert
+                             (IOProbeScore 10000) outcompetes us and IOKit starts only the
+                             best of the category. Own category = own start list. -->
+                        <key>IOMatchCategory</key>
+                        <string>com.ioni.hello</string>
+                </dict>
+        </dict>
+</dict>
+</plist>

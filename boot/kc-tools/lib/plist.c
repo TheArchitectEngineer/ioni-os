@@ -177,6 +177,22 @@ static int skip_tag_rest(P *p) {
   return self_closing;
 }
 
+/* Skip XML comments between structural tokens. parse_dict/parse_array call
+ * this before their gate checks: a `<!-- ... -->` ahead of `<key>` or a
+ * nested node used to break the loop early (dropping everything after it -
+ * e.g. IOKitPersonalities when OSBundleLibraries carried a comment). */
+static void skip_comments(P *p) {
+  while (1) {
+    skip_ws(p);
+    if (p->p + 4 <= p->end && !memcmp(p->p, "<!--", 4)) {
+      p->p += 4;
+      skip_until(p, "-->");
+      continue;
+    }
+    break;
+  }
+}
+
 static char *read_until(P *p, const char *end) {
   const char *s = p->p;
   size_t l = strlen(end);
@@ -223,7 +239,7 @@ static PlistNode *parse_node(P *p);
 static PlistNode *parse_dict(P *p) {
   PlistNode *d = plist_new_dict();
   while (1) {
-    skip_ws(p);
+    skip_comments(p);
     if (p->p >= p->end)
       break;
 
@@ -251,7 +267,7 @@ static PlistNode *parse_dict(P *p) {
 static PlistNode *parse_array(P *p) {
   PlistNode *a = plist_new_array();
   while (1) {
-    skip_ws(p);
+    skip_comments(p);
     if (p->p >= p->end)
       break;
 

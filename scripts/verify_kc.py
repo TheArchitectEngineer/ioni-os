@@ -240,8 +240,45 @@ if n_kexts > 0:
             check(load_va <= start < load_va + size and
                   load_va <= stop < load_va + size,
                   f"{bid}: start/stop inside own image [{load_va:#x},{load_va+size:#x})")
+
+    # ---- 11. IOKit personalities in prelink info (round 3) ------------------
+    # A prelinked IOKit driver is activated only via its personalities:
+    # sendAllKextPersonalitiesToCatalog -> IOCatalogue matching ->
+    # isModuleLoaded -> OSKext::load+start. Check the XML the kernel will
+    # unserialize: IOKitPersonalities must have survived the kc-tools plist
+    # round-trip with the keys matching depends on.
+    print("11. IOKit personalities (round 3 activation inputs)")
+    hello_entries = [e for e in (arr or [])
+                     if e.get("CFBundleIdentifier") == "com.ioni.hello"]
+    if not hello_entries:
+        print("     [ok ] com.ioni.hello not staged - skipping "
+              "(local kernel-only-ish build)")
+    for ent in hello_entries:
+        bid = ent.get("CFBundleIdentifier", "?")
+        pers = ent.get("IOKitPersonalities")
+        libs = ent.get("OSBundleLibraries")
+        check(isinstance(pers, dict) and len(pers) >= 1,
+              f"{bid}: IOKitPersonalities dict present in __PRELINK_INFO")
+        check(isinstance(libs, dict) and "__kernel__" in libs,
+              f"{bid}: OSBundleLibraries -> __kernel__ "
+              f"(kernel component kexts do not exist in our KC)")
+        if isinstance(pers, dict):
+            for pname, p in pers.items():
+                check(isinstance(p, dict) and p.get("IOClass") == "com_ioni_hello",
+                      f"{bid}/{pname}: IOClass == com_ioni_hello "
+                      f"(C++ class name OSMetaClass registers by)")
+                check(isinstance(p, dict) and
+                      p.get("IOProviderClass") == "IOPlatformExpertDevice",
+                      f"{bid}/{pname}: IOProviderClass == IOPlatformExpertDevice")
+                check(isinstance(p, dict) and p.get("IONameMatch") == "ACPI",
+                      f"{bid}/{pname}: IONameMatch == ACPI (platform nub name)")
+                check(isinstance(p, dict) and
+                      p.get("IOMatchCategory") == "com.ioni.hello",
+                      f"{bid}/{pname}: IOMatchCategory own (default category "
+                      f"would lose to IOProbeScore-10000 platform expert)")
 else:
     print("10. prelink pipeline: skipped (kernel-only KC)")
+    print("11. IOKit personalities: skipped (kernel-only KC)")
 
 print()
 if FAIL:

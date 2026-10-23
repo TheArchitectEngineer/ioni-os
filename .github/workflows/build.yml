@@ -118,7 +118,7 @@ jobs:
     name: kernelcache X86_64 (kc-tools)
     runs-on: macos-26
     timeout-minutes: 20
-    needs: kernel
+    needs: [kernel, hdrs]
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +129,14 @@ jobs:
           # artifact root is the upload paths' common ancestor (RELEASE_X86_64/):
           # download into it so the binary lands at the canonical build path
           path: BUILD/obj/RELEASE_X86_64
+
+      - name: fetch exported headers
+        uses: actions/download-artifact@v4
+        with:
+          name: export-hdrs-X86_64
+          # artifact root is the upload paths' common ancestor (EXPORT_HDRS/);
+          # needed to build the ioni-hello IOKit driver kext (round 3)
+          path: BUILD/obj/EXPORT_HDRS
 
       - name: build kernelcache
         run: ./scripts/build-kc.sh BUILD/obj/RELEASE_X86_64/kernel BUILD/ioni.kc
@@ -181,7 +189,10 @@ jobs:
         run: |
           KC=$(find BUILD/kc -type f -name '*.kc' | head -n1)
           echo "kc: $KC"
-          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8 kt=2 startup_debug=1" IONI_QEMU_TIMEOUT=600 IONI_QEMU_SMP=1 ./scripts/qemu-boot.sh "$KC" BUILD/kc-boot
+          # OK mark = the ioni-hello driver's ::start success line: the boot
+          # test then covers the FULL activation chain (prelink -> personality
+          # -> IOCatalogue matching -> OSKext load+start -> driver runs)
+          IONI_BOOT_ARGS="-v keepsyms=1 serial=3 debug=0x8 kt=2 startup_debug=1 kextlog=0x440bd" IONI_BOOT_OK_MARK="com.ioni.hello: started" IONI_QEMU_TIMEOUT=600 IONI_QEMU_SMP=1 ./scripts/qemu-boot.sh "$KC" BUILD/kc-boot
 
       - name: upload KC boot logs
         if: always()
