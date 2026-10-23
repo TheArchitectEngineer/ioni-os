@@ -179,8 +179,11 @@ com_ioni_virtio_blktest::start(IOService * provider)
                 IOLog("com.ioni.virtio.blk: provider is not a VirtioDevice\n");
                 return false;
         }
-        if (virtio->open(this) != kIOReturnSuccess)
-                return false;
+        /* IOService::open returns bool in xnu-12377 (true = success). */
+        if (!virtio->open(this)) {
+        	IOLog("com.ioni.virtio.blk: virtio->open FAILED\n");
+        	return false;
+        }
 
         virtio->resetDevice();
         uint32_t dev_features = virtio->supportedFeatures();
