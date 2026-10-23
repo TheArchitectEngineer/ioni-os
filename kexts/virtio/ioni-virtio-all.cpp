@@ -21,10 +21,14 @@
  */
 
 #include <string.h>
-#include <kern/misc_protos.h>
 #include <kern/assert.h>
 #include <kern/thread.h>
+#include <kern/task.h>
 #include <mach/thread_act.h>
+#include <libkern/OSByteOrder.h>
+/* kern/misc_protos.h is not in the exported header set; snprintf is a
+ * kernel export (kern/printf.c) - declare it for -fno-builtin builds. */
+extern "C" int snprintf(char *str, size_t size, const char *fmt, ...);
 
 #define PJ_NAME_PREFIX eu_dennis__jordan_driver_
 #define SSDCMultiSubrangeMemoryDescriptor \

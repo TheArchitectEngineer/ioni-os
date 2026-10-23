@@ -4,6 +4,7 @@
  */
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOLib.h>
+#include <libkern/OSByteOrder.h>
 #include <string.h>
 
 OSDefineMetaClassAndStructors(IOPCIDevice, IOService);

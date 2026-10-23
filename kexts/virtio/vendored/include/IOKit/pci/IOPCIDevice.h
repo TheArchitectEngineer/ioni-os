@@ -21,7 +21,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOMemoryMap.h>
+/* IOMemoryMap is declared by IOMemoryDescriptor.h (no separate export) */
 #include <libkern/c++/OSData.h>
 #include <stdint.h>
 
