@@ -143,7 +143,7 @@ bool VirtioBlockDevice::start(IOService* provider)
 	if (virtio == NULL)
 		return false;
 	
-	if (virtio->open(this) != kIOReturnSuccess) /* IONI: IOReturn, not bool */
+	if (!virtio->open(this)) /* IONI: IOService::open returns bool in xnu-12377 */
 		return false;
 	
 	virtio->resetDevice();

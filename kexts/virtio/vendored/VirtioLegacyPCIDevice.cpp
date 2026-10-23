@@ -155,7 +155,7 @@ bool VirtioLegacyPCIDevice::start(IOService* provider)
 	}
 	
 	this->setName(name);
-	if (pciDevice->open(this) != kIOReturnSuccess) /* IONI: IOReturn, not bool */
+	if (!pciDevice->open(this)) /* IONI: IOService::open returns bool in xnu-12377 */
 	{
 		IOLog("VirtioLegacyPCIDevice::start(): failed to open() PCI device %p (%s)\n", pciDevice, pciDevice ? pciDevice->getName() : "[NULL]");
 		return false;
