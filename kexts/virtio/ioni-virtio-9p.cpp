@@ -165,7 +165,7 @@ void
 com_ioni_virtio_9p::negotiationThread(void* param0, void* param1)
 {
 	com_ioni_virtio_9p* self = (com_ioni_virtio_9p*)param0;
-        this->runNegotiation();
+        self->runNegotiation();
         /* thread_call callouts just return; the callout thread keeps going. */
         IOLog("com.ioni.virtio.9p: negotiation thread exiting\n");
 }

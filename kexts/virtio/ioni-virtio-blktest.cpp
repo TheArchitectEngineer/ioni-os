@@ -165,7 +165,7 @@ void
 com_ioni_virtio_blktest::readThread(void* param0, void* param1)
 {
 	com_ioni_virtio_blktest* self = (com_ioni_virtio_blktest*)param0;
-        this->runReadTest();
+        self->runReadTest();
         /* thread_call callouts just return; the callout thread keeps going. */
         IOLog("com.ioni.virtio.blk: read thread exiting\n");
 }
