@@ -18,7 +18,11 @@ LIBDISPATCH_TAG="${LIBDISPATCH_TAG:-libdispatch-1542.100.32}"
 LIBC_TAG="${LIBC_TAG:-Libc-1752.120.2}"
 DYLD_TAG="${DYLD_TAG:-dyld-1378}"
 
-: "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
+: "${RC_DARWIN_KERNEL_VERSION:=25.6.0}"
+# Darwin kernel release (uname -r semantics), NOT the xnu source version:
+# OSKextParseVersionString caps the major at VERS_MAJOR_DIGITS=4, so the
+# 5-digit "12377.121.6" parses to -1 and the fake "__kernel__" kext would
+# reject every OSBundleLibraries version ("not compatible").
 export RC_DARWIN_KERNEL_VERSION
 
 mkdir -p "$FAKEROOT" "$DEPS_DIR"

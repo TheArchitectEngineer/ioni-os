@@ -30,7 +30,11 @@ KDKROOT="${KDKROOT:-/Library/Developer/KDKs/KDK_${KDK_VERSION}_${KDK_BUILD}.kdk}
 KDK_DMG_URL="${KDK_DMG_URL:-https://github.com/dortania/KdkSupportPkg/releases/download/${KDK_BUILD}/Kernel_Debug_Kit_${KDK_VERSION}_build_${KDK_BUILD}.dmg}"
 export KDKROOT
 
-: "${RC_DARWIN_KERNEL_VERSION:=12377.121.6}"
+: "${RC_DARWIN_KERNEL_VERSION:=25.6.0}"
+# Darwin kernel release (uname -r semantics), NOT the xnu source version:
+# OSKextParseVersionString caps the major at VERS_MAJOR_DIGITS=4, so the
+# 5-digit "12377.121.6" parses to -1 and the fake "__kernel__" kext would
+# reject every OSBundleLibraries version ("not compatible").
 export RC_DARWIN_KERNEL_VERSION
 
 mkdir -p "$FAKEROOT" "$DEPS_DIR"
