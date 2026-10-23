@@ -61,10 +61,11 @@ auto)
         kexts/ioni-bringup/ioni-bringup.c -o "$KEXT_STAGE/ioni-bringup.o"
     # ld -bundle -static: MH_BUNDLE with real segments (vmsize > 0), which
     # patch_kmod_info requires; kc-tools converts MH_BUNDLE -> MH_KEXT_BUNDLE.
-    # -U keeps the kernel externs undefined in the binary so link_kext
-    # resolves them against the kernel symtab.
+    # -U keeps the kernel externs (macho names!) undefined in the binary so
+    # link_kext resolves them against the kernel symtab; -static -bundle
+    # also implicitly references the entry "start".
     ld -arch x86_64 -bundle -static \
-        -U _panic -U _kernel_debug_string -U _current_thread \
+        -U _panic -U _current_thread -U _kernel_debug_string -U start \
         -o "$KEXT_STAGE/Contents/MacOS/ioni-bringup" \
         "$KEXT_STAGE/ioni-bringup.o"
     rm -f "$KEXT_STAGE/ioni-bringup.o"

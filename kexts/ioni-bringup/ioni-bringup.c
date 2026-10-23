@@ -53,10 +53,12 @@ _Static_assert(__builtin_offsetof(struct kmod_info, start) == 180,
     "kmod_info pack(4) ABI");
 
 /* Kernel symbols (left undefined by ld -U; kc-tools resolves them against
- * the kernel's symtab at prelink time). */
-extern void _panic(void);
-extern void _kernel_debug_string(const char *message);
-extern void *_current_thread(void);
+ * the kernel's symtab at prelink time). C names without a leading
+ * underscore: the compiler prepends '_', producing the macho symbols
+ * _panic/_kernel_debug_string/_current_thread found in the kernel. */
+extern void panic(void);
+extern void kernel_debug_string(const char *message);
+extern void *current_thread(void);
 
 #define KERN_SUCCESS 0
 
@@ -78,8 +80,8 @@ ioni_bringup_stop(struct kmod_info *ki, void *data)
 
 /* X86_64_RELOC_UNSIGNED against undefined kernel symbols. */
 void *ioni_bringup_kernel_addrs[] = {
-        (void *)&_panic,
-        (void *)&_current_thread,
+        (void *)&panic,
+        (void *)&current_thread,
 };
 
 /* X86_64_RELOC_BRANCH against an undefined kernel symbol. Never executed. */
@@ -87,7 +89,7 @@ __attribute__((used))
 void
 ioni_bringup_probe(void)
 {
-        _kernel_debug_string("com.ioni.bringup probe");
+        kernel_debug_string("com.ioni.bringup probe");
 }
 
 /* X86_64_RELOC_UNSIGNED against local defined symbols. */
