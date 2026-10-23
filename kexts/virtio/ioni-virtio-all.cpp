@@ -23,6 +23,7 @@
 #include <string.h>
 #include <kern/assert.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <kern/task.h>
 #include <mach/thread_act.h>
 #include <libkern/OSByteOrder.h>

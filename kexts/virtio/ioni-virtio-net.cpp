@@ -36,7 +36,7 @@
 #define NET_TX_QUEUE 1
 
 #define RX_BUFFERS 4
-#define RX_POLL_MS 3000
+#define RX_POLL_MS 1500
 
 class com_ioni_virtio_net : public IOService {
 	OSDeclareDefaultStructors(com_ioni_virtio_net);
@@ -51,7 +51,7 @@ private:
 	bool postRxBuffer(unsigned index);
 	static void completionAction(OSObject* target, void* ref,
 	    bool device_reset, uint32_t num_bytes_written);
-	static void datapathThread(void* arg, wait_result_t wr);
+	static void datapathThread(void* param0, void* param1);
 	void runDatapathTest(void);
 };
 
@@ -209,13 +209,12 @@ com_ioni_virtio_net::runDatapathTest(void)
 }
 
 void
-com_ioni_virtio_net::datapathThread(void* arg, wait_result_t wr)
+com_ioni_virtio_net::datapathThread(void* param0, void* param1)
 {
-	(void)wr;
-	com_ioni_virtio_net* self = (com_ioni_virtio_net*)arg;
-	self->runDatapathTest();
+	com_ioni_virtio_net* self = (com_ioni_virtio_net*)param0;
+	this->runDatapathTest();
+	/* thread_call callouts just return; the callout thread keeps going. */
 	IOLog("com.ioni.virtio.net: datapath thread exiting\n");
-	thread_terminate(current_thread());
 }
 
 bool
@@ -261,14 +260,20 @@ com_ioni_virtio_net::start(IOService * provider)
 
 	virtio->startDevice();
 
-	thread_t th = NULL;
-	if (kernel_thread_start(&com_ioni_virtio_net::datapathThread, this, &th)
-	    == KERN_SUCCESS) {
-		thread_deallocate(th);
-		IOLog("com.ioni.virtio.net: datapath thread launched\n");
+	/* Kernel threads created via kernel_thread_start run their
+	 * continuation again after EVERY block (VM allocations block!),
+	 * which restarted the datapath test from the top and corrupted
+	 * the virtqueue state (boot 40020633051 panic: completion call
+	 * through a garbage action pointer). thread_call callouts run on
+	 * full-stack callout threads where blocking is safe. The call
+	 * object is intentionally not freed for this bringup stage. */
+	thread_call_t tc = thread_call_allocate(
+	    (thread_call_func_t)&com_ioni_virtio_net::datapathThread, (thread_call_param_t)this);
+	if (tc != NULL && thread_call_enter(tc)) {
+		IOLog("com.ioni.virtio.net: datapath thread scheduled on callout thread\n");
 	} else {
-		IOLog("com.ioni.virtio.net: kernel_thread_start failed, running inline\n");
-		runDatapathTest();
+		IOLog("com.ioni.virtio.net: thread_call failed, running inline\n");
+		this->runDatapathTest();
 	}
 	return true;
 }

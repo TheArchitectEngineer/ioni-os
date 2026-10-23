@@ -28,7 +28,7 @@
 #define NINEP_MSIZE    8192
 
 #define RX_BUF_SIZE 256
-#define POLL_MS     2000
+#define POLL_MS     1000
 
 class com_ioni_virtio_9p : public IOService {
         OSDeclareDefaultStructors(com_ioni_virtio_9p);
@@ -42,7 +42,7 @@ private:
 
         static void completionAction(OSObject* target, void* ref,
             bool device_reset, uint32_t num_bytes_written);
-        static void negotiationThread(void* arg, wait_result_t wr);
+        static void negotiationThread(void* param0, void* param1);
         void runNegotiation(void);
 };
 
@@ -162,13 +162,12 @@ com_ioni_virtio_9p::runNegotiation(void)
 }
 
 void
-com_ioni_virtio_9p::negotiationThread(void* arg, wait_result_t wr)
+com_ioni_virtio_9p::negotiationThread(void* param0, void* param1)
 {
-        (void)wr;
-        com_ioni_virtio_9p* self = (com_ioni_virtio_9p*)arg;
-        self->runNegotiation();
+	com_ioni_virtio_9p* self = (com_ioni_virtio_9p*)param0;
+        this->runNegotiation();
+        /* thread_call callouts just return; the callout thread keeps going. */
         IOLog("com.ioni.virtio.9p: negotiation thread exiting\n");
-        thread_terminate(current_thread());
 }
 
 bool
@@ -209,13 +208,20 @@ com_ioni_virtio_9p::start(IOService * provider)
 
         virtio->startDevice();
 
-        thread_t th = NULL;
-        if (kernel_thread_start(&com_ioni_virtio_9p::negotiationThread, this, &th)
-            == KERN_SUCCESS) {
-                thread_deallocate(th);
-                IOLog("com.ioni.virtio.9p: negotiation thread launched\n");
+        /* Kernel threads created via kernel_thread_start run their
+         * continuation again after EVERY block (VM allocations block!),
+         * which restarted the datapath test from the top and corrupted
+         * the virtqueue state (boot 40020633051 panic: completion call
+         * through a garbage action pointer). thread_call callouts run on
+         * full-stack callout threads where blocking is safe. The call
+         * object is intentionally not freed for this bringup stage. */
+        thread_call_t tc = thread_call_allocate(
+            (thread_call_func_t)&com_ioni_virtio_9p::negotiationThread, (thread_call_param_t)this);
+        if (tc != NULL && thread_call_enter(tc)) {
+        	IOLog("com.ioni.virtio.9p: negotiation thread scheduled on callout thread\n");
         } else {
-                runNegotiation();
+        	IOLog("com.ioni.virtio.9p: thread_call failed, running inline\n");
+        	this->runNegotiation();
         }
         return true;
 }

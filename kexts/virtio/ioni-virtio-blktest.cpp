@@ -41,7 +41,7 @@
 #define BLK_S_OK         0
 
 #define SECTOR_SIZE 512
-#define POLL_MS     2000
+#define POLL_MS     1000
 
 class com_ioni_virtio_blktest : public IOService {
         OSDeclareDefaultStructors(com_ioni_virtio_blktest);
@@ -55,7 +55,7 @@ private:
 
         static void completionAction(OSObject* target, void* ref,
             bool device_reset, uint32_t num_bytes_written);
-        static void readThread(void* arg, wait_result_t wr);
+        static void readThread(void* param0, void* param1);
         void runReadTest(void);
 };
 
@@ -162,13 +162,12 @@ com_ioni_virtio_blktest::runReadTest(void)
 }
 
 void
-com_ioni_virtio_blktest::readThread(void* arg, wait_result_t wr)
+com_ioni_virtio_blktest::readThread(void* param0, void* param1)
 {
-        (void)wr;
-        com_ioni_virtio_blktest* self = (com_ioni_virtio_blktest*)arg;
-        self->runReadTest();
+	com_ioni_virtio_blktest* self = (com_ioni_virtio_blktest*)param0;
+        this->runReadTest();
+        /* thread_call callouts just return; the callout thread keeps going. */
         IOLog("com.ioni.virtio.blk: read thread exiting\n");
-        thread_terminate(current_thread());
 }
 
 bool
@@ -212,13 +211,20 @@ com_ioni_virtio_blktest::start(IOService * provider)
 
         virtio->startDevice();
 
-        thread_t th = NULL;
-        if (kernel_thread_start(&com_ioni_virtio_blktest::readThread, this, &th)
-            == KERN_SUCCESS) {
-                thread_deallocate(th);
-                IOLog("com.ioni.virtio.blk: read thread launched\n");
+        /* Kernel threads created via kernel_thread_start run their
+         * continuation again after EVERY block (VM allocations block!),
+         * which restarted the datapath test from the top and corrupted
+         * the virtqueue state (boot 40020633051 panic: completion call
+         * through a garbage action pointer). thread_call callouts run on
+         * full-stack callout threads where blocking is safe. The call
+         * object is intentionally not freed for this bringup stage. */
+        thread_call_t tc = thread_call_allocate(
+            (thread_call_func_t)&com_ioni_virtio_blktest::readThread, (thread_call_param_t)this);
+        if (tc != NULL && thread_call_enter(tc)) {
+        	IOLog("com.ioni.virtio.blk: read thread scheduled on callout thread\n");
         } else {
-                runReadTest();
+        	IOLog("com.ioni.virtio.blk: thread_call failed, running inline\n");
+        	this->runReadTest();
         }
         return true;
 }
