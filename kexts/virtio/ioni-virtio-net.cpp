@@ -221,13 +221,18 @@ com_ioni_virtio_net::datapathThread(void* arg, wait_result_t wr)
 bool
 com_ioni_virtio_net::start(IOService * provider)
 {
+	IOLog("com.ioni.virtio.net: start, provider \"%s\"\n",
+	    provider ? provider->getName() : "(none)");
 	virtio = OSDynamicCast(VirtioDevice, provider);
 	if (virtio == NULL) {
 		IOLog("com.ioni.virtio.net: provider is not a VirtioDevice\n");
 		return false;
 	}
-	if (virtio->open(this) != kIOReturnSuccess)
+	/* IOService::open returns bool in xnu-12377 (true = success). */
+	if (!virtio->open(this)) {
+		IOLog("com.ioni.virtio.net: virtio->open FAILED\n");
 		return false;
+	}
 
 	virtio->resetDevice();
 	uint32_t dev_features = virtio->supportedFeatures();
